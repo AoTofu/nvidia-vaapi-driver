@@ -129,6 +129,7 @@ typedef struct _BackingImage {
     bool        borrowedCudaResources;
     struct _BackingImage *borrowedBackingImage;
     atomic_uint borrowCount;
+    uint64_t    detachedSerial;
     bool        syncInitialized;
     bool        resolving;
     pthread_mutex_t mutex;
@@ -185,6 +186,9 @@ typedef struct _NVDriver
     pthread_mutex_t         exportMutex;
     pthread_mutex_t         imagesMutex;
     Array/*<NVEGLImage>*/   images;
+    uint64_t                detachedBackingImageSerial;
+    uint64_t                maxDetachedBackingImageBytes;
+    uint32_t                maxDetachedBackingImages;
     const NVBackend         *backend;
     //fields for direct backend
     NVDriverContext         driverContext;

@@ -83,6 +83,9 @@ static FILE *LOG_OUTPUT;
 static FILE *STATS_OUTPUT;
 static bool LOG_DEBUG_ENABLED;
 
+static const uint64_t DEFAULT_MAX_DETACHED_BACKING_IMAGE_BYTES = 512ULL * 1024ULL * 1024ULL;
+static const uint32_t DEFAULT_MAX_DETACHED_BACKING_IMAGES = 64;
+
 static int gpu = -1;
 static enum {
     EGL, DIRECT
@@ -312,6 +315,22 @@ void logger(const char *filename, const char *function, int line, const char *ms
 
 bool nvdLogDebugEnabled(void) {
     return LOG_DEBUG_ENABLED;
+}
+
+static uint64_t parseEnvU64(const char *name, uint64_t fallback) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value) {
+        LOG("Ignoring invalid %s=%s", name, value);
+        return fallback;
+    }
+
+    return parsed;
 }
 
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line) {
@@ -3839,6 +3858,11 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     drv->cv = cv;
     drv->useCorrectNV12Format = true;
     drv->cudaGpuId = gpu;
+    drv->maxDetachedBackingImageBytes = parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGE_BYTES",
+                                                    DEFAULT_MAX_DETACHED_BACKING_IMAGE_BYTES);
+    uint64_t maxDetachedImages = parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGES",
+                                             DEFAULT_MAX_DETACHED_BACKING_IMAGES);
+    drv->maxDetachedBackingImages = maxDetachedImages > UINT32_MAX ? UINT32_MAX : (uint32_t) maxDetachedImages;
     //make sure that we want the default GPU, and that a DRM fd that we care about is passed in
     drv->drmFd = drmFd;
 
