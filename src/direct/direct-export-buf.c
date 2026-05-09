@@ -205,14 +205,8 @@ static bool backingImageCanPrune(const BackingImage *img) {
 }
 
 static bool detachedBackingImagesOverLimit(uint64_t bytes, uint32_t count, const NVDriver *drv) {
-    if (count == 0) {
-        return false;
-    }
-    if (drv->maxDetachedBackingImages == 0 || drv->maxDetachedBackingImageBytes == 0) {
-        return true;
-    }
-    return count > drv->maxDetachedBackingImages ||
-           bytes > drv->maxDetachedBackingImageBytes;
+    return (drv->maxDetachedBackingImages > 0 && count > drv->maxDetachedBackingImages) ||
+           (drv->maxDetachedBackingImageBytes > 0 && bytes > drv->maxDetachedBackingImageBytes);
 }
 
 static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes, uint32_t *count) {
