@@ -380,45 +380,6 @@ static Direct444PImportMode directGet444PImportMode(void) {
     return DIRECT_444P_IMPORT_MODE_GPU_COPY;
 }
 
-static NVFormat directSurfaceBackingFormat(const NVSurface *surface) {
-    if (surface == NULL) {
-        return NV_FORMAT_NONE;
-    }
-
-    if (surface->rtFormat == VA_RT_FORMAT_RGB32) {
-        return NV_FORMAT_ARGB;
-    }
-
-    switch (surface->format) {
-    case cudaVideoSurfaceFormat_P016:
-        switch (surface->bitDepth) {
-        case 10:
-            return NV_FORMAT_P010;
-        case 12:
-            return NV_FORMAT_P012;
-        default:
-            return NV_FORMAT_P016;
-        }
-
-#if NVENCAPI_MAJOR_VERSION >= 13
-    case cudaVideoSurfaceFormat_P216:
-        return NV_FORMAT_P210;
-
-    case cudaVideoSurfaceFormat_NV16:
-        return NV_FORMAT_NV16;
-#endif
-
-    case cudaVideoSurfaceFormat_YUV444_16Bit:
-        return NV_FORMAT_Q416;
-
-    case cudaVideoSurfaceFormat_YUV444:
-        return NV_FORMAT_444P;
-
-    default:
-        return NV_FORMAT_NV12;
-    }
-}
-
 static void direct_initBackingImageFds(BackingImage *img) {
     if (img == NULL) {
         return;
