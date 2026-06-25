@@ -162,6 +162,8 @@ Environment variables used to control the behavior of this library.
 | `NVD_DECODE_SURFACE_COUNT` | Override the default decode surface count used when clients create a decode context without render targets. Valid range is `1` to `32`; default is `32`. |
 | `NVD_ENABLE_CLIENT_PACKED_HEADERS` | Opt into prepending client-supplied H.264/HEVC packed header data. Default disabled because NVENC-generated SPS/PPS is safer for NVENC slice output. |
 | `NVD_DISABLE_CLIENT_PACKED_HEADERS` | Deprecated compatibility spelling. Client-supplied H.264/HEVC packed header data is ignored by default while packed-header capability advertisement remains enabled. |
+| `NVD_DISABLE_ENCODE` | Hide all encode entrypoints from VA-API clients. Mainly useful for compatibility testing and emergency fallbacks. |
+| `NVD_ENABLE_KPIPEWIRE_ENCODE` | Opt KPipeWire/Spectacle clients back into advertised encode entrypoints. Default disabled because current KPipeWire VAAPI recording paths can fail on NVIDIA DMA-BUF imports. |
 
 ### `NVD_ENCODE_PROBE_CACHE`
 
@@ -211,6 +213,21 @@ Controls the direct backend external-import path for `444P` surfaces.
 - `buffer`: force buffer-direct import for linear `444P`; if the layout is non-linear or the import fails, the driver falls back to GPU-copy
 - `array`: force CUDA array direct-import (`CUmipmappedArray` path); if that import fails, the driver falls back to GPU-copy
 - `gpu-copy`: bypass direct-import and use GPU-copy import immediately
+
+### KPipeWire / Spectacle recording
+
+KPipeWire-based screen recording clients, including KDE Spectacle, currently use
+a VAAPI encode path that can force a linear DMA-BUF flow before frames reach the
+driver's NVENC submission path. On NVIDIA systems this may fail in the
+compositor import path and can crash recording clients.
+
+By default the driver hides encode entrypoints from KPipeWire/Spectacle
+processes only. This lets those clients fall back to software recording while
+preserving VAAPI/NVENC encode advertisement for normal clients such as ffmpeg.
+
+Set `NVD_ENABLE_KPIPEWIRE_ENCODE=1` to opt KPipeWire/Spectacle back into the
+experimental VAAPI encode path. Set `NVD_DISABLE_ENCODE=1` to hide encode
+entrypoints from every VA-API client.
 
 ## Firefox
 

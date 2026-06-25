@@ -352,6 +352,106 @@ static bool nvAllowImportedGpuCopyDirectEncodeCudaArrayNv12(void)
     return isTruthyEnv(getenv("NVD_EXPERIMENTAL_ALLOW_IMPORTED_GPU_COPY_DIRECT_ENCODE"));
 }
 
+static bool nvProcessMapsContain(const char *needle)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps == NULL) {
+        return false;
+    }
+
+    char line[4096];
+    bool found = false;
+    while (fgets(line, sizeof(line), maps) != NULL) {
+        if (strstr(line, needle) != NULL) {
+            found = true;
+            break;
+        }
+    }
+
+    fclose(maps);
+    return found;
+}
+
+static bool nvProcessCommEquals(const char *name)
+{
+    FILE *comm = fopen("/proc/self/comm", "r");
+    if (comm == NULL) {
+        return false;
+    }
+
+    char value[256];
+    bool matches = false;
+    if (fgets(value, sizeof(value), comm) != NULL) {
+        value[strcspn(value, "\r\n")] = '\0';
+        matches = strcmp(value, name) == 0;
+    }
+
+    fclose(comm);
+    return matches;
+}
+
+static bool nvProcessExeBasenameEquals(const char *name)
+{
+    char path[PATH_MAX];
+    ssize_t pathLen = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (pathLen <= 0) {
+        return false;
+    }
+    path[pathLen] = '\0';
+
+    const char *basename = strrchr(path, '/');
+    basename = basename == NULL ? path : basename + 1;
+    return strcmp(basename, name) == 0;
+}
+
+static bool nvCurrentProcessUsesKPipeWire(void)
+{
+    static atomic_int cached = ATOMIC_VAR_INIT(-1);
+    int cachedValue = atomic_load(&cached);
+    if (cachedValue >= 0) {
+        return cachedValue != 0;
+    }
+
+    bool usesKPipeWire =
+        nvProcessMapsContain("libKPipeWireRecord.so") ||
+        nvProcessMapsContain("libKPipeWireDmaBuf.so") ||
+        nvProcessMapsContain("libKPipeWire.so") ||
+        nvProcessCommEquals("spectacle") ||
+        nvProcessExeBasenameEquals("spectacle");
+
+    atomic_store(&cached, usesKPipeWire ? 1 : 0);
+    return usesKPipeWire;
+}
+
+static void nvLogEncodeSuppressedOnce(const char *reason)
+{
+    static atomic_bool logged = ATOMIC_VAR_INIT(false);
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&logged, &expected, true)) {
+        return;
+    }
+
+    LOG("Encode entrypoints suppressed: %s", reason);
+}
+
+static bool nvShouldAdvertiseEncodeEntrypoints(void)
+{
+    if (isTruthyEnv(getenv("NVD_DISABLE_ENCODE"))) {
+        nvLogEncodeSuppressedOnce("NVD_DISABLE_ENCODE is set");
+        return false;
+    }
+
+    if (!isTruthyEnv(getenv("NVD_ENABLE_KPIPEWIRE_ENCODE")) &&
+        nvCurrentProcessUsesKPipeWire()) {
+        nvLogEncodeSuppressedOnce(
+            "KPipeWire/Spectacle compatibility mode; set NVD_ENABLE_KPIPEWIRE_ENCODE=1 to opt in"
+        );
+        return false;
+    }
+
+    return true;
+}
+
 static pthread_mutex_t concurrency_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t instances;
 static uint32_t max_instances;
@@ -2001,6 +2101,10 @@ static bool isEncodeProfile(VAProfile profile) {
 }
 
 static bool isEncodeProfileSupportedByDriver(const NVDriver *drv, VAProfile profile) {
+    if (!nvShouldAdvertiseEncodeEntrypoints()) {
+        return false;
+    }
+
     if (profile == NV_VA_PROFILE_H264_HIGH10) {
 #if NVENCAPI_MAJOR_VERSION >= 13
         return drv->supportsEncodeH264 && drv->supportsEncodeH26410Bit;
