@@ -12,8 +12,9 @@
 
 - **NVSEC-05:** `vaQuerySurfaceAttributes` が入力容量を保持し、容量不足では `VA_STATUS_ERROR_MAX_NUM_EXCEEDED` を返すようにした。件数問い合わせ（`attrib_list == NULL`）も明示的に処理する。
 - **NVSEC-10（一部）:** NVIDIA バージョン文字列の NULL、形式、数値範囲を検証してから使用するようにした。direct/EGL backend の optional `EGL_KHR_debug` callback は未取得時に呼び出さない。
+- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。
 
-各修正後に通常ビルドと RTX 5080 上の `vainfo` を実行し、最後に H.264/HEVC/VP9/AV1/MJPEG の hardware decode smoke test、Clang ASan/UBSan ビルド、容量不足 API の専用テストを実行した。残りの NVSEC-01〜04、NVSEC-06〜10 の未記載部分は未修正である。
+各修正後に通常ビルドと RTX 5080 上の `vainfo` を実行し、最後に H.264/HEVC/VP9/AV1/MJPEG の hardware decode smoke test、Clang ASan/UBSan ビルド、容量不足 API と buffer validation の専用テストを実行した。NVSEC-01 の codec/slice validation と、NVSEC-02〜04、NVSEC-06〜10 の未記載部分は未修正である。
 
 ## 1. エグゼクティブサマリー
 
@@ -30,7 +31,7 @@
 | ID | 重大度 | 要点 | 主な到達条件 |
 |---|---|---|---|
 | DEPLOY-01 | High | README が Firefox RDD sandbox の無効化を指示 | Web 動画を Firefox で再生 |
-| NVSEC-01 | High | VA buffer/codec parameter/slice 範囲を中央で検証していない | 破損動画から不正な VA 値が伝播、または不正 VA client |
+| NVSEC-01 | High（一部修正） | VA buffer/codec parameter/slice 範囲を中央で検証していない | 破損動画から不正な VA 値が伝播、または不正 VA client |
 | NVSEC-02 | High | 外部 DMA-BUF の plane 境界と算術を検証していない | PRIME/PRIME_2 surface import、VideoProc、decode copy |
 | NVSEC-03 | Medium | `vaGetImage` がコピー領域と出力 image buffer の対応を検証しない | 不正または誤った `vaGetImage` 呼び出し |
 | NVSEC-04 | High | resolve thread/context/surface の終了順と寿命が安全でない | 同時終了、CUDA stall、未破棄 object を伴う `vaTerminate` |
@@ -107,6 +108,7 @@ README は `MOZ_DISABLE_RDD_SANDBOX=1` を恒常設定候補として案内し�
 - 重大度: **High**
 - 確度: High（欠落自体）、Medium（任意の破損動画から各値がそのまま到達するか）
 - CWE: CWE-20, CWE-125, CWE-787, CWE-190
+- 状態: **共通入口の type検証とchecked multiplyは修正済み。codec構造体・slice範囲・semantic validationは未修正。**
 
 共通入口の問題:
 
@@ -374,7 +376,7 @@ deb [trusted=yes] http://apt.llvm.org/... main
 
 ### P0 — 配布前
 
-1. NVSEC-01: central VA buffer/type/size validation と全 codec の slice range check
+1. NVSEC-01: central VA buffer/type/size validation（**一部修正済み**）と全 codec の slice range check
 2. NVSEC-02: DMA-BUF descriptor validator と checked layout math
 3. NVSEC-03: `vaGetImage` rectangle/destination validation
 4. NVSEC-04: thread join/object lifetime/termination order の再設計

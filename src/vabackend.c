@@ -1969,6 +1969,16 @@ static bool isValidBufferType(VABufferType type) {
     return (int) type >= 0 && type < VABufferTypeMax;
 }
 
+static bool checkedMultiplySize(size_t left, size_t right, size_t *result) {
+    // Keep the overflow check in size_t, which is also the type consumed by
+    // the allocator and memcpy below.
+    if (left != 0 && right > SIZE_MAX / left) {
+        return false;
+    }
+    *result = left * right;
+    return true;
+}
+
 static VAStatus nvCreateBuffer(
         VADriverContextP ctx,
         VAContextID context,		/* in */
@@ -1999,11 +2009,23 @@ static VAStatus nvCreateBuffer(
     //HACK: This is an awful hack to support VP8 videos when running within FFMPEG.
     //VA-API doesn't pass enough information for NVDEC to work with, but the information is there
     //just before the start of the buffer that was passed to us.
+    size_t elementSize = size;
     size_t offset = 0;
     if (nvCtx->profile == VAProfileVP8Version0_3 && type == VASliceDataBufferType) {
         offset = ((uintptr_t) data) & 0xf;
         data = ((char *) data) - offset;
-        size += (unsigned int)offset;
+        // The VP8 prefix becomes part of each copied element, so account for
+        // it before multiplying by the element count.
+        if (elementSize > SIZE_MAX - offset) {
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+        elementSize += offset;
+    }
+
+    size_t bufferSize = 0;
+    if (!checkedMultiplySize(elementSize, num_elements, &bufferSize)) {
+        LOG("Buffer size overflow: %zu bytes x %u elements", elementSize, num_elements);
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
     //TODO should pool these as most of the time these should be the same size
@@ -2013,7 +2035,7 @@ static VAStatus nvCreateBuffer(
     NVBuffer *buf = (NVBuffer*) bufferObject->obj;
     buf->bufferType = type;
     buf->elements = num_elements;
-    buf->size = num_elements * size;
+    buf->size = bufferSize;
     buf->ptr = memalign(16, buf->size);
     buf->offset = offset;
 
