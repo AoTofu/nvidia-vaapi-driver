@@ -219,18 +219,20 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 //        ppc->cr_qp_offset_list[i] = buf->cr_qp_offset_list[i];
 //    }
 
-    //double check this
-    VAPictureHEVC *pic = &buf->CurrPic;
     for (int i = 0; i < 16; i++) {
-        ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx->drv, pic[i].picture_id);
-        ppc->PicOrderCntVal[i] = pic[i].pic_order_cnt;
-        ppc->IsLongTerm[i]     = i != 0 && (pic[i].flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
+        // NVDEC reserves slot 0 for CurrPic and slots 1..15 for the VA
+        // ReferenceFrames array. Select the real field explicitly: treating
+        // &CurrPic as a 16-element array crosses a C struct-member boundary.
+        const VAPictureHEVC *pic = i == 0 ? &buf->CurrPic : &buf->ReferenceFrames[i - 1];
+        ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx->drv, pic->picture_id);
+        ppc->PicOrderCntVal[i] = pic->pic_order_cnt;
+        ppc->IsLongTerm[i]     = i != 0 && (pic->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
 
-        if (pic[i].flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
+        if (pic->flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
             ppc->RefPicSetStCurrBefore[ppc->NumPocStCurrBefore++] = i;
-        } else if (pic[i].flags & VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) {
+        } else if (pic->flags & VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) {
             ppc->RefPicSetStCurrAfter[ppc->NumPocStCurrAfter++] = i;
-        } else if (pic[i].flags & VA_PICTURE_HEVC_RPS_LT_CURR) {
+        } else if (pic->flags & VA_PICTURE_HEVC_RPS_LT_CURR) {
             ppc->RefPicSetLtCurr[ppc->NumPocLtCurr++] = i;
         }
     }

@@ -12,7 +12,7 @@
 
 - **NVSEC-05:** `vaQuerySurfaceAttributes` が入力容量を保持し、容量不足では `VA_STATUS_ERROR_MAX_NUM_EXCEEDED` を返すようにした。件数問い合わせ（`attrib_list == NULL`）も明示的に処理する。
 - **NVSEC-10（一部）:** NVIDIA バージョン文字列の NULL、形式、数値範囲を検証してから使用するようにした。direct/EGL backend の optional `EGL_KHR_debug` callback は未取得時に呼び出さない。
-- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。buffer data allocation failure 時は作成済み object を削除し、出力 ID を `VA_INVALID_ID` のままにする。
+- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。buffer data allocation failure 時は作成済み object を削除し、出力 ID を `VA_INVALID_ID` のままにする。HEVCの`CurrPic`/`ReferenceFrames`変換は実際のstruct fieldを明示的に参照し、member境界を越える未定義動作を除去した。
 
 各修正後に通常ビルドと RTX 5080 上の `vainfo` を実行し、最後に H.264/HEVC/VP9/AV1/MJPEG の hardware decode smoke test、Clang ASan/UBSan ビルド、容量不足 API と buffer validation の専用テストを実行した。NVSEC-01 の codec/slice validation と、NVSEC-02〜04、NVSEC-06〜10 の未記載部分は未修正である。
 
@@ -108,7 +108,7 @@ README は `MOZ_DISABLE_RDD_SANDBOX=1` を恒常設定候補として案内し�
 - 重大度: **High**
 - 確度: High（欠落自体）、Medium（任意の破損動画から各値がそのまま到達するか）
 - CWE: CWE-20, CWE-125, CWE-787, CWE-190
-- 状態: **共通入口の type検証、checked multiply、allocation rollbackは修正済み。codec構造体・slice範囲・semantic validationは未修正。**
+- 状態: **共通入口の type検証、checked multiply、allocation rollback、およびHEVC picture field境界は修正済み。その他のcodec構造体・slice範囲・semantic validationは未修正。**
 
 共通入口の問題:
 
@@ -127,7 +127,7 @@ slice の問題:
 codec 固有の代表例:
 
 - HEVC `src/hevc.c:173-214`: `num_tile_columns_minus1` / `num_tile_rows_minus1` を VA/CUVID の固定配列上限と照合せず loop bound にする。
-- HEVC `src/hevc.c:223-251`: `&buf->CurrPic` を 16 要素配列のように扱う。実際の型では `CurrPic` は 1 要素、その次が `ReferenceFrames[15]` であり、C 言語上は field 境界を越える未定義動作である。`clang-tidy` も `clang-analyzer-security.ArrayBound` として検出した。
+- HEVC（修正済み）: 修正前の`src/hevc.c:223-251`は`&buf->CurrPic`を16要素配列のように扱っていた。現在はslot 0で`CurrPic`、slot 1..15で`ReferenceFrames[i - 1]`を明示的に参照し、C言語上のfield境界を越える未定義動作を除去している。
 - AV1 `src/av1.c:147-174`: `bit_depth_map[buf->bit_depth_idx]` の index check がない。
 - AV1 `src/av1.c:29-34`: `use_superres` 時の denominator 0 を拒否せず除算する。
 - AV1 `src/av1.c:239-283`, `src/av1.c:425-447`: `ref_frame_idx[]` / `primary_ref_frame` を 0..7 と検証せず固定配列 index に使う。
@@ -448,6 +448,7 @@ validation API を先に確定しないと codec ごとに異なる局所 check 
   - VP9: **hardware decoding 成功**
   - AV1: **hardware decoding 成功**
   - MJPEG: **hardware decoding 成功**
+- HEVC picture field修正後、参照フレームを含む30 frameのMain/Main10/Main12（12-bitはRext profile表記）を追加decode: **すべてhardware decoding成功**
 
 これは正常系 smoke であり、malformed input、concurrency、OOM、DMA-BUF adversarial layout の安全性を証明しない。
 
