@@ -219,14 +219,26 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 //        ppc->cr_qp_offset_list[i] = buf->cr_qp_offset_list[i];
 //    }
 
+    // NVDEC's arrays contain reference pictures only; the current picture's
+    // POC is carried separately in CurrPicOrderCntVal. Initialize every slot
+    // so the sixteenth entry remains explicitly unused (VA-API exposes 15).
     for (int i = 0; i < 16; i++) {
-        // NVDEC reserves slot 0 for CurrPic and slots 1..15 for the VA
-        // ReferenceFrames array. Select the real field explicitly: treating
-        // &CurrPic as a 16-element array crosses a C struct-member boundary.
-        const VAPictureHEVC *pic = i == 0 ? &buf->CurrPic : &buf->ReferenceFrames[i - 1];
+        ppc->RefPicIdx[i] = -1;
+        ppc->PicOrderCntVal[i] = 0;
+        ppc->IsLongTerm[i] = 0;
+    }
+
+    for (int i = 0; i < 15; i++) {
+        const VAPictureHEVC *pic = &buf->ReferenceFrames[i];
         ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx->drv, pic->picture_id);
         ppc->PicOrderCntVal[i] = pic->pic_order_cnt;
-        ppc->IsLongTerm[i]     = i != 0 && (pic->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
+        ppc->IsLongTerm[i]     = (pic->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
+
+        // Invalid VA DPB entries must not contribute to an NVDEC reference
+        // picture set even if their remaining flag bits contain stale data.
+        if (ppc->RefPicIdx[i] == -1) {
+            continue;
+        }
 
         if (pic->flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
             ppc->RefPicSetStCurrBefore[ppc->NumPocStCurrBefore++] = i;
@@ -240,7 +252,7 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
     ppc->NumPocTotalCurr = ppc->NumPocStCurrBefore + ppc->NumPocStCurrAfter + ppc->NumPocLtCurr;
 
     int numDeltaPocs = 0;
-    for (int i = 1; i < 16; i++) {
+    for (int i = 0; i < 16; i++) {
         if (ppc->RefPicIdx[i] != -1 && !ppc->IsLongTerm[i])
             numDeltaPocs++;
     }

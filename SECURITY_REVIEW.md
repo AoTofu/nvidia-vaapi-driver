@@ -12,7 +12,7 @@
 
 - **NVSEC-05:** `vaQuerySurfaceAttributes` が入力容量を保持し、容量不足では `VA_STATUS_ERROR_MAX_NUM_EXCEEDED` を返すようにした。件数問い合わせ（`attrib_list == NULL`）も明示的に処理する。
 - **NVSEC-10（一部）:** NVIDIA バージョン文字列の NULL、形式、数値範囲を検証してから使用するようにした。direct/EGL backend の optional `EGL_KHR_debug` callback は未取得時に呼び出さない。
-- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。buffer data allocation failure 時は作成済み object を削除し、出力 ID を `VA_INVALID_ID` のままにする。HEVCの`CurrPic`/`ReferenceFrames`変換は実際のstruct fieldを明示的に参照し、member境界を越える未定義動作を除去した。
+- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。buffer data allocation failure 時は作成済み object を削除し、出力 ID を `VA_INVALID_ID` のままにする。HEVCはVAの`ReferenceFrames[0..14]`をNVDECのreference slot 0..14へ対応させ、slot 15を未使用として初期化することで、member境界を越える未定義動作と`CurrPic`混入を除去した。
 
 各修正後に通常ビルドと RTX 5080 上の `vainfo` を実行し、最後に H.264/HEVC/VP9/AV1/MJPEG の hardware decode smoke test、Clang ASan/UBSan ビルド、容量不足 API と buffer validation の専用テストを実行した。NVSEC-01 の codec/slice validation と、NVSEC-02〜04、NVSEC-06〜10 の未記載部分は未修正である。
 
@@ -127,7 +127,7 @@ slice の問題:
 codec 固有の代表例:
 
 - HEVC `src/hevc.c:173-214`: `num_tile_columns_minus1` / `num_tile_rows_minus1` を VA/CUVID の固定配列上限と照合せず loop bound にする。
-- HEVC（修正済み）: 修正前の`src/hevc.c:223-251`は`&buf->CurrPic`を16要素配列のように扱っていた。現在はslot 0で`CurrPic`、slot 1..15で`ReferenceFrames[i - 1]`を明示的に参照し、C言語上のfield境界を越える未定義動作を除去している。
+- HEVC（修正済み）: 修正前の`src/hevc.c:223-251`は`&buf->CurrPic`を16要素配列のように扱い、NVDECのreference slot 0へ現在画像を混入させていた。現在はVAの`ReferenceFrames[0..14]`をNVDECのslot 0..14へ対応させ、slot 15を未使用として初期化している。`CurrPic.pic_order_cnt`はNVDECの独立した`CurrPicOrderCntVal`へ設定する。
 - AV1 `src/av1.c:147-174`: `bit_depth_map[buf->bit_depth_idx]` の index check がない。
 - AV1 `src/av1.c:29-34`: `use_superres` 時の denominator 0 を拒否せず除算する。
 - AV1 `src/av1.c:239-283`, `src/av1.c:425-447`: `ref_frame_idx[]` / `primary_ref_frame` を 0..7 と検証せず固定配列 index に使う。
@@ -149,7 +149,7 @@ codec 固有の代表例:
 4. `slice_offset <= data_size && slice_size <= data_size - slice_offset` の共通 helper を全 codec で使う。
 5. slice parameters は context 所有 memory に copy するか、同一 `nvRenderPicture` call 内だけで組み合わせ、raw pointer を call 間で保持しない。
 6. AV1/HEVC の spec range と CUDA header の固定配列長の小さい方を上限にする。
-7. HEVC は `i == 0 ? &buf->CurrPic : &buf->ReferenceFrames[i - 1]` のように正規の field 参照へ直す。
+7. HEVC reference mapping は修正済み。VAの`ReferenceFrames[0..14]`だけをNVDECのreference slotへ設定し、`CurrPic`は独立したcurrent-picture fieldとして扱う。
 8. validation failure を handler の `void` return で失わないよう、handler を `VAStatus` または `bool` return に変える。
 
 ### NVSEC-02 — 外部 DMA-BUF の layout と copy bounds が検証されない
