@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #include <drm_fourcc.h>
 
@@ -376,9 +377,39 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
 
     //query the version of the api
     char *ver = NULL;
-    nv_get_versions(nvctlFd, &ver);
-    context->driverMajorVersion = atoi(ver);
-    context->driverMinorVersion = atoi(ver+4);
+    const bool versionRecognized = nv_get_versions(nvctlFd, &ver);
+    if (ver == NULL) {
+        LOG("Unable to obtain NVIDIA kernel driver version")
+        goto err;
+    }
+
+    // The parsed values select version-dependent ioctl layouts below. Reject
+    // malformed or truncated strings instead of silently treating them as 0.
+    char *versionEnd = NULL;
+    errno = 0;
+    unsigned long majorVersion = strtoul(ver, &versionEnd, 10);
+    if (versionEnd == ver || *versionEnd != '.' || errno == ERANGE || majorVersion > UINT32_MAX) {
+        LOG("Invalid NVIDIA kernel driver version: %s", ver)
+        free(ver);
+        goto err;
+    }
+
+    char *minorEnd = NULL;
+    errno = 0;
+    unsigned long minorVersion = strtoul(versionEnd + 1, &minorEnd, 10);
+    if (minorEnd == versionEnd + 1 ||
+        (*minorEnd != '.' && *minorEnd != '\0') ||
+        errno == ERANGE || minorVersion > UINT32_MAX) {
+        LOG("Invalid NVIDIA kernel driver version: %s", ver)
+        free(ver);
+        goto err;
+    }
+
+    context->driverMajorVersion = (uint32_t) majorVersion;
+    context->driverMinorVersion = (uint32_t) minorVersion;
+    if (!versionRecognized) {
+        LOG("NVIDIA kernel driver version query was not recognized; using %s", ver)
+    }
     LOG("NVIDIA kernel driver version: %s, major version: %d, minor version: %d", ver, context->driverMajorVersion, context->driverMinorVersion)
     free(ver);
 

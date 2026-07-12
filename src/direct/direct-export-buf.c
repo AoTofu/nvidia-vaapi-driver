@@ -126,7 +126,12 @@ static bool direct_initExporter(NVDriver *drv) {
     //this is only needed to see errors in firefox
     static const EGLAttrib debugAttribs[] = {EGL_DEBUG_MSG_WARN_KHR, EGL_TRUE, EGL_DEBUG_MSG_INFO_KHR, EGL_TRUE, EGL_NONE};
     const PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR = (PFNEGLDEBUGMESSAGECONTROLKHRPROC) eglGetProcAddress("eglDebugMessageControlKHR");
-    eglDebugMessageControlKHR(debug, debugAttribs);
+    // EGL_KHR_debug is diagnostic-only and must not be required for decoding.
+    if (eglDebugMessageControlKHR != NULL) {
+        eglDebugMessageControlKHR(debug, debugAttribs);
+    } else {
+        LOG("EGL_KHR_debug is unavailable; continuing without EGL debug logging");
+    }
 
     //make sure we have a drm fd
     if (drv->drmFd == -1) {

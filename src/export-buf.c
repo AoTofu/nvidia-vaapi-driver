@@ -237,7 +237,13 @@ static bool egl_initExporter(NVDriver *drv) {
         return false;
     }
     //setup debug logging
-    eglDebugMessageControlKHR(debug, debugAttribs);
+    // EGL_KHR_debug is optional; exporter initialization can continue safely
+    // when the implementation does not expose the callback.
+    if (eglDebugMessageControlKHR != NULL) {
+        eglDebugMessageControlKHR(debug, debugAttribs);
+    } else {
+        LOG("EGL_KHR_debug is unavailable; continuing without EGL debug logging");
+    }
 
     //see if the driver supports 16-bit exports
     EGLint formats[64];

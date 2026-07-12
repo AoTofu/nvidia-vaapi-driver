@@ -3487,16 +3487,29 @@ static VAStatus nvQuerySurfaceAttributes(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVConfig *cfg = (NVConfig*) getObjectPtr(drv, OBJECT_TYPE_CONFIG, config);
 
+    if (num_attribs == NULL) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+
     if (cfg == NULL) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
     if (cfg->entrypoint == VAEntrypointVideoProc) {
-        if (num_attribs != NULL) {
-            *num_attribs = drv->supports16BitSurface ? 14 : 13;
+        // libva supplies array capacity through *num_attribs. Publish the
+        // required count, but never write when the caller's array is smaller.
+        const unsigned int required = drv->supports16BitSurface ? 14 : 13;
+        const unsigned int capacity = *num_attribs;
+        *num_attribs = required;
+
+        if (attrib_list == NULL) {
+            return VA_STATUS_SUCCESS;
+        }
+        if (capacity < required) {
+            return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
         }
 
-        if (attrib_list != NULL) {
+        {
             attrib_list[0].type = VASurfaceAttribMinWidth;
             attrib_list[0].flags = 0;
             attrib_list[0].value.type = VAGenericValueTypeInteger;
@@ -3574,23 +3587,31 @@ static VAStatus nvQuerySurfaceAttributes(
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
-    if (num_attribs != NULL) {
-        int cnt = 4;
-        if (cfg->chromaFormat == cudaVideoChromaFormat_444) {
-            cnt += 1;
+    int required = 4;
+    if (cfg->chromaFormat == cudaVideoChromaFormat_444) {
+        required += 1;
 #if VA_CHECK_VERSION(1, 20, 0)
-            cnt += 1;
+        required += 1;
 #endif
-        } else {
-            cnt += 1;
-            if (drv->supports16BitSurface) {
-                cnt += 3;
-            }
+    } else {
+        required += 1;
+        if (drv->supports16BitSurface) {
+            required += 3;
         }
-        *num_attribs = cnt;
+    }
+    // Apply the same capacity contract to decode attributes before querying
+    // CUDA or writing any caller-owned memory.
+    const unsigned int capacity = *num_attribs;
+    *num_attribs = (unsigned int) required;
+
+    if (attrib_list == NULL) {
+        return VA_STATUS_SUCCESS;
+    }
+    if (capacity < (unsigned int) required) {
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
 
-    if (attrib_list != NULL) {
+    {
         CUVIDDECODECAPS videoDecodeCaps = {
             .eCodecType      = cfg->cudaCodec,
             .eChromaFormat   = cfg->chromaFormat,
