@@ -2030,7 +2030,6 @@ static VAStatus nvCreateBuffer(
 
     //TODO should pool these as most of the time these should be the same size
     Object bufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
-    *buf_id = bufferObject->id;
 
     NVBuffer *buf = (NVBuffer*) bufferObject->obj;
     buf->bufferType = type;
@@ -2041,6 +2040,9 @@ static VAStatus nvCreateBuffer(
 
     if (buf->ptr == NULL) {
         LOG("Unable to allocate buffer of %zu bytes", buf->size);
+        // allocateObject has already published the ID; remove it before
+        // returning so failed allocations cannot leave zombie VA objects.
+        deleteObject(drv, bufferObject->id);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
 
@@ -2049,6 +2051,7 @@ static VAStatus nvCreateBuffer(
         memcpy(buf->ptr, data, buf->size);
     }
 
+    *buf_id = bufferObject->id;
     return VA_STATUS_SUCCESS;
 }
 

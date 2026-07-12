@@ -12,7 +12,7 @@
 
 - **NVSEC-05:** `vaQuerySurfaceAttributes` が入力容量を保持し、容量不足では `VA_STATUS_ERROR_MAX_NUM_EXCEEDED` を返すようにした。件数問い合わせ（`attrib_list == NULL`）も明示的に処理する。
 - **NVSEC-10（一部）:** NVIDIA バージョン文字列の NULL、形式、数値範囲を検証してから使用するようにした。direct/EGL backend の optional `EGL_KHR_debug` callback は未取得時に呼び出さない。
-- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。
+- **NVSEC-01（一部）:** buffer type を作成時と dispatch 前に検証し、要素サイズと個数を `size_t` の checked multiply で計算するようにした。buffer data allocation failure 時は作成済み object を削除し、出力 ID を `VA_INVALID_ID` のままにする。
 
 各修正後に通常ビルドと RTX 5080 上の `vainfo` を実行し、最後に H.264/HEVC/VP9/AV1/MJPEG の hardware decode smoke test、Clang ASan/UBSan ビルド、容量不足 API と buffer validation の専用テストを実行した。NVSEC-01 の codec/slice validation と、NVSEC-02〜04、NVSEC-06〜10 の未記載部分は未修正である。
 
@@ -108,7 +108,7 @@ README は `MOZ_DISABLE_RDD_SANDBOX=1` を恒常設定候補として案内し�
 - 重大度: **High**
 - 確度: High（欠落自体）、Medium（任意の破損動画から各値がそのまま到達するか）
 - CWE: CWE-20, CWE-125, CWE-787, CWE-190
-- 状態: **共通入口の type検証とchecked multiplyは修正済み。codec構造体・slice範囲・semantic validationは未修正。**
+- 状態: **共通入口の type検証、checked multiply、allocation rollbackは修正済み。codec構造体・slice範囲・semantic validationは未修正。**
 
 共通入口の問題:
 
