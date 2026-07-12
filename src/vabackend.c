@@ -1963,6 +1963,12 @@ static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) 
     return VA_STATUS_SUCCESS;
 }
 
+static bool isValidBufferType(VABufferType type) {
+    // Codec handlers use this enum as an array index, so reject values outside
+    // the libva-defined range before they can reach a dispatch table.
+    return (int) type >= 0 && type < VABufferTypeMax;
+}
+
 static VAStatus nvCreateBuffer(
         VADriverContextP ctx,
         VAContextID context,		/* in */
@@ -1976,9 +1982,18 @@ static VAStatus nvCreateBuffer(
     //LOG("got buffer %p, type %x, size %u, elements %u", data, type, size, num_elements);
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
 
+    if (buf_id == NULL) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    // Every failure path must leave the caller without a usable object ID.
+    *buf_id = VA_INVALID_ID;
+
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
     if (nvCtx == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (!isValidBufferType(type)) {
+        return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
     }
 
     //HACK: This is an awful hack to support VP8 videos when running within FFMPEG.
@@ -2983,6 +2998,12 @@ static VAStatus nvRenderPicture(
         if (buf == NULL || buf->ptr == NULL) {
             LOG("Invalid buffer detected, skipping: %d", buffers[i]);
             continue;
+        }
+        // Validate again at the trust boundary. This protects dispatch even
+        // if a buffer object is corrupted or originates outside nvCreateBuffer.
+        if (!isValidBufferType(buf->bufferType)) {
+            LOG("Invalid buffer type: %d", buf->bufferType);
+            return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
         }
         HandlerFunc func = nvCtx->codec->handlers[buf->bufferType];
         if (func != NULL) {
