@@ -622,8 +622,11 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
         // offset) is imported fine by Chromium's multi-plane path but mis-detiled by
         // per-plane importers (mpv/GStreamer/ffmpeg), which import each layer as a
         // standalone dma-buf and can't handle a tiled plane starting at a byte offset. The
-        // single-buffer layout is kept behind NVD_SINGLE_BUFFER for comparison/fallback.
-        if (nvdSingleBufferForced()) {
+        // Chrome cannot represent different modifiers for separate objects, so
+        // nvdUseSingleBufferExport selects the packed path only for Chromium (or
+        // an explicit NVD_SINGLE_BUFFER override). Other clients keep a2833b2's
+        // natural per-plane block heights and offset-zero dma-buf objects.
+        if (nvdUseSingleBufferExport()) {
             return direct_allocateBackingImage_single(drv, surface);
         }
         return direct_allocateBackingImage_perPlane(drv, surface);

@@ -83,7 +83,7 @@ extern const NVCodec __stop_nvd_codecs[];
 static FILE *LOG_OUTPUT;
 static FILE *STATS_OUTPUT;
 static bool LOG_DEBUG_ENABLED;
-static bool SINGLE_BUFFER_FORCED;
+static bool USE_SINGLE_BUFFER_EXPORT;
 
 // Destination for the statistics dump: the dedicated stats log if one was opened
 // (NVD_STATS_LOG), otherwise the regular log stream. Used by the stats subsystem.
@@ -209,6 +209,27 @@ static BackingImage *retainBackingImageByFd(NVDriver *drv, int fd, NVFormat form
     return ret;
 }
 
+static bool processRequiresSingleBufferExport(void) {
+#ifdef __linux__
+    // Chromium stores only one modifier in gfx::NativePixmapHandle and aborts
+    // if separate dma-buf objects advertise different per-plane modifiers.
+    // Detect its GPU process by comm instead of changing the default export:
+    // non-Chromium clients retain the per-plane block heights fixed by a2833b2.
+    char comm[32] = { 0 };
+    int fd = open("/proc/self/comm", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        const ssize_t bytesRead = read(fd, comm, sizeof(comm) - 1);
+        close(fd);
+        if (bytesRead > 0) {
+            comm[bytesRead] = '\0';
+            comm[strcspn(comm, "\r\n")] = '\0';
+            return strcmp(comm, "chrome") == 0 || strcmp(comm, "chromium") == 0;
+        }
+    }
+#endif
+    return false;
+}
+
 __attribute__ ((constructor))
 static void init() {
     char *nvdLog = getenv("NVD_LOG");
@@ -224,9 +245,11 @@ static void init() {
     }
     char *nvdLogVerbose = getenv("NVD_LOG_VERBOSE");
     LOG_DEBUG_ENABLED = nvdLogVerbose != NULL && strcmp(nvdLogVerbose, "0") != 0;
-    // Global toggle read once here (like every other NVD_* env) instead of via a
-    // getenv on each surface allocation in the direct backend.
-    SINGLE_BUFFER_FORCED = getenv("NVD_SINGLE_BUFFER") != NULL;
+    // Keep the explicit override for wrappers with a non-standard process name.
+    // Automatic Chromium compatibility is deliberately narrow so a2833b2's
+    // per-plane modifier path remains the default for every other VA client.
+    USE_SINGLE_BUFFER_EXPORT = getenv("NVD_SINGLE_BUFFER") != NULL ||
+                               processRequiresSingleBufferExport();
     char *nvdStats = getenv("NVD_STATS");
     if (nvdStats != NULL && strcmp(nvdStats, "0") != 0) {
         char *nvdStatsLog = getenv("NVD_STATS_LOG");
@@ -337,8 +360,8 @@ bool nvdLogDebugEnabled(void) {
     return LOG_DEBUG_ENABLED;
 }
 
-bool nvdSingleBufferForced(void) {
-    return SINGLE_BUFFER_FORCED;
+bool nvdUseSingleBufferExport(void) {
+    return USE_SINGLE_BUFFER_EXPORT;
 }
 
 static uint64_t parseEnvU64(const char *name, uint64_t fallback) {

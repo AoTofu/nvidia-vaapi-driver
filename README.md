@@ -159,7 +159,9 @@ If you're using the Snap version of Firefox, it will be unable to access the hos
 
 ## Chrome
 
-This fork includes the Chromium-compatible single-buffer export path. For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start the browser with flags similar to:
+This fork includes a Chromium-compatible single-buffer export path. Chrome and Chromium processes select it automatically because Chromium cannot represent different DRM modifiers for separate plane objects. Set `NVD_SINGLE_BUFFER=1` explicitly for Chromium-based wrappers that run the GPU process under a different executable name.
+
+Start the browser with flags similar to:
 
 ```sh
 LIBVA_DRIVER_NAME=nvidia google-chrome \
@@ -170,7 +172,7 @@ LIBVA_DRIVER_NAME=nvidia google-chrome \
 
 On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
 
-Multi-plane YUV surfaces are always exported as a single buffer with all planes sharing one DRM modifier, which is what Chromium's `vaapi_wrapper` requires; no configuration is needed.
+Chrome and Chromium receive one buffer with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
 ## MPV
 
