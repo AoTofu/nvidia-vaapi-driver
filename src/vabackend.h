@@ -21,9 +21,11 @@
 #include "common.h"
 #include "stats.h"
 #include "surface-import.h"
+#include "object-table.h"
 
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
+#define NVD_BUFFER_POOL_CLASS_COUNT 6
 
 typedef enum
 {
@@ -34,12 +36,7 @@ typedef enum
     OBJECT_TYPE_IMAGE
 } ObjectType;
 
-typedef struct Object_t
-{
-    ObjectType      type;
-    VAGenericID     id;
-    void            *obj;
-} *Object;
+typedef NVDObject *Object;
 
 typedef struct
 {
@@ -48,7 +45,13 @@ typedef struct
     VABufferType    bufferType;
     void            *ptr;
     size_t          offset;
+    size_t          capacity;
+    int8_t          poolClass;
 } NVBuffer;
+
+typedef struct _NVBufferPoolBlock {
+    struct _NVBufferPoolBlock *next;
+} NVBufferPoolBlock;
 
 struct _NVContext;
 struct _BackingImage;
@@ -95,6 +98,7 @@ typedef struct
     uint32_t    height;
     NVFormat    format;
     NVBuffer    *imageBuffer;
+    VABufferID  imageBufferId;
 } NVImage;
 
 typedef struct {
@@ -176,9 +180,8 @@ typedef struct _NVDriver
     CuvidFunctions          *cv;
     CUcontext               cudaContext;
     CUvideoctxlock          vidLock;
-    Array/*<Object>*/       objects;
+    NVDObjectTable          objects;
     pthread_mutex_t         objectCreationMutex;
-    VAGenericID             nextObjId;
     bool                    terminating;
     bool                    useCorrectNV12Format;
     bool                    supports16BitSurface;
@@ -187,6 +190,12 @@ typedef struct _NVDriver
     int                     drmFd;
     pthread_mutex_t         exportMutex;
     pthread_mutex_t         imagesMutex;
+    pthread_mutex_t         bufferPoolMutex;
+    bool                    bufferPoolMutexInitialized;
+    NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
+    uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
+    uint64_t                bufferPoolBytes;
+    uint64_t                bufferPoolMaxBytes;
     Array/*<NVEGLImage>*/   images;
     const NVBackend         *backend;
     //fields for direct backend
@@ -261,6 +270,7 @@ typedef struct _NVContext
     void                *lastSliceParams;
     unsigned int        lastSliceParamsCount;
     AppendableBuffer    bitstreamBuffer;
+    size_t              bitstreamDataOffset;
     AppendableBuffer    sliceOffsets;
     bool                av1SequenceEnableRestoration;
     uint32_t            av1TileOffsetsSeen;
@@ -298,6 +308,7 @@ typedef struct
 typedef void (*HandlerFunc)(NVContext*, NVBuffer* , CUVIDPICPARAMS*);
 typedef cudaVideoCodec (*ComputeCudaCodec)(VAProfile);
 typedef void (*CodecBeginPictureFunc)(NVContext*);
+typedef void (*CodecDestroyFunc)(NVContext*);
 
 // Internals exposed for the stats subsystem (src/stats.c).
 pid_t nv_gettid(void);
@@ -311,6 +322,7 @@ struct _NVCodec {
     int                 supportedProfileCount;
     const VAProfile     *supportedProfiles;
     CodecBeginPictureFunc beginPicture;
+    CodecDestroyFunc      destroy;
 };
 
 typedef struct _NVCodec NVCodec;

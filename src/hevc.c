@@ -276,6 +276,22 @@ static void copyHEVCSliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS 
 
 static void copyHEVCSliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
 {
+    size_t bitstreamBytes = 0;
+    for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
+        const VASliceParameterBufferHEVC *sliceParams =
+            &((const VASliceParameterBufferHEVC *) ctx->lastSliceParams)[i];
+        if (bitstreamBytes > SIZE_MAX - 3U ||
+            sliceParams->slice_data_size > SIZE_MAX - bitstreamBytes - 3U) {
+            ctx->bitstreamBuffer.failed = true;
+            return;
+        }
+        bitstreamBytes += sliceParams->slice_data_size + 3U;
+    }
+    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+                               sizeof(uint32_t)) ||
+        !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bitstreamBytes)) {
+        return;
+    }
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++)
     {
         static const uint8_t header[] = { 0, 0, 1 }; //1 as a 24-bit Big Endian

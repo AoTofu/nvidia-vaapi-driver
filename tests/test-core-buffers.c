@@ -36,6 +36,14 @@ static void testAppendOverflowIsNonDestructive(void) {
     // Restore the real allocation size before releasing the test fixture.
     buffer.size = sizeof(initial);
     freeAppendableBuffer(&buffer);
+
+    AppendableBuffer reserve = {.size = 2};
+    assert(!reserveAdditionalBuffer(&reserve, SIZE_MAX));
+    assert(reserve.failed);
+    reserve.failed = false;
+    reserve.size = 0;
+    assert(!reserveBufferElements(&reserve, SIZE_MAX, 2));
+    assert(reserve.failed);
 }
 
 static void testArrayGrowthAndExhaustion(void) {

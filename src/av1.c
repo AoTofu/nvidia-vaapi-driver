@@ -138,9 +138,7 @@ static void compactAV1BitstreamToCurrentFrame(NVContext *ctx, CUVIDPICPARAMS *pi
     }
 
     const size_t compactBytes = end - start;
-    memmove(ctx->bitstreamBuffer.buf, (const uint8_t*) ctx->bitstreamBuffer.buf + start, compactBytes);
-    nvStatsIncrement(ctx->drv, NV_STAT_AV1_COMPACT_COUNT);
-    nvStatsAdd(ctx->drv, NV_STAT_AV1_COMPACT_BYTES, compactBytes);
+    ctx->bitstreamDataOffset = start;
     ctx->bitstreamBuffer.size = compactBytes;
     picParams->nBitstreamDataLen = (uint32_t) ctx->bitstreamBuffer.size;
     ctx->av1BitstreamCompacted = true;
@@ -475,37 +473,22 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 }
 
 static void ensureAV1SliceOffsetStorage(NVContext *ctx, const uint32_t numSlices) {
-    const uint64_t requiredSize = (uint64_t) numSlices * 2 * sizeof(uint32_t);
-    const uint64_t oldSize = ctx->sliceOffsets.size;
+    if (numSlices > UINT32_MAX / (2U * sizeof(uint32_t))) {
+        ctx->sliceOffsets.failed = true;
+        ctx->sliceOffsets.size = 0;
+        return;
+    }
+    const size_t requiredSize = (size_t) numSlices * 2U * sizeof(uint32_t);
+    const size_t oldSize = ctx->sliceOffsets.size;
     if (requiredSize == 0) {
         ctx->sliceOffsets.size = 0;
         return;
     }
 
-    if (ctx->sliceOffsets.buf == NULL) {
-        void *newBuffer = memalign(16, requiredSize * 2);
-        if (newBuffer == NULL) {
-            LOG("Unable to allocate AV1 slice offset storage");
-            ctx->sliceOffsets.size = 0;
-            return;
-        }
-        ctx->sliceOffsets.allocated = requiredSize * 2;
-        ctx->sliceOffsets.buf = newBuffer;
-    } else if (requiredSize > ctx->sliceOffsets.allocated) {
-        uint64_t newAllocated = ctx->sliceOffsets.allocated;
-        while (requiredSize > newAllocated) {
-            newAllocated += newAllocated >> 1;
-        }
-        void *newBuffer = memalign(16, newAllocated);
-        if (newBuffer == NULL) {
-            LOG("Unable to grow AV1 slice offset storage");
-            ctx->sliceOffsets.size = 0;
-            return;
-        }
-        memcpy(newBuffer, ctx->sliceOffsets.buf, oldSize);
-        free(ctx->sliceOffsets.buf);
-        ctx->sliceOffsets.buf = newBuffer;
-        ctx->sliceOffsets.allocated = newAllocated;
+    if (!reserveBuffer(&ctx->sliceOffsets, requiredSize)) {
+        LOG("Unable to reserve AV1 slice offset storage");
+        ctx->sliceOffsets.size = 0;
+        return;
     }
 
     if (requiredSize > oldSize) {

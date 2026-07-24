@@ -491,63 +491,26 @@ bool checkCudaErrors(CUresult err, const char *file, const char *function, const
 }
 
 static Object allocateObject(NVDriver *drv, ObjectType type, size_t allocatePtrSize) {
-    Object newObj = (Object) calloc(1, sizeof(struct Object_t));
-    if (newObj == NULL) {
-        return NULL;
-    }
-
-    newObj->type = type;
-
-    if (allocatePtrSize > 0) {
-        newObj->obj = calloc(1, allocatePtrSize);
-        if (newObj->obj == NULL) {
-            free(newObj);
-            return NULL;
-        }
-    }
-
     pthread_mutex_lock(&drv->objectCreationMutex);
     if (drv->terminating) {
         pthread_mutex_unlock(&drv->objectCreationMutex);
-        free(newObj->obj);
-        free(newObj);
         return NULL;
     }
-    if (drv->nextObjId == VA_INVALID_ID - 1) {
-        pthread_mutex_unlock(&drv->objectCreationMutex);
-        free(newObj->obj);
-        free(newObj);
-        return NULL;
-    }
-    if (!add_element(&drv->objects, newObj)) {
-        pthread_mutex_unlock(&drv->objectCreationMutex);
-        free(newObj->obj);
-        free(newObj);
-        return NULL;
-    }
-    newObj->id = ++drv->nextObjId;
+    Object newObj = nvdObjectTableAllocate(&drv->objects, (uint8_t) type, allocatePtrSize);
     pthread_mutex_unlock(&drv->objectCreationMutex);
-
     return newObj;
 }
 
 static Object getObject(NVDriver *drv, ObjectType type, VAGenericID id) {
     Object ret = NULL;
-    uint64_t steps = 0;
     if (id != VA_INVALID_ID) {
         nvStatsIncrement(drv, NV_STAT_OBJECT_LOOKUP_COUNT);
         pthread_mutex_lock(&drv->objectCreationMutex);
         if (!drv->terminating) {
-            ARRAY_FOR_EACH(Object, o, &drv->objects)
-                steps++;
-                if (o->id == id && o->type == type) {
-                    ret = o;
-                    break;
-                }
-            END_FOR_EACH
+            ret = nvdObjectTableGet(&drv->objects, (uint8_t) type, id);
         }
         pthread_mutex_unlock(&drv->objectCreationMutex);
-        nvStatsAdd(drv, NV_STAT_OBJECT_LOOKUP_STEPS, steps);
+        nvStatsAdd(drv, NV_STAT_OBJECT_LOOKUP_STEPS, 1);
     }
     return ret;
 }
@@ -562,45 +525,20 @@ static void* getObjectPtr(NVDriver *drv, ObjectType type, VAGenericID id) {
     return NULL;
 }
 
-static Object getObjectByPtr(NVDriver *drv, ObjectType type, void *ptr) {
-    Object ret = NULL;
-    uint64_t steps = 0;
-    if (ptr != NULL) {
-        nvStatsIncrement(drv, NV_STAT_OBJECT_LOOKUP_COUNT);
-        pthread_mutex_lock(&drv->objectCreationMutex);
-        ARRAY_FOR_EACH(Object, o, &drv->objects)
-            steps++;
-            if (o->obj == ptr && o->type == type) {
-                ret = o;
-                break;
-            }
-        END_FOR_EACH
-        pthread_mutex_unlock(&drv->objectCreationMutex);
-        nvStatsAdd(drv, NV_STAT_OBJECT_LOOKUP_STEPS, steps);
-    }
-    return ret;
-}
-
 static void deleteObject(NVDriver *drv, VAGenericID id) {
     if (id == VA_INVALID_ID) {
         return;
     }
 
     pthread_mutex_lock(&drv->objectCreationMutex);
-    ARRAY_FOR_EACH(Object, o, &drv->objects)
-        if (o->id == id) {
-            remove_element_at(&drv->objects, o_idx);
-            free(o->obj);
-            free(o);
-            //we've found the object, no need to continue
-            break;
-        }
-    END_FOR_EACH
+    Object object = nvdObjectTableRemove(&drv->objects, id);
     pthread_mutex_unlock(&drv->objectCreationMutex);
+    free(object);
 }
 
 static void setSurfaceResolving(NVSurface *surface, bool resolving);
 static void waitSurfaceResolved(NVSurface *surface);
+static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer);
 
 static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
     // Join on whether the resolve thread was actually started, not on decoder !=
@@ -639,6 +577,9 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
         nvCtx->decoder = NULL;
     }
 
+    if (nvCtx->codec != NULL && nvCtx->codec->destroy != NULL) {
+        nvCtx->codec->destroy(nvCtx);
+    }
     free(nvCtx->codecData);
     nvCtx->codecData = NULL;
 
@@ -658,12 +599,16 @@ static bool deleteAllContexts(NVDriver *drv) {
     for (;;) {
         Object contextObject = NULL;
         pthread_mutex_lock(&drv->objectCreationMutex);
-        ARRAY_FOR_EACH(Object, candidate, &drv->objects)
+        for (uint32_t i = 0; i < drv->objects.capacity; i++) {
+            Object candidate = nvdObjectTableAt(&drv->objects, i);
+            if (candidate == NULL) {
+                continue;
+            }
             if (candidate->type == OBJECT_TYPE_CONTEXT) {
                 contextObject = candidate;
                 break;
             }
-        END_FOR_EACH
+        }
         pthread_mutex_unlock(&drv->objectCreationMutex);
 
         if (contextObject == NULL) {
@@ -679,20 +624,28 @@ static bool deleteAllContexts(NVDriver *drv) {
 static void deleteAllObjects(NVDriver *drv) {
     for (;;) {
         pthread_mutex_lock(&drv->objectCreationMutex);
-        if (drv->objects.size == 0) {
+        if (drv->objects.liveCount == 0) {
             pthread_mutex_unlock(&drv->objectCreationMutex);
             break;
         }
-        uint32_t index = drv->objects.size - 1;
-        Object object = get_element_at(&drv->objects, index);
-        remove_element_at(&drv->objects, index);
+        Object object = NULL;
+        for (uint32_t i = drv->objects.capacity; i-- > 0;) {
+            object = nvdObjectTableAt(&drv->objects, i);
+            if (object != NULL) {
+                object = nvdObjectTableRemove(&drv->objects, object->id);
+                break;
+            }
+        }
         pthread_mutex_unlock(&drv->objectCreationMutex);
+
+        if (object == NULL) {
+            break;
+        }
 
         LOG("Found object %d of type %d", object->id, object->type);
         if (object->type == OBJECT_TYPE_BUFFER) {
             NVBuffer *buffer = object->obj;
-            free(buffer->ptr);
-            buffer->ptr = NULL;
+            releaseBufferMemory(drv, buffer);
         } else if (object->type == OBJECT_TYPE_SURFACE) {
             NVSurface *surface = object->obj;
             if (surface->syncInitialized) {
@@ -701,7 +654,6 @@ static void deleteAllObjects(NVDriver *drv) {
                 surface->syncInitialized = false;
             }
         }
-        free(object->obj);
         free(object);
     }
 }
@@ -2219,6 +2171,107 @@ static bool checkedAddSize(size_t left, size_t right, size_t *result) {
     return true;
 }
 
+static const size_t bufferPoolClassSizes[NVD_BUFFER_POOL_CLASS_COUNT] = {
+    4U * 1024U,
+    16U * 1024U,
+    64U * 1024U,
+    256U * 1024U,
+    1024U * 1024U,
+    4U * 1024U * 1024U,
+};
+
+static int bufferPoolClassForSize(size_t size) {
+    for (int i = 0; i < NVD_BUFFER_POOL_CLASS_COUNT; i++) {
+        if (size <= bufferPoolClassSizes[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool allocateBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
+    buffer->ptr = NULL;
+    buffer->capacity = 0;
+    buffer->poolClass = -1;
+    if (size == 0) {
+        return true;
+    }
+
+    const int poolClass = bufferPoolClassForSize(size);
+    const size_t capacity = poolClass >= 0 ? bufferPoolClassSizes[poolClass] : size;
+    if (poolClass >= 0) {
+        pthread_mutex_lock(&drv->bufferPoolMutex);
+        NVBufferPoolBlock *block = drv->bufferPool[poolClass];
+        if (block != NULL) {
+            drv->bufferPool[poolClass] = block->next;
+            drv->bufferPoolCounts[poolClass]--;
+            drv->bufferPoolBytes -= capacity;
+            buffer->ptr = block;
+        }
+        pthread_mutex_unlock(&drv->bufferPoolMutex);
+    }
+
+    if (buffer->ptr != NULL) {
+        nvStatsIncrement(drv, NV_STAT_BUFFER_POOL_HITS);
+    } else {
+        nvStatsIncrement(drv, NV_STAT_BUFFER_POOL_MISSES);
+        if (posix_memalign(&buffer->ptr, 16, capacity) != 0) {
+            buffer->ptr = NULL;
+            return false;
+        }
+    }
+    buffer->capacity = capacity;
+    buffer->poolClass = (int8_t) poolClass;
+    return true;
+}
+
+static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
+    if (buffer == NULL || buffer->ptr == NULL) {
+        return;
+    }
+    bool pooled = false;
+    if (buffer->poolClass >= 0 && buffer->poolClass < NVD_BUFFER_POOL_CLASS_COUNT) {
+        const int poolClass = buffer->poolClass;
+        pthread_mutex_lock(&drv->bufferPoolMutex);
+        if (drv->bufferPoolCounts[poolClass] < 16 &&
+            buffer->capacity <= drv->bufferPoolMaxBytes &&
+            drv->bufferPoolBytes <= drv->bufferPoolMaxBytes - buffer->capacity) {
+            NVBufferPoolBlock *block = buffer->ptr;
+            block->next = drv->bufferPool[poolClass];
+            drv->bufferPool[poolClass] = block;
+            drv->bufferPoolCounts[poolClass]++;
+            drv->bufferPoolBytes += buffer->capacity;
+            pooled = true;
+        }
+        pthread_mutex_unlock(&drv->bufferPoolMutex);
+    }
+    if (!pooled) {
+        free(buffer->ptr);
+    }
+    buffer->ptr = NULL;
+    buffer->capacity = 0;
+    buffer->poolClass = -1;
+}
+
+static void destroyBufferPool(NVDriver *drv) {
+    if (!drv->bufferPoolMutexInitialized) {
+        return;
+    }
+    pthread_mutex_lock(&drv->bufferPoolMutex);
+    for (int i = 0; i < NVD_BUFFER_POOL_CLASS_COUNT; i++) {
+        NVBufferPoolBlock *block = drv->bufferPool[i];
+        while (block != NULL) {
+            NVBufferPoolBlock *next = block->next;
+            free(block);
+            block = next;
+        }
+        drv->bufferPool[i] = NULL;
+        drv->bufferPoolCounts[i] = 0;
+    }
+    drv->bufferPoolBytes = 0;
+    pthread_mutex_unlock(&drv->bufferPoolMutex);
+}
+
 static VAStatus nvCreateBuffer(
         VADriverContextP ctx,
         VAContextID context,		/* in */
@@ -2268,8 +2321,6 @@ static VAStatus nvCreateBuffer(
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
-    //TODO should pool these as most of the time these should be the same size
-    nvStatsIncrement(drv, NV_STAT_BUFFER_POOL_MISSES);
     Object bufferObject = allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
     if (bufferObject == NULL) {
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -2279,10 +2330,9 @@ static VAStatus nvCreateBuffer(
     buf->bufferType = type;
     buf->elements = num_elements;
     buf->size = bufferSize;
-    buf->ptr = buf->size != 0 ? memalign(16, buf->size) : NULL;
     buf->offset = offset;
 
-    if (buf->size != 0 && buf->ptr == NULL) {
+    if (!allocateBufferMemory(drv, buf, buf->size)) {
         LOG("Unable to allocate buffer of %zu bytes", buf->size);
         // allocateObject has already published the ID; remove it before
         // returning so failed allocations cannot leave zombie VA objects.
@@ -2293,6 +2343,8 @@ static VAStatus nvCreateBuffer(
     if (data != NULL && buf->size != 0)
     {
         memcpy(buf->ptr, data, buf->size);
+    } else if (buf->size != 0) {
+        memset(buf->ptr, 0, buf->size);
     }
 
     *buf_id = bufferObject->id;
@@ -2346,9 +2398,7 @@ static VAStatus nvDestroyBuffer(
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
 
-    if (buf->ptr != NULL) {
-        free(buf->ptr);
-    }
+    releaseBufferMemory(drv, buf);
 
     deleteObject(drv, buffer_id);
 
@@ -3593,6 +3643,7 @@ static VAStatus nvBeginPicture(
 
     nvCtx->bitstreamBuffer.failed = false;
     nvCtx->sliceOffsets.failed = false;
+    nvCtx->bitstreamDataOffset = 0;
 
     memset(&nvCtx->pPicParams, 0, sizeof(CUVIDPICPARAMS));
     nvCtx->renderTarget = surface;
@@ -3730,7 +3781,7 @@ static VAStatus nvEndPicture(
         return decoderStatus;
     }
 
-    picParams->pBitstreamData = nvCtx->bitstreamBuffer.buf;
+    picParams->pBitstreamData = PTROFF(nvCtx->bitstreamBuffer.buf, nvCtx->bitstreamDataOffset);
     picParams->pSliceDataOffsets = nvCtx->sliceOffsets.buf;
     nvCtx->bitstreamBuffer.size = 0;
     nvCtx->sliceOffsets.size = 0;
@@ -3881,25 +3932,31 @@ static VAStatus nvCreateImage(
     const NVFormatInfo *fmtInfo = &formatsInfo[nvFormat];
     const NVFormatPlane *p = fmtInfo->plane;
 
-    size_t pixelCount = 0;
-    if (!checkedMultiplySize((size_t) width, (size_t) height, &pixelCount)) {
-        return VA_STATUS_ERROR_INVALID_PARAMETER;
-    }
-
     size_t planeSizes[3] = {0};
     size_t imageSize = 0;
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        size_t planePixels = pixelCount >> (p[i].ss.x + p[i].ss.y);
+        size_t planePixels = 0;
         size_t bytesPerSample = 0;
-        if (!checkedMultiplySize(fmtInfo->bppc, p[i].channelCount, &bytesPerSample) ||
+        if (!checkedMultiplySize((size_t) width >> p[i].ss.x,
+                                 (size_t) height >> p[i].ss.y,
+                                 &planePixels) ||
+            !checkedMultiplySize(fmtInfo->bppc, p[i].channelCount, &bytesPerSample) ||
             !checkedMultiplySize(planePixels, bytesPerSample, &planeSizes[i]) ||
             !checkedAddSize(imageSize, planeSizes[i], &imageSize)) {
             return VA_STATUS_ERROR_INVALID_PARAMETER;
         }
     }
-    size_t pitch = 0;
-    if (!checkedMultiplySize((size_t) width, fmtInfo->bppc, &pitch) ||
-        imageSize > UINT32_MAX || pitch > UINT32_MAX) {
+    size_t planePitches[3] = {0};
+    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+        size_t planeWidth = (size_t) width >> p[i].ss.x;
+        size_t bytesPerSample = 0;
+        if (!checkedMultiplySize(fmtInfo->bppc, p[i].channelCount, &bytesPerSample) ||
+            !checkedMultiplySize(planeWidth, bytesPerSample, &planePitches[i]) ||
+            planePitches[i] > UINT32_MAX) {
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        }
+    }
+    if (imageSize > UINT32_MAX) {
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
@@ -3926,14 +3983,15 @@ static VAStatus nvCreateImage(
     imageBuffer->bufferType = VAImageBufferType;
     imageBuffer->size = imageSize;
     imageBuffer->elements = 1;
-    imageBuffer->ptr = memalign(16, imageBuffer->size);
-    if (imageBuffer->ptr == NULL) {
+    if (!allocateBufferMemory(drv, imageBuffer, imageBuffer->size)) {
         deleteObject(drv, imageBufferObject->id);
         deleteObject(drv, imageObj->id);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
+    memset(imageBuffer->ptr, 0, imageBuffer->size);
 
     img->imageBuffer = imageBuffer;
+    img->imageBufferId = imageBufferObject->id;
 
     image->image_id = imageObj->id;
     memcpy(&image->format, format, sizeof(VAImageFormat));
@@ -3953,9 +4011,9 @@ static VAStatus nvCreateImage(
      * An array indicating the scanline pitch in bytes for each plane.
      * Each plane may have a different pitch. Maximum 3 planes for planar formats
      */
-    image->pitches[0] = pitch;
-    image->pitches[1] = pitch;
-    image->pitches[2] = pitch;
+    image->pitches[0] = (uint32_t) planePitches[0];
+    image->pitches[1] = (uint32_t) planePitches[1];
+    image->pitches[2] = (uint32_t) planePitches[2];
     /*
      * An array indicating the byte offset from the beginning of the image data
      * to the start of each plane.
@@ -3990,14 +4048,9 @@ static VAStatus nvDestroyImage(
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
 
-    Object imageBufferObj = getObjectByPtr(drv, OBJECT_TYPE_BUFFER, img->imageBuffer);
-
-    if (imageBufferObj != NULL) {
-        if (img->imageBuffer->ptr != NULL) {
-            free(img->imageBuffer->ptr);
-        }
-
-        deleteObject(drv, imageBufferObj->id);
+    if (getObjectPtr(drv, OBJECT_TYPE_BUFFER, img->imageBufferId) != NULL) {
+        releaseBufferMemory(drv, img->imageBuffer);
+        deleteObject(drv, img->imageBufferId);
     }
 
     deleteObject(drv, image);
@@ -4045,42 +4098,58 @@ static VAStatus nvGetImage(
 
     NVContext *context = (NVContext*) surfaceObj->context;
     const NVFormatInfo *fmtInfo = &formatsInfo[imageObj->format];
-    uint32_t offset = 0;
 
     if (context == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (surfaceObj->backingImage == NULL ||
+        surfaceObj->backingImage->format != imageObj->format ||
+        x < 0 || y < 0 || width == 0 || height == 0 ||
+        (uint64_t) (unsigned int) x + width > surfaceObj->width ||
+        (uint64_t) (unsigned int) y + height > surfaceObj->height ||
+        width > imageObj->width || height > imageObj->height) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
     //wait for the surface to be decoded
     nvSyncSurface(ctx, surface);
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    size_t destinationOffset = 0;
+    VAStatus status = VA_STATUS_SUCCESS;
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
+        const size_t bytesPerSample = (size_t) fmtInfo->bppc * p->channelCount;
+        const size_t destinationPitch = ((size_t) imageObj->width >> p->ss.x) * bytesPerSample;
         CUDA_MEMCPY2D memcpy2d = {
-        .srcXInBytes = 0, .srcY = 0,
+        .srcXInBytes = ((unsigned int) x >> p->ss.x) * bytesPerSample,
+        .srcY = (unsigned int) y >> p->ss.y,
         .srcMemoryType = CU_MEMORYTYPE_ARRAY,
         .srcArray = surfaceObj->backingImage->arrays[i],
 
         .dstXInBytes = 0, .dstY = 0,
         .dstMemoryType = CU_MEMORYTYPE_HOST,
-        .dstHost = (char *)imageObj->imageBuffer->ptr + offset,
-        .dstPitch = width * fmtInfo->bppc,
+        .dstHost = (char *)imageObj->imageBuffer->ptr + destinationOffset,
+        .dstPitch = destinationPitch,
 
-        .WidthInBytes = (width >> p->ss.x) * fmtInfo->bppc * p->channelCount,
+        .WidthInBytes = (width >> p->ss.x) * bytesPerSample,
         .Height = height >> p->ss.y
         };
 
         CUresult result = cu->cuMemcpy2D(&memcpy2d);
         if (result != CUDA_SUCCESS) {
             LOG("cuMemcpy2D failed: %d", result);
-            return VA_STATUS_ERROR_DECODING_ERROR;
+            status = VA_STATUS_ERROR_DECODING_ERROR;
+            break;
         }
-        offset += ((width * height) >> (p->ss.x + p->ss.y)) * fmtInfo->bppc * p->channelCount;
+        destinationOffset += destinationPitch * ((size_t) imageObj->height >> p->ss.y);
     }
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+    CUresult popResult = cu->cuCtxPopCurrent(NULL);
+    if (popResult != CUDA_SUCCESS) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
 
-    return VA_STATUS_SUCCESS;
+    return status;
 }
 
 static VAStatus nvPutImage(
@@ -4687,8 +4756,13 @@ static VAStatus nvTerminate( VADriverContextP ctx )
     failed |= CHECK_CUDA_RESULT(cu->cuCtxDestroy(drv->cudaContext));
     drv->cudaContext = NULL;
 
-    free(drv->objects.buf);
+    nvdObjectTableDestroy(&drv->objects);
     free(drv->images.buf);
+    destroyBufferPool(drv);
+    if (drv->bufferPoolMutexInitialized) {
+        pthread_mutex_destroy(&drv->bufferPoolMutex);
+        drv->bufferPoolMutexInitialized = false;
+    }
     pthread_mutex_destroy(&drv->exportMutex);
     pthread_mutex_destroy(&drv->imagesMutex);
     pthread_mutex_destroy(&drv->objectCreationMutex);
@@ -4805,6 +4879,7 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         releaseInstanceSlot();
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
+    nvdObjectTableInit(&drv->objects);
     ctx->pDriverData = drv;
     bool objectMutexInitialized = false;
     bool imagesMutexInitialized = false;
@@ -4842,6 +4917,8 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     }
     drv->videoProcScratchMaxBytes =
         parseEnvU64("NVD_VIDEOPROC_SCRATCH_MAX_BYTES", DEFAULT_VIDEOPROC_SCRATCH_MAX_BYTES);
+    drv->bufferPoolMaxBytes =
+        parseEnvU64("NVD_BUFFER_POOL_MAX_BYTES", 64ULL * 1024ULL * 1024ULL);
 
     nvStatsInit(drv);
 
@@ -4889,6 +4966,10 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         goto fail;
     }
     exportMutexInitialized = true;
+    if (pthread_mutex_init(&drv->bufferPoolMutex, NULL) != 0) {
+        goto fail;
+    }
+    drv->bufferPoolMutexInitialized = true;
 
     if (!drv->backend->initExporter(drv)) {
         LOG("Exporter failed");
@@ -4926,13 +5007,18 @@ fail:
     if (exportMutexInitialized) {
         pthread_mutex_destroy(&drv->exportMutex);
     }
+    if (drv->bufferPoolMutexInitialized) {
+        destroyBufferPool(drv);
+        pthread_mutex_destroy(&drv->bufferPoolMutex);
+        drv->bufferPoolMutexInitialized = false;
+    }
     if (imagesMutexInitialized) {
         pthread_mutex_destroy(&drv->imagesMutex);
     }
     if (objectMutexInitialized) {
         pthread_mutex_destroy(&drv->objectCreationMutex);
     }
-    free(drv->objects.buf);
+    nvdObjectTableDestroy(&drv->objects);
     free(drv->images.buf);
     free(drv);
     ctx->pDriverData = NULL;

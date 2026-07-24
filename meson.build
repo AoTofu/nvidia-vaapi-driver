@@ -62,6 +62,7 @@ sources = [
     'src/kernels.c',
     'src/mpeg2.c',
     'src/mpeg4.c',
+    'src/object-table.c',
     'src/resolve-queue.c',
     'src/stats.c',
     'src/surface-import.c',
@@ -119,6 +120,13 @@ decode_surfaces_test = executable(
     include_directories: include_directories('src'),
 )
 test('decode surfaces', decode_surfaces_test, timeout: 30)
+
+object_table_test = executable(
+    'test-object-table',
+    ['tests/test-object-table.c', 'src/object-table.c'],
+    include_directories: include_directories('src'),
+)
+test('object table', object_table_test, timeout: 30)
 
 meson.add_devenv(environment({
     'NVD_LOG': '1',

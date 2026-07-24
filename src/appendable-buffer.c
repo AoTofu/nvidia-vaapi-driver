@@ -36,6 +36,22 @@ bool reserveBuffer(AppendableBuffer *buffer, size_t required) {
     return true;
 }
 
+bool reserveAdditionalBuffer(AppendableBuffer *buffer, size_t additional) {
+    if (buffer->size > SIZE_MAX - additional) {
+        buffer->failed = true;
+        return false;
+    }
+    return reserveBuffer(buffer, buffer->size + additional);
+}
+
+bool reserveBufferElements(AppendableBuffer *buffer, size_t elements, size_t elementSize) {
+    if (elements != 0 && elementSize > SIZE_MAX / elements) {
+        buffer->failed = true;
+        return false;
+    }
+    return reserveAdditionalBuffer(buffer, elements * elementSize);
+}
+
 bool appendBuffer(AppendableBuffer *buffer, const void *data, size_t size) {
     if (size == 0) {
         return true;

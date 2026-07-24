@@ -131,6 +131,7 @@ Environment variables used to control the behavior of this library.
 | `NVD_DECODE_SURFACES_MIN` | Lower bound for automatic or forced decode-surface selection. Default: `2`. |
 | `NVD_DECODE_SURFACES_MAX` | Upper bound for decode-surface selection. NVIDIA picture indices are limited to 32, so larger values are clamped. Default: `32`. |
 | `NVD_VIDEOPROC_SCRATCH_MAX_BYTES` | Upper bound, separately, for fallback VideoProc GPU and CPU scratch buffers. Direct CUDA-array conversion does not allocate these buffers. Set to `0` to disable scratch-backed fallbacks. Default: `268435456` (256 MiB). Idle fallback scratch is released after 120 consecutive CUDA-processed frames. |
+| `NVD_BUFFER_POOL_MAX_BYTES` | Upper bound for reusable VA buffer/image host allocations. Six size classes from 4 KiB through 4 MiB are retained; oversize allocations are freed immediately. Set to `0` to disable retention. Default: `67108864` (64 MiB). |
 | `NVD_STATS` | Enables performance counters. `1` logs every 120 decoded pictures; a larger integer selects that interval. A final snapshot is always emitted when the driver terminates. Leave unset for benchmark runs that do not need instrumentation. |
 | `NVD_STATS_LOG` | Appends `NVD_STATS` snapshots to this file instead of the normal log output. Statistics include copy bytes, host fallbacks, resolve-queue pressure, backing allocation time/cache usage, current and peak backing/scratch memory, VideoProc time, object lookup cost, and codec copy volume. |
 
