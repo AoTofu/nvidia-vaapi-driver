@@ -14,6 +14,7 @@
 #include <sys/param.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <linux/dma-buf.h>
 
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
@@ -34,10 +35,6 @@
 
 #ifndef __has_include
 #define __has_include(x) 0
-#endif
-
-#ifndef CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_FD
-#define CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_FD ((CUexternalMemoryHandleType)7)
 #endif
 
 #if __has_include(<pthread_np.h>)
@@ -215,11 +212,34 @@ static BackingImage *retainBackingImageByFd(NVDriver *drv, int fd, NVFormat form
     END_FOR_EACH
     pthread_mutex_unlock(&drv->imagesMutex);
 
-    if (ret != NULL) {
-        nvStatsIncrement(drv, NV_STAT_BACKING_CACHE_HITS);
+    return ret;
+}
+
+static bool backingImageMatchesImportedLayout(const BackingImage *existing,
+                                              const BackingImage *imported) {
+    if (existing == NULL || imported == NULL || existing->format != imported->format) {
+        return false;
+    }
+    const NVFormatInfo *fmtInfo = &formatsInfo[existing->format];
+    const uint32_t expectedObjects = existing->isSingleBuffer ? 1 : fmtInfo->numPlanes;
+    if (imported->numObjects != expectedObjects || imported->numPlanes != fmtInfo->numPlanes) {
+        return false;
     }
 
-    return ret;
+    for (uint32_t plane = 0; plane < fmtInfo->numPlanes; plane++) {
+        const uint32_t importedObject = imported->planeObjectIndex[plane];
+        const uint32_t existingObject = existing->isSingleBuffer ? 0 : plane;
+        struct stat importedStat;
+        if (importedObject >= imported->numObjects ||
+            fstat(imported->fds[importedObject], &importedStat) != 0 ||
+            !backingImageFdMatchesStat(existing, &importedStat, (int) existingObject) ||
+            imported->offsets[plane] != existing->offsets[plane] ||
+            imported->strides[plane] != existing->strides[plane] ||
+            imported->mods[importedObject] != existing->mods[existingObject]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool processRequiresSingleBufferExport(void) {
@@ -1263,227 +1283,171 @@ static VAStatus nvQueryConfigAttributes(
     return VA_STATUS_SUCCESS;
 }
 
-typedef struct {
-    bool valid;
-    uint32_t memoryType;
-    uint32_t pixelFormat;
-    uint32_t width;
-    uint32_t height;
-    uint32_t dataSize;
-    uint32_t numPlanes;
-    uint32_t pitches[4];
-    uint32_t offsets[4];
-    int fds[4];
-    uint32_t numFds;
-} ImportedSurface;
-
-static void initImportedSurface(ImportedSurface *imported) {
-    memset(imported, 0, sizeof(*imported));
-    for (int i = 0; i < 4; i++) {
-        imported->fds[i] = -1;
+static void releaseExternalCudaBuffers(NVDriver *drv, BackingImage *img) {
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        if (img->externalDevicePtrs[i] != 0) {
+            CHECK_CUDA_RESULT(drv->cu->cuMemFree(img->externalDevicePtrs[i]));
+            img->externalDevicePtrs[i] = 0;
+            img->externalDeviceSize[i] = 0;
+        }
+        if (img->externalObjectMems[i] != NULL) {
+            CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->externalObjectMems[i]));
+            img->externalObjectMems[i] = NULL;
+        }
     }
 }
 
-static void parseSurfaceImportAttributes(VASurfaceAttrib *attribList, unsigned int numAttribs, ImportedSurface *imported) {
-    initImportedSurface(imported);
-    void *externalDescriptor = NULL;
-
-    for (unsigned int i = 0; i < numAttribs; i++) {
-        switch (attribList[i].type) {
-        case VASurfaceAttribMemoryType:
-            imported->memoryType = (uint32_t) attribList[i].value.value.i;
-            break;
-        case VASurfaceAttribExternalBufferDescriptor:
-            externalDescriptor = attribList[i].value.value.p;
-            break;
-        case VASurfaceAttribPixelFormat:
-            imported->pixelFormat = (uint32_t) attribList[i].value.value.i;
-            break;
-        default:
-            break;
+static bool importedObjectsAreLinear(const BackingImage *img) {
+    if (img->numObjects == 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        if (img->mods[i] != DRM_FORMAT_MOD_LINEAR) {
+            return false;
         }
     }
-
-    if (externalDescriptor == NULL) {
-        return;
-    }
-
-    if ((imported->memoryType & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME) != 0) {
-        VASurfaceAttribExternalBuffers *ext = (VASurfaceAttribExternalBuffers*) externalDescriptor;
-        imported->pixelFormat = ext->pixel_format != 0 ? ext->pixel_format : imported->pixelFormat;
-        imported->width = ext->width;
-        imported->height = ext->height;
-        imported->dataSize = ext->data_size;
-        imported->numPlanes = ext->num_planes;
-        imported->numFds = ext->num_buffers;
-        if (imported->numPlanes > 4 || imported->numFds == 0 || imported->numFds > 4 || ext->buffers == NULL) {
-            imported->valid = false;
-            return;
-        }
-        for (uint32_t i = 0; i < imported->numPlanes; i++) {
-            imported->pitches[i] = ext->pitches[i];
-            imported->offsets[i] = ext->offsets[i];
-        }
-        for (uint32_t i = 0; i < imported->numFds; i++) {
-            imported->fds[i] = (int) ext->buffers[i];
-        }
-        imported->valid = true;
-    } else if ((imported->memoryType & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) != 0) {
-        VADRMPRIMESurfaceDescriptor *desc = (VADRMPRIMESurfaceDescriptor*) externalDescriptor;
-        imported->pixelFormat = desc->fourcc;
-        imported->width = desc->width;
-        imported->height = desc->height;
-        imported->numFds = desc->num_objects;
-        if (desc->num_layers == 0 || imported->numFds == 0 || imported->numFds > 4) {
-            imported->valid = false;
-            return;
-        }
-        for (uint32_t i = 0; i < imported->numFds; i++) {
-            imported->fds[i] = desc->objects[i].fd;
-            imported->dataSize += desc->objects[i].size;
-        }
-        // A planar surface may be described either as one layer holding every
-        // plane, or as several single-plane layers (e.g. NV12 as separate Y and
-        // UV layers). Flatten all layers into one plane list so chroma isn't
-        // dropped when the client uses the multi-layer form.
-        uint32_t planeIdx = 0;
-        for (uint32_t l = 0; l < desc->num_layers; l++) {
-            for (uint32_t p = 0; p < desc->layers[l].num_planes; p++) {
-                if (planeIdx >= 4) {
-                    imported->valid = false;
-                    return;
-                }
-                imported->pitches[planeIdx] = desc->layers[l].pitch[p];
-                imported->offsets[planeIdx] = desc->layers[l].offset[p];
-                planeIdx++;
-            }
-        }
-        imported->numPlanes = planeIdx;
-        imported->valid = planeIdx > 0;
-    }
+    return true;
 }
 
-static bool importExternalBackingToCuda(NVDriver *drv, BackingImage *img) {
-    if (img->fds[0] < 0 || img->totalSize == 0) {
+static bool importExternalBuffersToCuda(NVDriver *drv, BackingImage *img) {
+    if (!importedObjectsAreLinear(img) || drv->cu->cuExternalMemoryGetMappedBuffer == NULL) {
         return false;
     }
 
-    int importFd = dup(img->fds[0]);
-    if (importFd < 0) {
-        return false;
-    }
-
-    CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
-        .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-        .handle.fd = importFd,
-        .flags = 0,
-        .size = img->totalSize
-    };
-    LOG_DEBUG("Importing external memory to CUDA: fd=%d size=%u", importFd, img->totalSize);
-    if (CHECK_CUDA_RESULT(drv->cu->cuImportExternalMemory(&img->extMem, &extMemDesc))) {
-        close(importFd);
-        return false;
-    }
-    img->isSingleBuffer = true;
-
-    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mipmapArrayDesc = {
-            .arrayDesc = {
-                .Width = img->width >> fmtInfo->plane[i].ss.x,
-                .Height = img->height >> fmtInfo->plane[i].ss.y,
-                .Depth = 0,
-                .Format = fmtInfo->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
-                .NumChannels = fmtInfo->plane[i].channelCount,
-                .Flags = 0
-            },
-            .numLevels = 1,
-            .offset = (unsigned long long) img->offsets[i]
-        };
-        if (CHECK_CUDA_RESULT(drv->cu->cuExternalMemoryGetMappedMipmappedArray(&img->cudaImages[i].mipmapArray, img->extMem, &mipmapArrayDesc)) ||
-            CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayGetLevel(&img->arrays[i], img->cudaImages[i].mipmapArray, 0))) {
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        if (img->fds[i] < 0 || img->objectSize[i] == 0) {
             goto fail;
         }
+        int importFd = dup(img->fds[i]);
+        if (importFd < 0) {
+            goto fail;
+        }
+        // On desktop CUDA, generic dma-buf import is not available through the
+        // external-memory API. OPAQUE_FD still permits zero-copy for handles
+        // produced by a CUDA-compatible external API; ordinary dma-bufs fall
+        // through to the mmap-backed direct D-to-H path below.
+        CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
+            .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+            .handle.fd = importFd,
+            .flags = 0,
+            .size = img->objectSize[i]
+        };
+        CUresult importResult = drv->cu->cuImportExternalMemory(&img->externalObjectMems[i], &extMemDesc);
+        if (importResult != CUDA_SUCCESS) {
+            LOG_DEBUG("CUDA mapped-buffer import unavailable for external object %u (error %d)",
+                      i, importResult);
+            close(importFd);
+            goto fail;
+        }
+        CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufferDesc = {
+            .offset = 0,
+            .size = img->objectSize[i],
+            .flags = 0
+        };
+        CUresult mapResult = drv->cu->cuExternalMemoryGetMappedBuffer(&img->externalDevicePtrs[i],
+                                                                      img->externalObjectMems[i],
+                                                                      &bufferDesc);
+        if (mapResult != CUDA_SUCCESS) {
+            LOG_DEBUG("CUDA mapped-buffer mapping unavailable for external object %u (error %d)",
+                      i, mapResult);
+            goto fail;
+        }
+        img->externalDeviceSize[i] = img->objectSize[i];
     }
 
+    char fourcc[5];
+    LOG_DEBUG("Imported linear external %s surface as %u CUDA mapped buffer object(s)",
+              fourccString((uint32_t) img->fourcc, fourcc), img->numObjects);
     return true;
 
 fail:
-    // Release the CUDA arrays/mipmaps created so far and the external memory
-    // object; the caller only frees the BackingImage struct and its fds.
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (img->arrays[i] != NULL) {
-            CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(img->arrays[i]));
-            img->arrays[i] = NULL;
-        }
-        if (img->cudaImages[i].mipmapArray != NULL) {
-            CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayDestroy(img->cudaImages[i].mipmapArray));
-            img->cudaImages[i].mipmapArray = NULL;
-        }
+    releaseExternalCudaBuffers(drv, img);
+    return false;
+}
+
+static bool mapExternalBacking(BackingImage *img) {
+    if (!importedObjectsAreLinear(img)) {
+        return false;
     }
-    if (img->extMem != NULL) {
-        CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->extMem));
-        img->extMem = NULL;
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        if (img->fds[i] < 0 || img->objectSize[i] == 0 || img->objectSize[i] > SIZE_MAX) {
+            goto fail;
+        }
+        img->externalMappings[i] = mmap(NULL, (size_t) img->objectSize[i], PROT_READ | PROT_WRITE,
+                                        MAP_SHARED, img->fds[i], 0);
+        if (img->externalMappings[i] == MAP_FAILED) {
+            img->externalMappings[i] = NULL;
+            goto fail;
+        }
+        img->externalMappingSize[i] = img->objectSize[i];
+    }
+    return true;
+
+fail:
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        if (img->externalMappings[i] != NULL) {
+            munmap(img->externalMappings[i], (size_t) img->externalMappingSize[i]);
+            img->externalMappings[i] = NULL;
+            img->externalMappingSize[i] = 0;
+        }
     }
     return false;
 }
 
-static bool importExternalBufferToCuda(NVDriver *drv, BackingImage *img) {
-    if (img->fds[0] < 0 || img->totalSize == 0 || drv->cu->cuExternalMemoryGetMappedBuffer == NULL) {
-        return false;
+static uint64_t importedFdSize(int fd) {
+    struct stat statBuffer;
+    if (fstat(fd, &statBuffer) == 0 && statBuffer.st_size > 0) {
+        return (uint64_t) statBuffer.st_size;
     }
-
-    int importFd = dup(img->fds[0]);
-    if (importFd < 0) {
-        return false;
+    const off_t original = lseek(fd, 0, SEEK_CUR);
+    const off_t end = lseek(fd, 0, SEEK_END);
+    if (original >= 0) {
+        lseek(fd, original, SEEK_SET);
     }
-
-    CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
-        .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-        .handle.fd = importFd,
-        .flags = 0,
-        .size = img->totalSize
-    };
-    if (CHECK_CUDA_RESULT(drv->cu->cuImportExternalMemory(&img->extMem, &extMemDesc))) {
-        close(importFd);
-        return false;
+    if (end > 0) {
+        return (uint64_t) end;
     }
-
-    CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufferDesc = {
-        .offset = 0,
-        .size = img->totalSize,
-        .flags = 0
-    };
-    if (CHECK_CUDA_RESULT(drv->cu->cuExternalMemoryGetMappedBuffer(&img->externalDevicePtr, img->extMem, &bufferDesc))) {
-        CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->extMem));
-        img->extMem = NULL;
-        return false;
-    }
-
-    img->externalDeviceSize = img->totalSize;
-    img->isSingleBuffer = true;
-    char fourcc[5];
-    LOG_DEBUG("Imported external %s surface as CUDA mapped buffer", fourccString((uint32_t) img->fourcc, fourcc));
-    return true;
+    return 0;
 }
 
-static bool mapExternalBacking(BackingImage *img) {
-    if (img->fds[0] < 0 || img->totalSize == 0) {
+static bool validateImportedLayout(const BackingImage *img) {
+    if (img->format <= NV_FORMAT_NONE || img->format > NV_FORMAT_ARGB ||
+        img->numObjects == 0 || img->numObjects > NVD_MAX_IMPORTED_OBJECTS) {
+        return false;
+    }
+    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+    if (img->numPlanes != fmtInfo->numPlanes) {
         return false;
     }
 
-    img->externalMapping = mmap(NULL, img->totalSize, PROT_READ | PROT_WRITE, MAP_SHARED, img->fds[0], 0);
-    if (img->externalMapping == MAP_FAILED) {
-        img->externalMapping = NULL;
-        return false;
+    for (uint32_t i = 0; i < img->numPlanes; i++) {
+        const NVFormatPlane *plane = &fmtInfo->plane[i];
+        const uint32_t objectIndex = img->planeObjectIndex[i];
+        const uint64_t widthBytes = (uint64_t) (img->width >> plane->ss.x) *
+                                    fmtInfo->bppc * plane->channelCount;
+        const uint64_t height = img->height >> plane->ss.y;
+        if (objectIndex >= img->numObjects || img->objectSize[objectIndex] == 0 ||
+            img->strides[i] <= 0 || (uint64_t) img->strides[i] < widthBytes || height == 0) {
+            return false;
+        }
+        const uint64_t lastRow = height - 1;
+        if (lastRow > (UINT64_MAX - (uint64_t) img->offsets[i] - widthBytes) /
+                          (uint64_t) img->strides[i]) {
+            return false;
+        }
+        const uint64_t end = (uint64_t) img->offsets[i] +
+                             lastRow * (uint64_t) img->strides[i] + widthBytes;
+        if (end > img->objectSize[objectIndex]) {
+            return false;
+        }
     }
-    img->externalMappingSize = img->totalSize;
     return true;
 }
 
 static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const ImportedSurface *imported, uint32_t width, uint32_t height) {
     NVFormat format = nvFormatFromSurfaceFourcc(imported->pixelFormat);
-    if (format == NV_FORMAT_NONE || imported->numPlanes == 0 || imported->fds[0] < 0) {
+    if (format == NV_FORMAT_NONE || imported->numPlanes == 0 || imported->numObjects == 0 ||
+        imported->objects[0].fd < 0) {
         return NULL;
     }
 
@@ -1500,27 +1464,49 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
     img->width = width;
     img->height = height;
     img->fourcc = (int) imported->pixelFormat;
-    img->totalSize = imported->dataSize;
-    for (uint32_t i = 0; i < imported->numFds && i < 4; i++) {
-        img->fds[i] = dup(imported->fds[i]);
+    img->numObjects = imported->numObjects;
+    img->numPlanes = imported->numPlanes;
+    img->isSingleBuffer = imported->numObjects == 1;
+    for (uint32_t i = 0; i < imported->numObjects; i++) {
+        img->fds[i] = dup(imported->objects[i].fd);
         if (img->fds[i] < 0) {
             goto fail;
         }
         cacheBackingImageFdStat(img, (int) i);
+        const uint64_t actualSize = importedFdSize(img->fds[i]);
+        img->objectSize[i] = imported->objects[i].size != 0 ? imported->objects[i].size : actualSize;
+        if (img->objectSize[i] == 0 || (actualSize != 0 && img->objectSize[i] > actualSize) ||
+            UINT64_MAX - img->totalSize < img->objectSize[i]) {
+            goto fail;
+        }
+        img->totalSize += img->objectSize[i];
+        img->mods[i] = imported->objects[i].modifier;
     }
-    off_t realSize = lseek(img->fds[0], 0, SEEK_END);
-    if (realSize > 0) {
-        img->totalSize = (uint32_t) realSize;
-        lseek(img->fds[0], 0, SEEK_SET);
+    for (uint32_t i = 0; i < imported->numPlanes; i++) {
+        if (imported->planes[i].objectIndex >= img->numObjects ||
+            imported->planes[i].pitch > INT_MAX || imported->planes[i].offset > INT_MAX) {
+            goto fail;
+        }
+        img->planeObjectIndex[i] = imported->planes[i].objectIndex;
+        img->strides[i] = (int) imported->planes[i].pitch;
+        img->offsets[i] = (int) imported->planes[i].offset;
+        const uint32_t objectIndex = imported->planes[i].objectIndex;
+        img->size[i] = img->objectSize[objectIndex] > UINT32_MAX
+            ? UINT32_MAX
+            : (uint32_t) img->objectSize[objectIndex];
     }
-    for (uint32_t i = 0; i < imported->numPlanes && i < 4; i++) {
-        img->strides[i] = (int) imported->pitches[i];
-        img->offsets[i] = (int) imported->offsets[i];
-        img->size[i] = imported->dataSize;
+    if (!validateImportedLayout(img)) {
+        LOG("Invalid imported surface object/plane layout");
+        goto fail;
     }
 
-    BackingImage *existing = retainBackingImageByFd(drv, imported->fds[0], format, width, height);
+    BackingImage *existing = retainBackingImageByFd(drv, imported->objects[0].fd, format, width, height);
+    if (existing != NULL && !backingImageMatchesImportedLayout(existing, img)) {
+        atomic_fetch_sub(&existing->borrowCount, 1);
+        existing = NULL;
+    }
     if (existing != NULL) {
+        nvStatsIncrement(drv, NV_STAT_BACKING_CACHE_HITS);
         nvBackingImageCopyColorMetadata(img, existing);
         const NVFormatInfo *fmtInfo = &formatsInfo[format];
         for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
@@ -1538,7 +1524,7 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
         return img;
     }
 
-    if (isRgbFourcc(imported->pixelFormat) && importExternalBufferToCuda(drv, img)) {
+    if (importExternalBuffersToCuda(drv, img)) {
         return img;
     }
 
@@ -1546,28 +1532,19 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
         return img;
     }
 
-    if (isRgbFourcc(imported->pixelFormat)) {
-        char fourcc[5];
-        LOG("Unable to mmap imported RGB surface %s", fourccString(imported->pixelFormat, fourcc));
-        goto fail;
-    }
-
-    if (!importExternalBackingToCuda(drv, img)) {
-        char fourcc[5];
-        LOG("Unable to import external surface %s to CUDA", fourccString(imported->pixelFormat, fourcc));
-        goto fail;
-    }
-
-    return img;
+    char fourcc[5];
+    LOG("Unable to import external surface %s: only validated linear layouts are supported",
+        fourccString(imported->pixelFormat, fourcc));
 
 fail:
+    releaseExternalCudaBuffers(drv, img);
     for (int i = 0; i < 4; i++) {
+        if (img->externalMappings[i] != NULL) {
+            munmap(img->externalMappings[i], (size_t) img->externalMappingSize[i]);
+        }
         if (img->fds[i] >= 0) {
             close(img->fds[i]);
         }
-    }
-    if (img->externalMapping != NULL) {
-        munmap(img->externalMapping, img->externalMappingSize);
     }
     free(img);
     return NULL;
@@ -1708,7 +1685,16 @@ static VAStatus nvCreateSurfaces2(
     }
     ImportedSurface imported;
     parseSurfaceImportAttributes(attrib_list, num_attribs, &imported);
+    if (imported.requested && !imported.valid) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     const bool importSurface = imported.valid;
+    if (importSurface && imported.legacyPrime && imported.numLegacyBuffers != num_surfaces) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
+    if (importSurface && !imported.legacyPrime && num_surfaces != 1) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    }
     uint32_t surfaceFourcc = importSurface ? imported.pixelFormat : 0;
 
     cudaVideoSurfaceFormat nvFormat;
@@ -1770,6 +1756,9 @@ static VAStatus nvCreateSurfaces2(
         default:
             // no change needed
             break;
+    }
+    if (importSurface && (imported.width != width || imported.height != height)) {
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
@@ -1839,7 +1828,13 @@ static VAStatus nvCreateSurfaces2(
         suf->syncInitialized = true;
 
         if (importSurface) {
-            BackingImage *img = createImportedBackingImage(drv, &imported, width, height);
+            ImportedSurface selectedImport;
+            if (!importedSurfaceSelectIndex(&imported, i, num_surfaces, &selectedImport)) {
+                selectedImport.valid = false;
+            }
+            BackingImage *img = selectedImport.valid
+                ? createImportedBackingImage(drv, &selectedImport, width, height)
+                : NULL;
             if (img == NULL) {
                 // Roll back every surface object allocated in this call, including
                 // the current one, so a failed import doesn't leak them. The
@@ -2788,8 +2783,9 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
     const size_t uvHeight = (height + 1) / 2;
     const size_t uvSize = (size_t) width * uvHeight * bpp;
     const size_t argbSize = (size_t) width * height * 4;
-    CUdeviceptr dstDevice = dstImg->externalDevicePtr != 0 ? dstImg->externalDevicePtr + (CUdeviceptr) dstImg->offsets[0] : drv->videoProcArgbBuffer;
-    uint32_t dstPitch = dstImg->externalDevicePtr != 0 ? (uint32_t) dstImg->strides[0] : width * 4;
+    const bool externalDeviceDestination = nvBackingImageHasExternalDeviceMemory(dstImg);
+    CUdeviceptr dstDevice = externalDeviceDestination ? nvBackingImageDevicePlane(dstImg, 0) : drv->videoProcArgbBuffer;
+    uint32_t dstPitch = externalDeviceDestination ? (uint32_t) dstImg->strides[0] : width * 4;
 
     pthread_mutex_lock(&drv->exportMutex);
     if (!loadVideoProcKernel(drv, is16Bit) ||
@@ -2797,11 +2793,11 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
         !ensureVideoProcBuffer(drv, &drv->videoProcUVBuffer, &drv->videoProcUVBufferSize, uvSize)) {
         goto fail;
     }
-    if (dstImg->externalDevicePtr == 0 &&
+    if (!externalDeviceDestination &&
         !ensureVideoProcBuffer(drv, &drv->videoProcArgbBuffer, &drv->videoProcArgbBufferSize, argbSize)) {
         goto fail;
     }
-    if (dstImg->externalDevicePtr == 0) {
+    if (!externalDeviceDestination) {
         dstDevice = drv->videoProcArgbBuffer;
     }
 
@@ -2899,7 +2895,7 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
         goto fail;
     }
 
-    if (dstImg->externalDevicePtr == 0) {
+    if (!externalDeviceDestination) {
         CUDA_MEMCPY2D argbCpy = {
             .srcMemoryType = CU_MEMORYTYPE_DEVICE,
             .srcDevice = drv->videoProcArgbBuffer,
@@ -2929,7 +2925,9 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
     const bool is16Bit = srcImg->format == NV_FORMAT_P010 || srcImg->format == NV_FORMAT_P012;
     const char *formatName = is16Bit ? "P010/P012" : "NV12";
 
-    if (dstImg->externalMapping == NULL || dstImg->externalDevicePtr != 0) {
+    const bool externalHostDestination = nvBackingImageHasExternalHostMemory(dstImg);
+    const bool externalDeviceDestination = nvBackingImageHasExternalDeviceMemory(dstImg);
+    if (!externalHostDestination || externalDeviceDestination) {
         if (convertNV12ToARGBCuda(drv, srcImg, dstImg, width, height, is16Bit, matrix, sampleInfo)) {
             nvStatsIncrement(drv, NV_STAT_VIDEOPROC_CUDA);
             static bool loggedCudaVideoProc[2] = { false, false };
@@ -2954,25 +2952,43 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
     const size_t ySize = (size_t) width * height * bpp;
     const size_t uvSize = (size_t) width * ((height + 1) / 2) * bpp;
     const size_t argbSize = (size_t) width * height * 4;
+    const bool externalHostSource = nvBackingImageHasExternalHostMemory(srcImg);
+    bool sourceAccessStarted = false;
+    bool destinationAccessStarted = false;
 
     pthread_mutex_lock(&drv->exportMutex);
+
+    if (externalHostSource) {
+        sourceAccessStarted = nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        if (!sourceAccessStarted) {
+            nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+            goto fail;
+        }
+    }
+    if (externalHostDestination) {
+        destinationAccessStarted = nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+        if (!destinationAccessStarted) {
+            nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+            goto fail;
+        }
+    }
 
     if (!ensureCpuVideoProcBuffer(drv, &drv->cpuVideoProcYBuffer, &drv->cpuVideoProcYBufferSize, ySize) ||
         !ensureCpuVideoProcBuffer(drv, &drv->cpuVideoProcUVBuffer, &drv->cpuVideoProcUVBufferSize, uvSize)) {
         goto fail;
     }
-    if (dstImg->externalMapping == NULL &&
+    if (!externalHostDestination &&
         !ensureCpuVideoProcBuffer(drv, &drv->cpuVideoProcArgbBuffer, &drv->cpuVideoProcArgbBufferSize, argbSize)) {
         goto fail;
     }
 
     uint8_t *yPlane = drv->cpuVideoProcYBuffer;
     uint8_t *uvPlane = drv->cpuVideoProcUVBuffer;
-    uint8_t *argb = dstImg->externalMapping == NULL ? drv->cpuVideoProcArgbBuffer : NULL;
+    uint8_t *argb = !externalHostDestination ? drv->cpuVideoProcArgbBuffer : NULL;
 
-    if (srcImg->externalMapping != NULL) {
-        const uint8_t *srcY = (const uint8_t*) srcImg->externalMapping + srcImg->offsets[0];
-        const uint8_t *srcUV = (const uint8_t*) srcImg->externalMapping + srcImg->offsets[1];
+    if (externalHostSource) {
+        const uint8_t *srcY = nvBackingImageHostPlane(srcImg, 0);
+        const uint8_t *srcUV = nvBackingImageHostPlane(srcImg, 1);
         for (uint32_t y = 0; y < height; y++) {
             memcpy(yPlane + (size_t) y * width * bpp, srcY + (size_t) y * srcImg->strides[0], width * bpp);
         }
@@ -2981,9 +2997,8 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
         }
         nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, ySize + uvSize);
     } else {
+        const bool externalDeviceSource = nvBackingImageHasExternalDeviceMemory(srcImg);
         CUDA_MEMCPY2D yCpy = {
-            .srcMemoryType = CU_MEMORYTYPE_ARRAY,
-            .srcArray = srcImg->arrays[0],
             .dstMemoryType = CU_MEMORYTYPE_HOST,
             .dstHost = yPlane,
             .dstPitch = width * bpp,
@@ -2991,14 +3006,25 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
             .Height = height
         };
         CUDA_MEMCPY2D uvCpy = {
-            .srcMemoryType = CU_MEMORYTYPE_ARRAY,
-            .srcArray = srcImg->arrays[1],
             .dstMemoryType = CU_MEMORYTYPE_HOST,
             .dstHost = uvPlane,
             .dstPitch = width * bpp,
             .WidthInBytes = width * bpp,
             .Height = (height + 1) / 2
         };
+        if (externalDeviceSource) {
+            yCpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            yCpy.srcDevice = nvBackingImageDevicePlane(srcImg, 0);
+            yCpy.srcPitch = (uint32_t) srcImg->strides[0];
+            uvCpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            uvCpy.srcDevice = nvBackingImageDevicePlane(srcImg, 1);
+            uvCpy.srcPitch = (uint32_t) srcImg->strides[1];
+        } else {
+            yCpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            yCpy.srcArray = srcImg->arrays[0];
+            uvCpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            uvCpy.srcArray = srcImg->arrays[1];
+        }
 
         if (CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&yCpy))) {
             goto fail;
@@ -3032,8 +3058,8 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
             const uint8_t r = clampU8((sampleInfo.yScale * c + matrix->vToR * e + sampleInfo.rounding) >> sampleInfo.valueShift);
             const uint8_t g = clampU8((sampleInfo.yScale * c - matrix->uToG * d - matrix->vToG * e + sampleInfo.rounding) >> sampleInfo.valueShift);
             const uint8_t b = clampU8((sampleInfo.yScale * c + matrix->uToB * d + sampleInfo.rounding) >> sampleInfo.valueShift);
-            if (dstImg->externalMapping != NULL) {
-                uint8_t *row = (uint8_t*) dstImg->externalMapping + dstImg->offsets[0] + (size_t) y * dstImg->strides[0];
+            if (externalHostDestination) {
+                uint8_t *row = nvBackingImageHostPlane(dstImg, 0) + (size_t) y * dstImg->strides[0];
                 writeRgbPixel(row + (size_t) x * 4, (uint32_t) dstImg->fourcc, r, g, b);
             } else {
                 const size_t out = ((size_t) y * width + x) * 4;
@@ -3045,9 +3071,15 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
         }
     }
 
-    if (dstImg->externalMapping != NULL) {
+    if (externalHostDestination) {
+        bool syncFailed = !nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        destinationAccessStarted = false;
+        if (sourceAccessStarted) {
+            syncFailed |= !nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+            sourceAccessStarted = false;
+        }
         pthread_mutex_unlock(&drv->exportMutex);
-        return true;
+        return !syncFailed;
     }
 
     CUDA_MEMCPY2D argbCpy = {
@@ -3063,11 +3095,21 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
     if (!failed) {
         nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, argbSize);
     }
+    if (sourceAccessStarted) {
+        failed |= !nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        sourceAccessStarted = false;
+    }
 
     pthread_mutex_unlock(&drv->exportMutex);
     return !failed;
 
 fail:
+    if (destinationAccessStarted) {
+        nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    }
+    if (sourceAccessStarted) {
+        nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+    }
     pthread_mutex_unlock(&drv->exportMutex);
     return false;
 }
@@ -3151,27 +3193,87 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
     }
 
     const NVFormatInfo *fmtInfo = &formatsInfo[srcImg->format];
+    const bool externalHostSource = nvBackingImageHasExternalHostMemory(srcImg);
+    const bool externalDeviceSource = nvBackingImageHasExternalDeviceMemory(srcImg);
+    const bool externalHostDestination = nvBackingImageHasExternalHostMemory(dstImg);
+    const bool externalDeviceDestination = nvBackingImageHasExternalDeviceMemory(dstImg);
+    bool sourceAccessStarted = false;
+    bool destinationAccessStarted = false;
 
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+    if (externalHostSource) {
+        sourceAccessStarted = nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        if (!sourceAccessStarted) {
+            nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        }
+    }
+    if (sourceAccessStarted || !externalHostSource) {
+        if (externalHostDestination) {
+            destinationAccessStarted = nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+            if (!destinationAccessStarted) {
+                nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+            }
+        }
+    }
+
+    bool copyFailed = (externalHostSource && !sourceAccessStarted) ||
+                      (externalHostDestination && !destinationAccessStarted);
+
+    for (uint32_t i = 0; !copyFailed && i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
         CUDA_MEMCPY2D cpy = {
-            .srcMemoryType = CU_MEMORYTYPE_ARRAY,
-            .srcArray = srcImg->arrays[i],
-            .dstMemoryType = CU_MEMORYTYPE_ARRAY,
-            .dstArray = dstImg->arrays[i],
             .WidthInBytes = ((uint32_t) srcRegion.width >> p->ss.x) * fmtInfo->bppc * p->channelCount,
             .Height = (uint32_t) srcRegion.height >> p->ss.y
         };
 
-        const bool failed = i == fmtInfo->numPlanes - 1
+        if (externalHostSource) {
+            cpy.srcMemoryType = CU_MEMORYTYPE_HOST;
+            cpy.srcHost = nvBackingImageHostPlane(srcImg, i);
+            cpy.srcPitch = (uint32_t) srcImg->strides[i];
+        } else if (externalDeviceSource) {
+            cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            cpy.srcDevice = nvBackingImageDevicePlane(srcImg, i);
+            cpy.srcPitch = (uint32_t) srcImg->strides[i];
+        } else {
+            cpy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            cpy.srcArray = srcImg->arrays[i];
+        }
+
+        if (externalHostDestination) {
+            cpy.dstMemoryType = CU_MEMORYTYPE_HOST;
+            cpy.dstHost = nvBackingImageHostPlane(dstImg, i);
+            cpy.dstPitch = (uint32_t) dstImg->strides[i];
+        } else if (externalDeviceDestination) {
+            cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            cpy.dstDevice = nvBackingImageDevicePlane(dstImg, i);
+            cpy.dstPitch = (uint32_t) dstImg->strides[i];
+        } else {
+            cpy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+            cpy.dstArray = dstImg->arrays[i];
+        }
+
+        const bool hostCopy = externalHostSource || externalHostDestination;
+        copyFailed = hostCopy || i == fmtInfo->numPlanes - 1
             ? CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))
             : CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
-        if (failed) {
-            CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
-            setSurfaceResolving(dst, false);
-            return false;
+        if (!copyFailed) {
+            nvStatsAdd(drv,
+                hostCopy ? NV_STAT_HOST_COPY_BYTES : NV_STAT_DEVICE_COPY_BYTES,
+                (uint64_t) cpy.WidthInBytes * cpy.Height);
         }
-        nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) cpy.WidthInBytes * cpy.Height);
+    }
+
+    if (destinationAccessStarted &&
+        !nvSyncBackingImageHostAccess(dstImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE)) {
+        copyFailed = true;
+    }
+    if (sourceAccessStarted &&
+        !nvSyncBackingImageHostAccess(srcImg, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ)) {
+        copyFailed = true;
+    }
+    if (copyFailed) {
+        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+        setSurfaceResolving(dst, false);
+        return false;
     }
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), (setSurfaceResolving(dst, false), false));
 

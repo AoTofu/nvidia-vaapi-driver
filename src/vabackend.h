@@ -20,6 +20,7 @@
 #include "direct/nv-driver.h"
 #include "common.h"
 #include "stats.h"
+#include "surface-import.h"
 
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
@@ -115,12 +116,16 @@ typedef struct _BackingImage {
     int         strides[4];
     uint64_t    mods[4];
     uint32_t    size[4];
+    uint64_t    objectSize[4];
+    uint32_t    planeObjectIndex[4];
+    uint32_t    numObjects;
+    uint32_t    numPlanes;
     //direct backend only
     NVCudaImage cudaImages[3];
     NVFormat    format;
     VAProcColorStandardType colorStandard;
     bool        colorRangeFull;
-    uint32_t    totalSize;
+    uint64_t    totalSize;
     CUexternalMemory extMem;
     bool        isSingleBuffer;
     bool        isExternalBuffer;
@@ -131,10 +136,11 @@ typedef struct _BackingImage {
     bool        resolving;
     pthread_mutex_t mutex;
     pthread_cond_t  cond;
-    void        *externalMapping;
-    uint32_t    externalMappingSize;
-    CUdeviceptr externalDevicePtr;
-    uint32_t    externalDeviceSize;
+    void        *externalMappings[4];
+    uint64_t    externalMappingSize[4];
+    CUexternalMemory externalObjectMems[4];
+    CUdeviceptr externalDevicePtrs[4];
+    uint64_t    externalDeviceSize[4];
     uint64_t    detachedSerial;
     uint64_t    statsBytes;
     bool        statsTracked;

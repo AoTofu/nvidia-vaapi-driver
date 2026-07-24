@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <linux/dma-buf.h>
 #include <fcntl.h>
 #include <unistd.h>
 #ifdef __linux__
@@ -517,12 +518,14 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
     // single DRM modifier, so they must agree on one (largest) block height.
     backingImage->totalSize = calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
                                                              fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane, true);
-    LOG_DEBUG("Allocating single BackingImage: %p %ux%u = %u bytes", backingImage, surface->width, surface->height, backingImage->totalSize);
+    LOG_DEBUG("Allocating single BackingImage: %p %ux%u = %llu bytes", backingImage, surface->width, surface->height,
+              (unsigned long long) backingImage->totalSize);
 
     int memFd = -1;
     int memFd2 = -1;
     int drmFd = -1;
-    if (!alloc_buffer(&drv->driverContext, backingImage->totalSize, driverImages, &memFd, &memFd2, &drmFd)) {
+    if (backingImage->totalSize > UINT32_MAX ||
+        !alloc_buffer(&drv->driverContext, (uint32_t) backingImage->totalSize, driverImages, &memFd, &memFd2, &drmFd)) {
         goto fail;
     }
     LOG_DEBUG("Allocate single Buffer: %d %d %d", memFd, memFd2, drmFd);
@@ -709,6 +712,10 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
 }
 
 static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
+    if (img->isExternalBuffer) {
+        nvDestroyImportedBackingImage(drv, img);
+        return;
+    }
     nvStatsBackingImageDestroyed(drv, img);
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     if (img->surface != NULL) {
@@ -719,15 +726,21 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
         img->borrowedBackingImage = NULL;
     }
 
-    if (img->externalMapping != NULL) {
-        munmap(img->externalMapping, img->externalMappingSize);
-        img->externalMapping = NULL;
-        img->externalMappingSize = 0;
-    }
-    if (img->externalDevicePtr != 0) {
-        CHECK_CUDA_RESULT(drv->cu->cuMemFree(img->externalDevicePtr));
-        img->externalDevicePtr = 0;
-        img->externalDeviceSize = 0;
+    for (uint32_t i = 0; i < NVD_MAX_IMPORTED_OBJECTS; i++) {
+        if (img->externalMappings[i] != NULL) {
+            munmap(img->externalMappings[i], (size_t) img->externalMappingSize[i]);
+            img->externalMappings[i] = NULL;
+            img->externalMappingSize[i] = 0;
+        }
+        if (img->externalDevicePtrs[i] != 0) {
+            CHECK_CUDA_RESULT(drv->cu->cuMemFree(img->externalDevicePtrs[i]));
+            img->externalDevicePtrs[i] = 0;
+            img->externalDeviceSize[i] = 0;
+        }
+        if (img->externalObjectMems[i] != NULL) {
+            CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->externalObjectMems[i]));
+            img->externalObjectMems[i] = NULL;
+        }
     }
 
     for (int i = 0; i < 4; i++) {
@@ -832,52 +845,38 @@ static void direct_destroyAllBackingImage(NVDriver *drv) {
 }
 
 static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
-    const NVFormatInfo *fmtInfo = &formatsInfo[surface->backingImage->format];
+    BackingImage *img = surface->backingImage;
+    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     uint32_t y = 0;
-
-    // For the host-mapped external surface fallback we stage each plane through
-    // a host buffer. Plane 0 (luma) is always the largest, so allocate one
-    // buffer sized to it up front and reuse it for every plane instead of
-    // malloc/free per plane on every resolved frame.
-    uint8_t *stagingPlane = NULL;
-    if (surface->backingImage->externalMapping != NULL) {
-        const uint32_t stagingBytes = surface->width * fmtInfo->bppc * fmtInfo->plane[0].channelCount * surface->height;
-        stagingPlane = malloc(stagingBytes);
-        if (stagingPlane == NULL) {
-            return false;
-        }
+    const bool hostDestination = nvBackingImageHasExternalHostMemory(img);
+    const bool deviceDestination = nvBackingImageHasExternalDeviceMemory(img);
+    if (hostDestination && !nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE)) {
+        nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        return false;
     }
 
+    bool failed = false;
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
         const uint32_t widthInBytes = (surface->width >> p->ss.x) * fmtInfo->bppc * p->channelCount;
         const uint32_t height = surface->height >> p->ss.y;
-        if (surface->backingImage->externalMapping != NULL) {
+        if (hostDestination) {
             CUDA_MEMCPY2D cpy = {
                 .srcMemoryType = CU_MEMORYTYPE_DEVICE,
                 .srcDevice = ptr,
                 .srcY = y,
                 .srcPitch = pitch,
                 .dstMemoryType = CU_MEMORYTYPE_HOST,
-                .dstHost = stagingPlane,
-                .dstPitch = widthInBytes,
+                .dstHost = nvBackingImageHostPlane(img, i),
+                .dstPitch = (uint32_t) img->strides[i],
                 .Height = height,
                 .WidthInBytes = widthInBytes
             };
-            bool failed = CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy));
-            if (!failed) {
-                uint8_t *dst = (uint8_t*) surface->backingImage->externalMapping + surface->backingImage->offsets[i];
-                for (uint32_t row = 0; row < height; row++) {
-                    memcpy(dst + (size_t) row * surface->backingImage->strides[i],
-                           stagingPlane + (size_t) row * widthInBytes,
-                           widthInBytes);
-                }
-                nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, (uint64_t) widthInBytes * height * 2);
+            if (CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))) {
+                failed = true;
+                break;
             }
-            if (failed) {
-                free(stagingPlane);
-                return false;
-            }
+            nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, (uint64_t) widthInBytes * height);
             y += height;
             continue;
         }
@@ -887,23 +886,34 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
             .srcDevice = ptr,
             .srcY = y,
             .srcPitch = pitch,
-            .dstMemoryType = CU_MEMORYTYPE_ARRAY,
-            .dstArray = surface->backingImage->arrays[i],
             .Height = height,
             .WidthInBytes = widthInBytes
         };
-        const bool failed = i == fmtInfo->numPlanes - 1
+        if (deviceDestination) {
+            cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            cpy.dstDevice = nvBackingImageDevicePlane(img, i);
+            cpy.dstPitch = (uint32_t) img->strides[i];
+        } else {
+            cpy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+            cpy.dstArray = img->arrays[i];
+        }
+        failed = i == fmtInfo->numPlanes - 1
             ? CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))
             : CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
         if (failed) {
-            free(stagingPlane);
-            return false;
+            break;
         }
         nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) widthInBytes * height);
         y += height;
     }
 
-    free(stagingPlane);
+    if (hostDestination &&
+        !nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE)) {
+        failed = true;
+    }
+    if (failed) {
+        return false;
+    }
 
     //notify anyone waiting for us to be resolved
     pthread_mutex_lock(&surface->mutex);
@@ -995,7 +1005,7 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
             pthread_mutex_unlock(&syncImg->mutex);
         }
         nvStatsIncrement(drv, NV_STAT_EXPORT_COPIES);
-        if (img != NULL && img->externalMapping != NULL) {
+        if (img != NULL && nvBackingImageHasExternalHostMemory(img)) {
             nvStatsIncrement(drv, NV_STAT_EXPORT_HOST_COPIES);
             nvStatsIncrement(drv, NV_STAT_HOST_FALLBACK_FRAMES);
         }

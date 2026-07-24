@@ -63,6 +63,7 @@ sources = [
     'src/mpeg4.c',
     'src/resolve-queue.c',
     'src/stats.c',
+    'src/surface-import.c',
     'src/vabackend.c',
     'src/vc1.c',
     'src/vp8.c',
@@ -102,6 +103,14 @@ core_buffers_test = executable(
     include_directories: include_directories('src'),
 )
 test('core buffers', core_buffers_test, timeout: 30)
+
+surface_import_test = executable(
+    'test-surface-import',
+    ['tests/test-surface-import.c', 'src/surface-import.c'],
+    include_directories: include_directories('src'),
+    dependencies: [libva_deps, dependency('libdrm').partial_dependency(compile_args: true)],
+)
+test('surface import', surface_import_test, timeout: 30)
 
 meson.add_devenv(environment({
     'NVD_LOG': '1',

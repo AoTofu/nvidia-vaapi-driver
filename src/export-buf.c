@@ -332,6 +332,10 @@ static BackingImage* createBackingImage(NVDriver *drv, uint32_t width, uint32_t 
 
 
 static bool egl_destroyBackingImage(NVDriver *drv, BackingImage *img) {
+    if (img->isExternalBuffer) {
+        nvDestroyImportedBackingImage(drv, img);
+        return true;
+    }
     //if we're attached to a surface, update the surface to remove us
     if (img->surface != NULL) {
         img->surface->backingImage = NULL;
@@ -367,7 +371,8 @@ static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface)
         return;
     }
 
-    if (surface->backingImage->fourcc == DRM_FORMAT_NV21) {
+    if (surface->backingImage->isExternalBuffer ||
+        surface->backingImage->fourcc == DRM_FORMAT_NV21) {
         if (!egl_destroyBackingImage(drv, surface->backingImage)) {
             LOG("Unable to destroy backing image");
         }
