@@ -102,6 +102,11 @@ typedef struct {
     CUmipmappedArray mipmapArray;
 } NVCudaImage;
 
+typedef uint64_t NVCUsurfObject;
+typedef CUresult CUDAAPI NVCuSurfObjectCreate(NVCUsurfObject *surfaceObject,
+                                              const CUDA_RESOURCE_DESC *resourceDesc);
+typedef CUresult CUDAAPI NVCuSurfObjectDestroy(NVCUsurfObject surfaceObject);
+
 typedef struct _BackingImage {
     NVSurface   *surface;
     EGLImage    image;
@@ -196,8 +201,16 @@ typedef struct _NVDriver
     CUfunction              nv12ToArgbKernel;
     CUfunction              p010ToArgbKernel;
     CUmodule                videoProcModuleP010;
+    CUmodule                videoProcArrayModule;
+    CUfunction              arrayToArgbKernel;
     bool                    videoProcKernelP010Failed;
     bool                    videoProcKernelFailed;
+    bool                    videoProcArrayKernelFailed;
+    CUstream                videoProcStream;
+    CUevent                 videoProcEvent;
+    NVCuSurfObjectCreate    *cuSurfObjectCreate;
+    NVCuSurfObjectDestroy   *cuSurfObjectDestroy;
+    bool                    surfaceFunctionsLoaded;
     CUdeviceptr             videoProcYBuffer;
     CUdeviceptr             videoProcUVBuffer;
     CUdeviceptr             videoProcArgbBuffer;
@@ -210,6 +223,8 @@ typedef struct _NVDriver
     size_t                  cpuVideoProcYBufferSize;
     size_t                  cpuVideoProcUVBufferSize;
     size_t                  cpuVideoProcArgbBufferSize;
+    uint64_t                videoProcScratchMaxBytes;
+    uint32_t                videoProcCudaFramesSinceCpuFallback;
     bool                    statsEnabled;
     uint64_t                statsLogInterval;
     atomic_uint_fast64_t    stats[NV_STAT_COUNT];

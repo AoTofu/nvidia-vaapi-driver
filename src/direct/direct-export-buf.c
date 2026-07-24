@@ -19,6 +19,10 @@
 #include <drm.h>
 #include <drm_fourcc.h>
 
+#ifndef CUDA_ARRAY3D_SURFACE_LDST
+#define CUDA_ARRAY3D_SURFACE_LDST 0x02
+#endif
+
 static void destroyBackingImage(NVDriver *drv, BackingImage *img);
 
 static bool isRgbSurfaceFourcc(uint32_t fourcc) {
@@ -104,7 +108,7 @@ static bool import_to_cuda(NVDriver *drv, NVDriverImage *image, int bpc, int cha
             .Depth = 0,
             .Format = bpc == 8 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
             .NumChannels = channels,
-            .Flags = 0
+            .Flags = CUDA_ARRAY3D_SURFACE_LDST
         },
         .numLevels = 1,
         .offset = 0
@@ -464,7 +468,7 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv, NVSurfa
                 .Depth = 0,
                 .Format = fmtInfo->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
                 .NumChannels = fmtInfo->plane[i].channelCount,
-                .Flags = 0
+                .Flags = CUDA_ARRAY3D_SURFACE_LDST
             },
             .numLevels = 1,
             .offset = 0
@@ -565,7 +569,7 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
                 .Depth = 0,
                 .Format = fmtInfo->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
                 .NumChannels = fmtInfo->plane[i].channelCount,
-                .Flags = 0
+                .Flags = CUDA_ARRAY3D_SURFACE_LDST
             },
             .numLevels = 1,
             .offset = driverImages[i].offset
