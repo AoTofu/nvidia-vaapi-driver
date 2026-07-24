@@ -24,6 +24,7 @@ static void copyH264PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 
     picParams->CodecSpecific.h264.direct_8x8_inference_flag = buf->seq_fields.bits.direct_8x8_inference_flag;
     picParams->CodecSpecific.h264.num_ref_frames = buf->num_ref_frames;
+    ctx->decodeSurfaceReferenceHint = (uint32_t) buf->num_ref_frames + 2U;
     picParams->CodecSpecific.h264.residual_colour_transform_flag = buf->seq_fields.bits.residual_colour_transform_flag;
     picParams->CodecSpecific.h264.bit_depth_luma_minus8 = buf->bit_depth_luma_minus8;
 

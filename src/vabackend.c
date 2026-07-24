@@ -2,6 +2,7 @@
 
 #include "vabackend.h"
 #include "backend-common.h"
+#include "decode-surfaces.h"
 #include "kernels.h"
 
 #include <assert.h>
@@ -413,6 +414,25 @@ static uint64_t parseEnvU64(const char *name, uint64_t fallback) {
     }
 
     return parsed;
+}
+
+static uint32_t parseDecodeSurfaceOverride(bool *automatic) {
+    *automatic = false;
+    const char *value = getenv("NVD_DECODE_SURFACES");
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    if (strcmp(value, "auto") == 0) {
+        *automatic = true;
+        return 0;
+    }
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+        LOG("Ignoring invalid NVD_DECODE_SURFACES=%s", value);
+        return 0;
+    }
+    return (uint32_t) parsed;
 }
 
 // Default byte ceiling for the detached backing-image cache, derived from the
@@ -1914,6 +1934,107 @@ static VAStatus nvDestroySurfaces(
     return VA_STATUS_SUCCESS;
 }
 
+static uint32_t defaultDecodeSurfaceCount(cudaVideoCodec codec) {
+    switch (codec) {
+    case cudaVideoCodec_H264:
+    case cudaVideoCodec_HEVC:
+        return 20;
+    case cudaVideoCodec_VP9:
+    case cudaVideoCodec_AV1:
+        return 10;
+    case cudaVideoCodec_JPEG:
+        return 2;
+    case cudaVideoCodec_MPEG1:
+    case cudaVideoCodec_MPEG2:
+    case cudaVideoCodec_MPEG4:
+    case cudaVideoCodec_VC1:
+    case cudaVideoCodec_VP8:
+    default:
+        return 8;
+    }
+}
+
+static uint32_t selectContextDecodeSurfaceCount(NVContext *nvCtx) {
+    NVDriver *drv = nvCtx->drv;
+    const uint32_t automatic = nvdSelectDecodeSurfaceCount(
+        defaultDecodeSurfaceCount(nvCtx->cudaCodec), nvCtx->decodeSurfaceReferenceHint,
+        nvCtx->clientRenderTargetCount, 0, drv->decodeSurfacesMinimum,
+        drv->decodeSurfacesMaximum);
+    nvStatsSet(drv, NV_STAT_DECODE_SURFACES_AUTO_CANDIDATE, automatic);
+    if (drv->decodeSurfacesAuto) {
+        return automatic;
+    }
+    const uint32_t overrideCount = drv->decodeSurfacesOverride != 0
+        ? drv->decodeSurfacesOverride : 32;
+    return nvdSelectDecodeSurfaceCount(automatic, 0, 0, overrideCount,
+                                       drv->decodeSurfacesMinimum,
+                                       drv->decodeSurfacesMaximum);
+}
+
+static VAStatus createDecoderForContext(NVContext *nvCtx) {
+    if (nvCtx->decoder != NULL) {
+        return VA_STATUS_SUCCESS;
+    }
+
+    nvCtx->surfaceCount = (int) selectContextDecodeSurfaceCount(nvCtx);
+    if (nvCtx->currentPictureId > nvCtx->surfaceCount) {
+        LOG("Selected %d decode surfaces after %d picture indices were assigned",
+            nvCtx->surfaceCount, nvCtx->currentPictureId);
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
+    int displayAreaWidth = nvCtx->width;
+    int displayAreaHeight = nvCtx->height;
+    switch (nvCtx->decoderChromaFormat) {
+    case cudaVideoChromaFormat_422:
+        displayAreaWidth = ROUND_UP(displayAreaWidth, 2);
+        break;
+    case cudaVideoChromaFormat_420:
+        displayAreaWidth = ROUND_UP(displayAreaWidth, 2);
+        displayAreaHeight = ROUND_UP(displayAreaHeight, 2);
+        break;
+    default:
+        break;
+    }
+
+    CUVIDDECODECREATEINFO info = {
+        .CodecType = nvCtx->cudaCodec,
+        .ulCreationFlags = cudaVideoCreate_PreferCUVID,
+        .display_area.right = displayAreaWidth,
+        .display_area.bottom = displayAreaHeight,
+        .ChromaFormat = nvCtx->decoderChromaFormat,
+        .OutputFormat = nvCtx->decoderSurfaceFormat,
+        .bitDepthMinus8 = nvCtx->decoderBitDepth - 8,
+        .DeinterlaceMode = cudaVideoDeinterlaceMode_Weave,
+        .ulNumOutputSurfaces = 1,
+        .ulNumDecodeSurfaces = (unsigned long) nvCtx->surfaceCount,
+    };
+    info.ulWidth = info.ulMaxWidth = info.ulTargetWidth = nvCtx->width;
+    info.ulHeight = info.ulMaxHeight = info.ulTargetHeight = nvCtx->height;
+
+    NVDriver *drv = nvCtx->drv;
+    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    CUvideodecoder decoder = NULL;
+    CUresult result = cv->cuvidCreateDecoder(&decoder, &info);
+    CUresult popResult = cu->cuCtxPopCurrent(NULL);
+    if (result != CUDA_SUCCESS || popResult != CUDA_SUCCESS) {
+        CHECK_CUDA_RESULT(result);
+        CHECK_CUDA_RESULT(popResult);
+        if (decoder != NULL) {
+            CHECK_CUDA_RESULT(cv->cuvidDestroyDecoder(decoder));
+        }
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+
+    nvCtx->decoder = decoder;
+    nvStatsIncrement(drv, NV_STAT_DECODER_CREATES);
+    nvStatsSet(drv, NV_STAT_DECODE_SURFACES_SELECTED, (uint64_t) nvCtx->surfaceCount);
+    nvStatsSet(drv, NV_STAT_DECODE_SURFACES_LEGACY, 32);
+    LOG("Created decoder lazily with %d surfaces (legacy fallback: 32, refs hint: %u, client targets: %u)",
+        nvCtx->surfaceCount, nvCtx->decodeSurfaceReferenceHint, nvCtx->clientRenderTargetCount);
+    return VA_STATUS_SUCCESS;
+}
+
 static VAStatus nvCreateContext(
         VADriverContextP ctx,
         VAConfigID config_id,
@@ -1989,84 +2110,15 @@ static VAStatus nvCreateContext(
         cfg->bitDepth = surface->bitDepth;
     }
 
-     // Setting to maximun value if num_render_targets == 0 to prevent picture index overflow as additional surfaces can be created after calling nvCreateContext
-    int surfaceCount = num_render_targets > 0 ? num_render_targets : 32;
-
-    if (surfaceCount > 32) {
-        LOG("Application requested %d surface(s), limiting to 32. This may cause issues.", surfaceCount);
-        surfaceCount = 32;
-    }
-
-    int display_area_width = picture_width;
-    int display_area_height = picture_height;
-
-    // If we're increasing the surface size for the chroma subsampling,
-    // increase the displayArea to match
-    switch(cfg->chromaFormat) {
-        case cudaVideoChromaFormat_422:
-            display_area_width = ROUND_UP(display_area_width, 2);
-            break;
-        case cudaVideoChromaFormat_420:
-            display_area_width = ROUND_UP(display_area_width, 2);
-            display_area_height = ROUND_UP(display_area_height, 2);
-            break;
-        default:
-            // no change needed
-            break;
-    }
-
-    CUVIDDECODECREATEINFO vdci = {
-        .ulWidth             = vdci.ulMaxWidth  = vdci.ulTargetWidth  = picture_width,
-        .ulHeight            = vdci.ulMaxHeight = vdci.ulTargetHeight = picture_height,
-        .CodecType           = cfg->cudaCodec,
-        .ulCreationFlags     = cudaVideoCreate_PreferCUVID,
-        .ulIntraDecodeOnly   = 0, //TODO (flag & VA_PROGRESSIVE) != 0
-        .display_area.right  = display_area_width,
-        .display_area.bottom = display_area_height,
-        .ChromaFormat        = cfg->chromaFormat,
-        .OutputFormat        = cfg->surfaceFormat,
-        .bitDepthMinus8      = cfg->bitDepth - 8,
-        .DeinterlaceMode     = cudaVideoDeinterlaceMode_Weave,
-
-        //we only ever map one frame at a time, so we can set this to 1
-        //it isn't particually efficient to do this, but it is simple
-        .ulNumOutputSurfaces = 1,
-        //just allocate as many surfaces as have been created since we can never have as much information as the decode to guess correctly
-        .ulNumDecodeSurfaces = surfaceCount,
-        //.vidLock             = drv->vidLock
-    };
-
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-
-    CUvideodecoder decoder = NULL;
-    CUresult createResult = cv->cuvidCreateDecoder(&decoder, &vdci);
-    if (createResult != CUDA_SUCCESS) {
-        CHECK_CUDA_RESULT(createResult);
-        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    }
-    nvStatsIncrement(drv, NV_STAT_DECODER_CREATES);
-
-    if (CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL))) {
-        // A failed pop leaves the current-context state uncertain, but making a
-        // best-effort decoder destroy here is still safer than publishing or
-        // silently leaking it.
-        CHECK_CUDA_RESULT(cv->cuvidDestroyDecoder(decoder));
-        return VA_STATUS_ERROR_OPERATION_FAILED;
-    }
-
     Object contextObj = allocateObject(drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
     if (contextObj == NULL) {
-        CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext));
-        CHECK_CUDA_RESULT(cv->cuvidDestroyDecoder(decoder));
-        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
-    LOG("Creating decoder: %p for context id: %d", decoder, contextObj->id);
+    LOG("Creating lazy decoder context id: %d", contextObj->id);
 
     NVContext *nvCtx = (NVContext*) contextObj->obj;
     nvCtx->drv = drv;
-    nvCtx->decoder = decoder;
+    nvCtx->decoder = NULL;
     nvCtx->profile = cfg->profile;
     nvCtx->entrypoint = cfg->entrypoint;
     nvCtx->width = picture_width;
@@ -2076,7 +2128,8 @@ static VAStatus nvCreateContext(
     nvCtx->decoderSurfaceFormat = cfg->surfaceFormat;
     nvCtx->decoderChromaFormat = cfg->chromaFormat;
     nvCtx->decoderBitDepth = cfg->bitDepth;
-    nvCtx->surfaceCount = surfaceCount;
+    nvCtx->surfaceCount = 0;
+    nvCtx->clientRenderTargetCount = num_render_targets > 0 ? (uint32_t) num_render_targets : 0;
     nvCtx->firstKeyframeValid = false;
     
     if (!initializeContextSynchronization(nvCtx)) {
@@ -2123,75 +2176,22 @@ static VAStatus nvDestroyContext(
 }
 
 static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) {
-    if (nvCtx->decoderSurfaceFormat == surface->format &&
-        nvCtx->decoderChromaFormat == surface->chromaFormat &&
-        nvCtx->decoderBitDepth == surface->bitDepth) {
-        return VA_STATUS_SUCCESS;
-    }
-
-    if (nvCtx->currentPictureId != 0) {
-        LOG("Decoder/surface format mismatch after decode start: decoder format=%d chroma=%d bitDepth=%d, surface format=%d chroma=%d bitDepth=%d",
+    const bool matches = nvCtx->decoderSurfaceFormat == surface->format &&
+                         nvCtx->decoderChromaFormat == surface->chromaFormat &&
+                         nvCtx->decoderBitDepth == surface->bitDepth;
+    if (nvCtx->decoder != NULL) {
+        if (matches) {
+            return VA_STATUS_SUCCESS;
+        }
+        LOG("Decoder/surface format mismatch after lazy decoder creation: decoder format=%d chroma=%d bitDepth=%d, surface format=%d chroma=%d bitDepth=%d",
             nvCtx->decoderSurfaceFormat, nvCtx->decoderChromaFormat, nvCtx->decoderBitDepth,
             surface->format, surface->chromaFormat, surface->bitDepth);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    int display_area_width = nvCtx->width;
-    int display_area_height = nvCtx->height;
-
-    switch(surface->chromaFormat) {
-        case cudaVideoChromaFormat_422:
-            display_area_width = ROUND_UP(display_area_width, 2);
-            break;
-        case cudaVideoChromaFormat_420:
-            display_area_width = ROUND_UP(display_area_width, 2);
-            display_area_height = ROUND_UP(display_area_height, 2);
-            break;
-        default:
-            break;
-    }
-
-    // Assign the width/height family explicitly rather than with a
-    // self-referential designated initializer (.ulWidth = vdci.ulMaxWidth =
-    // ...): reading a sibling member of the same aggregate while it is still
-    // being initialized is undefined behaviour, and it only happens to work on
-    // GCC/Clang.
-    CUVIDDECODECREATEINFO vdci = {
-        .CodecType           = nvCtx->cudaCodec,
-        .ulCreationFlags     = cudaVideoCreate_PreferCUVID,
-        .ulIntraDecodeOnly   = 0,
-        .display_area.right  = display_area_width,
-        .display_area.bottom = display_area_height,
-        .ChromaFormat        = surface->chromaFormat,
-        .OutputFormat        = surface->format,
-        .bitDepthMinus8      = surface->bitDepth - 8,
-        .DeinterlaceMode     = cudaVideoDeinterlaceMode_Weave,
-        .ulNumOutputSurfaces = 1,
-        .ulNumDecodeSurfaces = nvCtx->surfaceCount,
-    };
-    vdci.ulWidth = vdci.ulMaxWidth = vdci.ulTargetWidth = nvCtx->width;
-    vdci.ulHeight = vdci.ulMaxHeight = vdci.ulTargetHeight = nvCtx->height;
-
-    NVDriver *drv = nvCtx->drv;
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-    if (nvCtx->decoder != NULL) {
-        CHECK_CUDA_RESULT(cv->cuvidDestroyDecoder(nvCtx->decoder));
-        nvCtx->decoder = NULL;
-    }
-
-    CUvideodecoder decoder;
-    CUresult result = cv->cuvidCreateDecoder(&decoder, &vdci);
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
-    if (result != CUDA_SUCCESS) {
-        LOG("cuvidCreateDecoder failed while matching first surface: %d", result);
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    }
-
-    nvCtx->decoder = decoder;
     nvCtx->decoderSurfaceFormat = surface->format;
     nvCtx->decoderChromaFormat = surface->chromaFormat;
     nvCtx->decoderBitDepth = surface->bitDepth;
-    nvStatsIncrement(drv, NV_STAT_DECODER_CREATES);
     return VA_STATUS_SUCCESS;
 }
 
@@ -2779,6 +2779,11 @@ static bool ensureVideoProcBuffer(NVDriver *drv, CUdeviceptr *buffer, size_t *bu
     }
 
     const size_t allocSize = roundVideoProcBufferSize(requiredSize);
+    const uint64_t additionalBytes = allocSize > *bufferSize ? allocSize - *bufferSize : 0;
+    if (drv->backend->pruneToMemoryBudget != NULL &&
+        !drv->backend->pruneToMemoryBudget(drv, additionalBytes)) {
+        return false;
+    }
     const uint64_t currentBytes = drv->videoProcYBufferSize + drv->videoProcUVBufferSize +
                                   drv->videoProcArgbBufferSize;
     if (allocSize > drv->videoProcScratchMaxBytes ||
@@ -3575,7 +3580,10 @@ static VAStatus nvBeginPicture(
 
     //if this surface hasn't been used before, give it a new picture index
     if (surface->pictureIdx == -1) {
-        if (nvCtx->currentPictureId == nvCtx->surfaceCount) {
+        const uint32_t surfaceLimit = nvCtx->decoder != NULL
+            ? (uint32_t) nvCtx->surfaceCount
+            : drv->decodeSurfacesMaximum;
+        if ((uint32_t) nvCtx->currentPictureId >= surfaceLimit) {
             return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
         }
         surface->pictureIdx = nvCtx->currentPictureId++;
@@ -3689,7 +3697,7 @@ static VAStatus nvEndPicture(
         return VA_STATUS_SUCCESS;
     }
 
-    if (nvCtx == NULL || nvCtx->decoder == NULL) {
+    if (nvCtx == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
@@ -3708,6 +3716,19 @@ static VAStatus nvEndPicture(
     }
 
     CUVIDPICPARAMS *picParams = &nvCtx->pPicParams;
+
+    VAStatus decoderStatus = createDecoderForContext(nvCtx);
+    if (decoderStatus != VA_STATUS_SUCCESS) {
+        nvCtx->bitstreamBuffer.size = 0;
+        nvCtx->sliceOffsets.size = 0;
+        if (nvCtx->displayTarget != NULL) {
+            setSurfaceResolving(nvCtx->displayTarget, false);
+        }
+        if (nvCtx->renderTarget != NULL && nvCtx->renderTarget != nvCtx->displayTarget) {
+            setSurfaceResolving(nvCtx->renderTarget, false);
+        }
+        return decoderStatus;
+    }
 
     picParams->pBitstreamData = nvCtx->bitstreamBuffer.buf;
     picParams->pSliceDataOffsets = nvCtx->sliceOffsets.buf;
@@ -4801,6 +4822,24 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGE_BYTES", defaultMaxDetachedBackingImageBytes(drv->cudaGpuId));
     drv->maxDetachedBackingImages =
         (uint32_t) parseEnvU64("NVD_MAX_DETACHED_BACKING_IMAGES", DEFAULT_MAX_DETACHED_BACKING_IMAGES);
+    drv->memoryBudgetBytes = parseEnvU64("NVD_MEMORY_BUDGET_BYTES", 0);
+    drv->decodeSurfacesOverride = parseDecodeSurfaceOverride(&drv->decodeSurfacesAuto);
+    drv->decodeSurfacesMinimum =
+        (uint32_t) parseEnvU64("NVD_DECODE_SURFACES_MIN", 2);
+    drv->decodeSurfacesMaximum =
+        (uint32_t) parseEnvU64("NVD_DECODE_SURFACES_MAX", 32);
+    if (drv->decodeSurfacesMinimum == 0) {
+        drv->decodeSurfacesMinimum = 1;
+    }
+    if (drv->decodeSurfacesMaximum < drv->decodeSurfacesMinimum) {
+        drv->decodeSurfacesMaximum = drv->decodeSurfacesMinimum;
+    }
+    if (drv->decodeSurfacesMaximum > 32) {
+        drv->decodeSurfacesMaximum = 32;
+    }
+    if (drv->decodeSurfacesMinimum > drv->decodeSurfacesMaximum) {
+        drv->decodeSurfacesMinimum = drv->decodeSurfacesMaximum;
+    }
     drv->videoProcScratchMaxBytes =
         parseEnvU64("NVD_VIDEOPROC_SCRATCH_MAX_BYTES", DEFAULT_VIDEOPROC_SCRATCH_MAX_BYTES);
 

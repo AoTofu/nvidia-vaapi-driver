@@ -147,6 +147,8 @@ typedef struct _BackingImage {
     CUdeviceptr externalDevicePtrs[4];
     uint64_t    externalDeviceSize[4];
     uint64_t    detachedSerial;
+    struct _BackingImage *detachedPrev;
+    struct _BackingImage *detachedNext;
     uint64_t    statsBytes;
     bool        statsTracked;
     bool        statsActive;
@@ -165,6 +167,7 @@ typedef struct {
     bool (*realiseSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*fillExportDescriptor)(struct _NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc);
     void (*destroyAllBackingImage)(struct _NVDriver *drv);
+    bool (*pruneToMemoryBudget)(struct _NVDriver *drv, uint64_t extraGpuBytes);
 } NVBackend;
 
 typedef struct _NVDriver
@@ -231,6 +234,15 @@ typedef struct _NVDriver
     uint64_t                maxDetachedBackingImageBytes;
     uint32_t                maxDetachedBackingImages;
     uint64_t                detachedBackingImageSerial;
+    BackingImage            *detachedBackingImageHead;
+    BackingImage            *detachedBackingImageTail;
+    uint64_t                detachedBackingImageBytes;
+    uint32_t                detachedBackingImageCount;
+    uint64_t                memoryBudgetBytes;
+    uint32_t                decodeSurfacesOverride;
+    bool                    decodeSurfacesAuto;
+    uint32_t                decodeSurfacesMinimum;
+    uint32_t                decodeSurfacesMaximum;
 } NVDriver;
 
 struct _NVCodec;
@@ -268,6 +280,8 @@ typedef struct _NVContext
     pthread_mutex_t     surfaceCreationMutex;
     bool                surfaceCreationMutexInitialized;
     int                 surfaceCount;
+    uint32_t            clientRenderTargetCount;
+    uint32_t            decodeSurfaceReferenceHint;
     bool                firstKeyframeValid;
 } NVContext;
 

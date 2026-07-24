@@ -52,6 +52,7 @@ sources = [
     'src/appendable-buffer.c',
     'src/av1.c',
     'src/backend-common.c',
+    'src/decode-surfaces.c',
     'src/export-buf.c',
     'src/direct/direct-export-buf.c',
     'src/direct/nv-driver.c',
@@ -111,6 +112,13 @@ surface_import_test = executable(
     dependencies: [libva_deps, dependency('libdrm').partial_dependency(compile_args: true)],
 )
 test('surface import', surface_import_test, timeout: 30)
+
+decode_surfaces_test = executable(
+    'test-decode-surfaces',
+    ['tests/test-decode-surfaces.c', 'src/decode-surfaces.c'],
+    include_directories: include_directories('src'),
+)
+test('decode surfaces', decode_surfaces_test, timeout: 30)
 
 meson.add_devenv(environment({
     'NVD_LOG': '1',

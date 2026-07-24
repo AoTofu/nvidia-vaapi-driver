@@ -77,6 +77,7 @@ static int sortFuncRev(const unsigned char *a, const unsigned char *b, int *POCV
 static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams)
 {
     VAPictureParameterBufferHEVC* buf = (VAPictureParameterBufferHEVC*) buffer->ptr;
+    ctx->decodeSurfaceReferenceHint = (uint32_t) buf->sps_max_dec_pic_buffering_minus1 + 3U;
 
     picParams->PicWidthInMbs    = buf->pic_width_in_luma_samples / 16;
     picParams->FrameHeightInMbs = buf->pic_height_in_luma_samples / 16;

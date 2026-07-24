@@ -693,5 +693,6 @@ const NVBackend EGL_BACKEND = {
     .detachBackingImageFromSurface = egl_detachBackingImageFromSurface,
     .realiseSurface = egl_realiseSurface,
     .fillExportDescriptor = egl_fillExportDescriptor,
-    .destroyAllBackingImage = egl_destroyAllBackingImage
+    .destroyAllBackingImage = egl_destroyAllBackingImage,
+    .pruneToMemoryBudget = NULL
 };
