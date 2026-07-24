@@ -136,6 +136,11 @@ typedef struct _BackingImage {
     CUdeviceptr externalDevicePtr;
     uint32_t    externalDeviceSize;
     uint64_t    detachedSerial;
+    uint64_t    statsBytes;
+    bool        statsTracked;
+    bool        statsActive;
+    bool        statsBorrowed;
+    bool        statsExternal;
 } BackingImage;
 
 struct _NVDriver;

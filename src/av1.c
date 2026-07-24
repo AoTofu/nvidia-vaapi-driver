@@ -137,8 +137,11 @@ static void compactAV1BitstreamToCurrentFrame(NVContext *ctx, CUVIDPICPARAMS *pi
         }
     }
 
-    memmove(ctx->bitstreamBuffer.buf, (const uint8_t*) ctx->bitstreamBuffer.buf + start, end - start);
-    ctx->bitstreamBuffer.size = end - start;
+    const size_t compactBytes = end - start;
+    memmove(ctx->bitstreamBuffer.buf, (const uint8_t*) ctx->bitstreamBuffer.buf + start, compactBytes);
+    nvStatsIncrement(ctx->drv, NV_STAT_AV1_COMPACT_COUNT);
+    nvStatsAdd(ctx->drv, NV_STAT_AV1_COMPACT_BYTES, compactBytes);
+    ctx->bitstreamBuffer.size = compactBytes;
     picParams->nBitstreamDataLen = (uint32_t) ctx->bitstreamBuffer.size;
     ctx->av1BitstreamCompacted = true;
 }

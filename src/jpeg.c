@@ -733,9 +733,12 @@ static void copyJPEGSliceData(NVContext *ctx, NVBuffer *buf, CUVIDPICPARAMS *pic
     picParams->nNumSlices = 1U;
 
     uint32_t offset = (uint32_t)ctx->bitstreamBuffer.size;
-    appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
-    appendBuffer(&ctx->bitstreamBuffer, frame, frameSize);
-    picParams->nBitstreamDataLen = (uint32_t)ctx->bitstreamBuffer.size;
+    const bool offsetAppended = appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
+    const bool frameAppended = appendBuffer(&ctx->bitstreamBuffer, frame, frameSize);
+    if (offsetAppended && frameAppended) {
+        nvStatsAdd(ctx->drv, NV_STAT_JPEG_COPY_BYTES, frameSize);
+        picParams->nBitstreamDataLen = (uint32_t)ctx->bitstreamBuffer.size;
+    }
 
     LOG("JPEG: Reconstructed %u bytes for NVDEC", frameSize);
 

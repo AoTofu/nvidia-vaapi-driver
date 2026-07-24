@@ -290,6 +290,7 @@ static bool clearBackingImagePlane(NVDriver *drv, BackingImage *img, uint32_t pl
             failed = true;
             break;
         }
+        nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, widthInBytes * rowsToCopy);
     }
 
     free(rows);
@@ -358,6 +359,7 @@ static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes
     uint64_t imageBytes = backingImageMemorySize(img);
     destroyBackingImage(drv, img);
     remove_element_at(&drv->images, pruneIndex);
+    nvStatsIncrement(drv, NV_STAT_BACKING_PRUNE_COUNT);
     if (*bytes >= imageBytes) {
         *bytes -= imageBytes;
     } else {
@@ -608,7 +610,7 @@ fail:
     return NULL;
 }
 
-static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surface) {
+static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *surface) {
     // Multi-plane YUV surfaces must be exported as a single buffer holding every
     // plane at an offset, so all planes share one DRM modifier. Chromium's
     // vaapi_wrapper enforces one-modifier-per-buffer, so a per-plane export (a
@@ -695,7 +697,19 @@ bail:
     return NULL;
 }
 
+static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surface) {
+    const uint64_t start = nvStatsTimestamp(drv);
+    BackingImage *img = direct_allocateBackingImageImpl(drv, surface);
+    const uint64_t end = nvStatsTimestamp(drv);
+    nvStatsIncrement(drv, NV_STAT_BACKING_ALLOC_COUNT);
+    if (start != 0 && end >= start) {
+        nvStatsAdd(drv, NV_STAT_BACKING_ALLOC_NS, end - start);
+    }
+    return img;
+}
+
 static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
+    nvStatsBackingImageDestroyed(drv, img);
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     if (img->surface != NULL) {
         img->surface->backingImage = NULL;
@@ -797,6 +811,7 @@ static void direct_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surfa
     // image whose exported dma-buf is most likely still in the client's
     // pipeline, which is the corruption the oldest-first prune exists to avoid.
     pthread_mutex_lock(&drv->imagesMutex);
+    nvStatsBackingImageSetActive(drv, surface->backingImage, false);
     surface->backingImage->surface = NULL;
     surface->backingImage->detachedSerial = ++drv->detachedBackingImageSerial;
     surface->backingImage = NULL;
@@ -857,6 +872,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
                            stagingPlane + (size_t) row * widthInBytes,
                            widthInBytes);
                 }
+                nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, (uint64_t) widthInBytes * height * 2);
             }
             if (failed) {
                 free(stagingPlane);
@@ -876,11 +892,14 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
             .Height = height,
             .WidthInBytes = widthInBytes
         };
-        if (i == fmtInfo->numPlanes - 1) {
-            CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy));
-        } else {
-            CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
+        const bool failed = i == fmtInfo->numPlanes - 1
+            ? CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))
+            : CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
+        if (failed) {
+            free(stagingPlane);
+            return false;
         }
+        nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) widthInBytes * height);
         y += height;
     }
 
@@ -930,6 +949,9 @@ static bool direct_realiseSurface(NVDriver *drv, NVSurface *surface) {
         direct_attachBackingImageToSurface(surface, img);
         pthread_mutex_lock(&drv->imagesMutex);
         bool added = add_element(&drv->images, img);
+        if (added) {
+            nvStatsBackingImageCreated(drv, img, true);
+        }
         pthread_mutex_unlock(&drv->imagesMutex);
         if (!added) {
             surface->backingImage = NULL;
@@ -975,6 +997,7 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
         nvStatsIncrement(drv, NV_STAT_EXPORT_COPIES);
         if (img != NULL && img->externalMapping != NULL) {
             nvStatsIncrement(drv, NV_STAT_EXPORT_HOST_COPIES);
+            nvStatsIncrement(drv, NV_STAT_HOST_FALLBACK_FRAMES);
         }
         nvBackingImageStoreSurfaceColorMetadata(img, surface);
         bool copied = copyFrameToSurface(drv, ptr, surface, pitch);

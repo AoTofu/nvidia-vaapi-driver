@@ -350,6 +350,7 @@ static bool egl_destroyBackingImage(NVDriver *drv, BackingImage *img) {
     CHECK_CUDA_RESULT_RETURN(drv->cu->cuArrayDestroy(img->arrays[1]), false);
     img->arrays[0] = NULL;
     img->arrays[1] = NULL;
+    nvStatsBackingImageDestroyed(drv, img);
     free(img);
     return true;
 }
@@ -377,6 +378,7 @@ static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface)
             //find the entry for this surface
             if (img->surface == surface) {
                 LOG("Detaching BackingImage %p from Surface %p", img, surface);
+                nvStatsBackingImageSetActive(drv, img, false);
                 img->surface = NULL;
                 break;
             }
@@ -407,6 +409,8 @@ static BackingImage* findFreeBackingImage(NVDriver *drv, NVSurface *surface) {
         if (img->surface == NULL && img->width == surface->width && img->height == surface->height) {
             LOG("Using BackingImage %p for Surface %p", img, surface);
             egl_attachBackingImageToSurface(surface, img);
+            nvStatsBackingImageSetActive(drv, img, true);
+            nvStatsIncrement(drv, NV_STAT_BACKING_CACHE_HITS);
             ret = img;
             break;
         }
@@ -416,7 +420,7 @@ static BackingImage* findFreeBackingImage(NVDriver *drv, NVSurface *surface) {
 }
 
 
-static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *surface) {
+static BackingImage *egl_allocateBackingImageImpl(NVDriver *drv, const NVSurface *surface) {
     CUeglFrame eglframe = {
         .width = surface->width,
         .height = surface->height,
@@ -503,6 +507,12 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
             LOG("Acquired image from EGLStream: %p", img);
 
             ret = createBackingImage(drv, surface->width, surface->height, img, eglframe.frame.pArray);
+            if (ret != NULL) {
+                ret->format = surface->format == cudaVideoSurfaceFormat_NV12 ? NV_FORMAT_NV12 : NV_FORMAT_P016;
+                const uint64_t visibleBytes = (uint64_t) surface->width * surface->height *
+                                              (surface->format == cudaVideoSurfaceFormat_NV12 ? 3 : 6) / 2;
+                ret->totalSize = visibleBytes > UINT32_MAX ? UINT32_MAX : (uint32_t) visibleBytes;
+            }
         } else {
             LOG("Unhandled event: %X", event);
         }
@@ -510,6 +520,17 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
 
     pthread_mutex_unlock(&drv->exportMutex);
     return ret;
+}
+
+static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *surface) {
+    const uint64_t start = nvStatsTimestamp(drv);
+    BackingImage *img = egl_allocateBackingImageImpl(drv, surface);
+    const uint64_t end = nvStatsTimestamp(drv);
+    nvStatsIncrement(drv, NV_STAT_BACKING_ALLOC_COUNT);
+    if (start != 0 && end >= start) {
+        nvStatsAdd(drv, NV_STAT_BACKING_ALLOC_NS, end - start);
+    }
+    return img;
 }
 
 static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
@@ -524,6 +545,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         .WidthInBytes = surface->width * bpp
     };
     CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2DAsync(&cpy, 0), false);
+    nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) cpy.WidthInBytes * cpy.Height);
     CUDA_MEMCPY2D cpy2 = {
         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
         .srcDevice = ptr,
@@ -535,6 +557,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         .WidthInBytes = surface->width * bpp
     };
     CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2D(&cpy2), false);
+    nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) cpy2.WidthInBytes * cpy2.Height);
 
     //notify anyone waiting for us to be resolved
     pthread_mutex_lock(&surface->mutex);
@@ -584,6 +607,9 @@ static bool egl_realiseSurface(NVDriver *drv, NVSurface *surface) {
             //add our newly created BackingImage to the list
             pthread_mutex_lock(&drv->imagesMutex);
             bool added = add_element(&drv->images, img);
+            if (added) {
+                nvStatsBackingImageCreated(drv, img, true);
+            }
             pthread_mutex_unlock(&drv->imagesMutex);
             if (!added) {
                 surface->backingImage = NULL;

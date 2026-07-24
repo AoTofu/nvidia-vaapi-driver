@@ -4,8 +4,16 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define RESOLVE_QUEUE_CAPACITY 16
+
+typedef struct {
+    atomic_uint_fast64_t *depth;
+    atomic_uint_fast64_t *highWater;
+    atomic_uint_fast64_t *fullWaits;
+    atomic_uint_fast64_t *waitNs;
+} ResolveQueueTelemetry;
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -17,9 +25,11 @@ typedef struct {
     size_t count;
     bool exiting;
     bool initialized;
+    ResolveQueueTelemetry telemetry;
 } ResolveQueue;
 
 bool resolveQueueInit(ResolveQueue *queue);
+void resolveQueueSetTelemetry(ResolveQueue *queue, ResolveQueueTelemetry telemetry);
 bool resolveQueuePush(ResolveQueue *queue, void *item);
 bool resolveQueuePop(ResolveQueue *queue, void **item);
 void resolveQueueShutdown(ResolveQueue *queue);

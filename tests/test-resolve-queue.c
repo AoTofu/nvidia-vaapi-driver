@@ -125,9 +125,21 @@ static void *blockedProducer(void *opaque) {
 static void testShutdownWakesFullQueue(void) {
     ResolveQueue queue;
     assert(resolveQueueInit(&queue));
+    atomic_uint_fast64_t depth = 0;
+    atomic_uint_fast64_t highWater = 0;
+    atomic_uint_fast64_t fullWaits = 0;
+    atomic_uint_fast64_t waitNs = 0;
+    resolveQueueSetTelemetry(&queue, (ResolveQueueTelemetry) {
+        .depth = &depth,
+        .highWater = &highWater,
+        .fullWaits = &fullWaits,
+        .waitNs = &waitNs,
+    });
     for (uintptr_t i = 1; i <= RESOLVE_QUEUE_CAPACITY; i++) {
         assert(resolveQueuePush(&queue, (void *) i));
     }
+    assert(atomic_load(&depth) == RESOLVE_QUEUE_CAPACITY);
+    assert(atomic_load(&highWater) == RESOLVE_QUEUE_CAPACITY);
 
     BlockedProducerState state = {.queue = &queue};
     pthread_t producer;
@@ -148,6 +160,9 @@ static void testShutdownWakesFullQueue(void) {
         drained++;
     }
     assert(drained == RESOLVE_QUEUE_CAPACITY);
+    assert(atomic_load(&depth) == 0);
+    assert(atomic_load(&fullWaits) == 1);
+    assert(atomic_load(&waitNs) > 0);
     resolveQueueDestroy(&queue);
 }
 
