@@ -4,40 +4,58 @@
 
 #include "list.h"
 
-static void ensure_capacity(Array *arr, uint32_t new_capacity) {
+static bool ensure_capacity(Array *arr, uint32_t new_capacity) {
     if (new_capacity <= arr->capacity) {
         //we already have enough capacity to hold the new element
-        return;
+        return true;
     }
 
-    uint32_t old_capacity = arr->capacity;
-    if (arr->capacity == 0) {
+    uint32_t capacity = arr->capacity;
+    if (capacity == 0) {
         //if we're completely empty allocate a small amount
-        arr->capacity = 16;
+        capacity = 16;
     } else {
         //grow the capacity until we can hold the new amount
-        while (new_capacity > arr->capacity) {
-            arr->capacity += arr->capacity >> 1;
+        while (new_capacity > capacity) {
+            uint32_t growth = capacity >> 1;
+            if (growth == 0 || capacity > UINT32_MAX - growth) {
+                capacity = new_capacity;
+                break;
+            }
+            capacity += growth;
         }
     }
 
-    arr->buf = realloc(arr->buf, arr->capacity * sizeof(void*));
+    if (capacity != 0 && sizeof(void *) > SIZE_MAX / capacity) {
+        return false;
+    }
+    void **new_buf = realloc(arr->buf, (size_t) capacity * sizeof(void *));
+    if (new_buf == NULL) {
+        return false;
+    }
 
     //clear the new part of the array
-    memset(&arr->buf[old_capacity], 0, (size_t)(arr->capacity - old_capacity) * sizeof(void*));
+    memset(&new_buf[arr->capacity], 0, (size_t)(capacity - arr->capacity) * sizeof(void *));
+    arr->buf = new_buf;
+    arr->capacity = capacity;
+    return true;
 }
 
-void add_element(Array *arr, void *element) {
-    ensure_capacity(arr, arr->size + 1);
+bool add_element(Array *arr, void *element) {
+    if (arr->size == UINT32_MAX || !ensure_capacity(arr, arr->size + 1)) {
+        return false;
+    }
 
     arr->buf[arr->size++] = element;
+    return true;
 }
 
 void* alloc_and_add_element(Array *arr, size_t size) {
-    ensure_capacity(arr, arr->size + 1);
-
     void *element = calloc(1, size);
-    arr->buf[arr->size++] = element;
+    if (element == NULL || !add_element(arr, element)) {
+        free(element);
+        return NULL;
+    }
     return element;
 }
 

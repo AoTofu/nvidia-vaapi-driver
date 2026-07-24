@@ -929,8 +929,15 @@ static bool direct_realiseSurface(NVDriver *drv, NVSurface *surface) {
 
         direct_attachBackingImageToSurface(surface, img);
         pthread_mutex_lock(&drv->imagesMutex);
-        add_element(&drv->images, img);
+        bool added = add_element(&drv->images, img);
         pthread_mutex_unlock(&drv->imagesMutex);
+        if (!added) {
+            surface->backingImage = NULL;
+            img->surface = NULL;
+            destroyBackingImage(drv, img);
+            pthread_mutex_unlock(&surface->mutex);
+            return false;
+        }
     }
     pthread_mutex_unlock(&surface->mutex);
 

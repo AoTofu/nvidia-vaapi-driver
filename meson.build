@@ -49,6 +49,7 @@ if cc.get_argument_syntax() == 'gcc'
 endif
 
 sources = [
+    'src/appendable-buffer.c',
     'src/av1.c',
     'src/backend-common.c',
     'src/export-buf.c',
@@ -60,6 +61,7 @@ sources = [
     'src/kernels.c',
     'src/mpeg2.c',
     'src/mpeg4.c',
+    'src/resolve-queue.c',
     'src/stats.c',
     'src/vabackend.c',
     'src/vc1.c',
@@ -85,6 +87,21 @@ shared_library(
     install_dir: nvidia_install_dir,
     gnu_symbol_visibility: 'hidden',
 )
+
+resolve_queue_test = executable(
+    'test-resolve-queue',
+    ['tests/test-resolve-queue.c', 'src/resolve-queue.c'],
+    include_directories: include_directories('src'),
+    dependencies: dependency('threads'),
+)
+test('resolve queue', resolve_queue_test, timeout: 30)
+
+core_buffers_test = executable(
+    'test-core-buffers',
+    ['tests/test-core-buffers.c', 'src/appendable-buffer.c', 'src/list.c'],
+    include_directories: include_directories('src'),
+)
+test('core buffers', core_buffers_test, timeout: 30)
 
 meson.add_devenv(environment({
     'NVD_LOG': '1',

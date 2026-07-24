@@ -583,8 +583,15 @@ static bool egl_realiseSurface(NVDriver *drv, NVSurface *surface) {
             egl_attachBackingImageToSurface(surface, img);
             //add our newly created BackingImage to the list
             pthread_mutex_lock(&drv->imagesMutex);
-            add_element(&drv->images, img);
+            bool added = add_element(&drv->images, img);
             pthread_mutex_unlock(&drv->imagesMutex);
+            if (!added) {
+                surface->backingImage = NULL;
+                img->surface = NULL;
+                egl_destroyBackingImage(drv, img);
+                pthread_mutex_unlock(&surface->mutex);
+                return false;
+            }
         }
     }
     pthread_mutex_unlock(&surface->mutex);

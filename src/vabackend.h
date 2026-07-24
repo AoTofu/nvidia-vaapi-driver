@@ -15,19 +15,14 @@
 #include <stdio.h>
 #include <pthread.h>
 #include "list.h"
+#include "resolve-queue.h"
+#include "appendable-buffer.h"
 #include "direct/nv-driver.h"
 #include "common.h"
 #include "stats.h"
 
-#define SURFACE_QUEUE_SIZE 16
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
-
-typedef struct {
-    void        *buf;
-    uint64_t    size;
-    uint64_t    allocated;
-} AppendableBuffer;
 
 typedef enum
 {
@@ -77,6 +72,7 @@ typedef struct
     int                     fourcc;
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
+    bool                    syncInitialized;
     bool                    decodeFailed;
 } NVSurface;
 
@@ -164,6 +160,7 @@ typedef struct _NVDriver
     Array/*<Object>*/       objects;
     pthread_mutex_t         objectCreationMutex;
     VAGenericID             nextObjId;
+    bool                    terminating;
     bool                    useCorrectNV12Format;
     bool                    supports16BitSurface;
     bool                    supports444Surface;
@@ -241,13 +238,9 @@ typedef struct _NVContext
     int                 currentPictureId;
     pthread_t           resolveThread;
     bool                resolveThreadStarted;
-    pthread_mutex_t     resolveMutex;
-    pthread_cond_t      resolveCondition;
-    NVSurface*          surfaceQueue[SURFACE_QUEUE_SIZE];
-    int                 surfaceQueueReadIdx;
-    int                 surfaceQueueWriteIdx;
-    volatile bool       exiting;
+    ResolveQueue        resolveQueue;
     pthread_mutex_t     surfaceCreationMutex;
+    bool                surfaceCreationMutexInitialized;
     int                 surfaceCount;
     bool                firstKeyframeValid;
 } NVContext;
@@ -295,7 +288,6 @@ typedef struct
 
 extern const NVFormatInfo formatsInfo[];
 
-void appendBuffer(AppendableBuffer *ab, const void *buf, uint64_t size);
 int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
 const char *nvColorStandardName(VAProcColorStandardType colorStandard);
