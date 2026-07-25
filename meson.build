@@ -49,8 +49,11 @@ if cc.get_argument_syntax() == 'gcc'
 endif
 
 sources = [
+    'src/appendable-buffer.c',
     'src/av1.c',
     'src/backend-common.c',
+    'src/codec-utils.c',
+    'src/decode-surfaces.c',
     'src/export-buf.c',
     'src/direct/direct-export-buf.c',
     'src/direct/nv-driver.c',
@@ -60,6 +63,10 @@ sources = [
     'src/kernels.c',
     'src/mpeg2.c',
     'src/mpeg4.c',
+    'src/object-table.c',
+    'src/resolve-queue.c',
+    'src/stats.c',
+    'src/surface-import.c',
     'src/vabackend.c',
     'src/vc1.c',
     'src/vp8.c',
@@ -84,6 +91,51 @@ shared_library(
     install_dir: nvidia_install_dir,
     gnu_symbol_visibility: 'hidden',
 )
+
+resolve_queue_test = executable(
+    'test-resolve-queue',
+    ['tests/test-resolve-queue.c', 'src/resolve-queue.c'],
+    include_directories: include_directories('src'),
+    dependencies: dependency('threads'),
+)
+test('resolve queue', resolve_queue_test, timeout: 30)
+
+core_buffers_test = executable(
+    'test-core-buffers',
+    ['tests/test-core-buffers.c', 'src/appendable-buffer.c', 'src/list.c'],
+    include_directories: include_directories('src'),
+)
+test('core buffers', core_buffers_test, timeout: 30)
+
+surface_import_test = executable(
+    'test-surface-import',
+    ['tests/test-surface-import.c', 'src/surface-import.c'],
+    include_directories: include_directories('src'),
+    dependencies: [libva_deps, dependency('libdrm').partial_dependency(compile_args: true)],
+)
+test('surface import', surface_import_test, timeout: 30)
+
+decode_surfaces_test = executable(
+    'test-decode-surfaces',
+    ['tests/test-decode-surfaces.c', 'src/decode-surfaces.c'],
+    include_directories: include_directories('src'),
+)
+test('decode surfaces', decode_surfaces_test, timeout: 30)
+
+object_table_test = executable(
+    'test-object-table',
+    ['tests/test-object-table.c', 'src/object-table.c'],
+    include_directories: include_directories('src'),
+)
+test('object table', object_table_test, timeout: 30)
+
+codec_utils_test = executable(
+    'test-codec-utils',
+    ['tests/test-codec-utils.c', 'src/codec-utils.c'],
+    include_directories: [include_directories('src'), nvidia_incdir],
+    dependencies: deps,
+)
+test('codec slice ranges', codec_utils_test, timeout: 30)
 
 meson.add_devenv(environment({
     'NVD_LOG': '1',

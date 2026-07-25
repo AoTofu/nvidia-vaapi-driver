@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 if [ "x$1" = "x" ]; then
     echo "Usage: $(basename $0) <path of NVIDIA open-gpu-kernel-modules project>"
@@ -20,8 +22,11 @@ while IFS= read -r line; do
         INC_DIRS="$INC_DIRS -I$DIR/${line//d /}"
     elif [[ $line =~ ^f\ .+ ]]; then
         INC_FILES="${INC_FILES}#include <${line//f /}>${NEWLINE}"
-    elif [[ $line =~ ^#.+ ]]; then
+    elif [[ $line =~ ^#include ]] || [[ $line =~ ^#define ]]; then
         INC_FILES="${INC_FILES}${line}${NEWLINE}"
+    elif [[ $line =~ ^#.+ ]]; then
+        # License/comment lines: emit as C comment so cpp does not error
+        INC_FILES="${INC_FILES}// ${line#\#}${NEWLINE}"
     fi
 done < headers.in
 
@@ -35,7 +40,8 @@ mkdir -p ${OUTPUT_DIR}
 
 echo "${INC_FILES}" > ${OUTPUT_DIR}/nvidia.h
 
-INCLUDED_FILES=$(cpp $INC_DIRS -H ${OUTPUT_DIR}/nvidia.h 2>&1 1>/dev/null | grep -E '^\.' | grep -Eo "$DIR.*")
+# Use -I${OUTPUT_DIR} so cpp finds project-local headers (e.g. nvidia-drm-ioctl.h) not in the NVIDIA repo
+INCLUDED_FILES=$(cpp $INC_DIRS -I${OUTPUT_DIR} -H ${OUTPUT_DIR}/nvidia.h 2>&1 1>/dev/null | grep -E '^\.' | grep -Eo "$DIR.*")
 
 for f in $INCLUDED_FILES; do
     for d in $DIRS; do

@@ -95,8 +95,9 @@ You'll need `meson`, the `gstreamer-plugins-bad` library, and [`nv-codec-headers
 Then run the following commands:
 
 ```sh
-meson setup build
-meson install -C build
+meson setup build --buildtype=release
+meson compile -C build
+sudo meson install -C build
 ```
 
 ## Removal
@@ -124,8 +125,16 @@ Environment variables used to control the behavior of this library.
 | `NVD_LOG` | Used to control logging. `1` to log to stdout, anything else to append to the given file. |
 | `NVD_MAX_INSTANCES` | Controls the maximum concurrent instances of the driver will be allowed per-process. This option is only really useful for older GPUs with not much VRAM, especially with Firefox on video heavy websites. |
 | `NVD_BACKEND` | Controls which backend this library uses. Either `egl`, or `direct` (default). See [direct backend](#direct-backend) for more details. |
-| `NVD_MAX_DETACHED_BACKING_IMAGE_BYTES` | Upper bound (in bytes) on the size of the detached backing-image cache used by the direct backend to recycle decode surfaces across stream switches. Lower this on low-VRAM GPUs to reduce memory usage at the cost of more re-allocation when streams change. Set to `0` to disable detached caching. Default: `134217728` (128 MiB). |
+| `NVD_MAX_DETACHED_BACKING_IMAGE_BYTES` | Upper bound (in bytes) on the size of the detached backing-image cache used by the direct backend to recycle decode surfaces across stream switches. Lower this on low-VRAM GPUs to reduce memory usage at the cost of more re-allocation when streams change. Set to `0` to disable detached caching. Default: scales with the GPU — total VRAM / 64 (~1.6%), clamped to 64 MiB–512 MiB; falls back to `134217728` (128 MiB) if the VRAM size cannot be queried. |
 | `NVD_MAX_DETACHED_BACKING_IMAGES` | Upper bound on the number of cached detached backing images. Set to `0` to disable detached caching. Default: `16`. |
+| `NVD_MEMORY_BUDGET_BYTES` | Optional shared GPU-memory budget for detached backing images and VideoProc GPU scratch. The driver prunes reclaimable cache entries before optional scratch growth; essential active decode surfaces are never evicted. `0` disables the shared budget. Default: `0`. |
+| `NVD_DECODE_SURFACES` | Decode-surface selection mode. `auto` derives the count from codec reference requirements and client render targets; a positive integer forces a count, subject to the min/max bounds below. Unset keeps the compatibility value of 32 while statistics report the automatic candidate for validation. |
+| `NVD_DECODE_SURFACES_MIN` | Lower bound for automatic or forced decode-surface selection. Default: `2`. |
+| `NVD_DECODE_SURFACES_MAX` | Upper bound for decode-surface selection. NVIDIA picture indices are limited to 32, so larger values are clamped. Default: `32`. |
+| `NVD_VIDEOPROC_SCRATCH_MAX_BYTES` | Upper bound, separately, for fallback VideoProc GPU and CPU scratch buffers. Direct CUDA-array conversion does not allocate these buffers. Set to `0` to disable scratch-backed fallbacks. Default: `268435456` (256 MiB). Idle fallback scratch is released after 120 consecutive CUDA-processed frames. |
+| `NVD_BUFFER_POOL_MAX_BYTES` | Upper bound for reusable VA buffer/image host allocations. Six size classes from 4 KiB through 4 MiB are retained; oversize allocations are freed immediately. Set to `0` to disable retention. Default: `67108864` (64 MiB). |
+| `NVD_STATS` | Enables performance counters. `1` logs every 120 decoded pictures; a larger integer selects that interval. A final snapshot is always emitted when the driver terminates. Leave unset for benchmark runs that do not need instrumentation. |
+| `NVD_STATS_LOG` | Appends `NVD_STATS` snapshots to this file instead of the normal log output. Statistics include copy bytes, host fallbacks, resolve-queue pressure, backing allocation time/cache usage, current and peak backing/scratch memory, VideoProc time, object lookup cost, and codec copy volume. |
 
 ## Firefox
 
@@ -159,7 +168,9 @@ If you're using the Snap version of Firefox, it will be unable to access the hos
 
 ## Chrome
 
-This fork includes the Chromium-compatible single-buffer export path. For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start the browser with flags similar to:
+This fork includes a Chromium-compatible single-buffer export path. Chrome and Chromium processes select it automatically because Chromium cannot represent different DRM modifiers for separate plane objects. Set `NVD_SINGLE_BUFFER=1` explicitly for Chromium-based wrappers that run the GPU process under a different executable name.
+
+Start the browser with flags similar to:
 
 ```sh
 LIBVA_DRIVER_NAME=nvidia google-chrome \
@@ -170,7 +181,7 @@ LIBVA_DRIVER_NAME=nvidia google-chrome \
 
 On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
 
-`NVD_DESCRIPTOR_MODE` defaults to Chromium-compatible `single` mode in this branch. Use `NVD_DESCRIPTOR_MODE=multi` only when testing traditional per-plane export behavior.
+Chrome and Chromium receive one buffer with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
 ## MPV
 

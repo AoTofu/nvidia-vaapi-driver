@@ -65,6 +65,25 @@ static void copyMPEG4SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *p
 
 static void copyMPEG4SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
 {
+    size_t bytes = 0;
+    for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
+        const VASliceParameterBufferMPEG4 *slice =
+            &((const VASliceParameterBufferMPEG4 *) ctx->lastSliceParams)[i];
+        if (!nvValidateSliceRange(ctx, buf, slice->slice_data_offset,
+                                  slice->slice_data_size, NULL)) {
+            return;
+        }
+        if (slice->slice_data_size > SIZE_MAX - bytes) {
+            ctx->bitstreamBuffer.failed = true;
+            return;
+        }
+        bytes += slice->slice_data_size;
+    }
+    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+                               sizeof(uint32_t)) ||
+        !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bytes)) {
+        return;
+    }
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++)
     {
         VASliceParameterBufferMPEG4 *sliceParams = &((VASliceParameterBufferMPEG4*) ctx->lastSliceParams)[i];

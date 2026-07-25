@@ -14,7 +14,7 @@ jobs:
       DISTRO: ${{ matrix.os }}
     steps:
     - name: 'Checkout'
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
     - name: 'Install toolchain'
       if: ${{ (matrix.compiler == 'clang-15') }}
       run: .github/workflows/install-clang.sh 15
@@ -27,8 +27,10 @@ jobs:
           libegl-dev \
           meson
     - name: 'Configure'
-      run: meson setup ./builddir --prefix=/usr -D werror=true
+      run: meson setup ./builddir --prefix=/usr --buildtype=release -D werror=true
     - name: 'Build'
       run: meson compile -C ./builddir
+    - name: 'Test'
+      run: meson test -C ./builddir --print-errorlogs
     - name: 'Install'
       run: sudo meson install -C ./builddir

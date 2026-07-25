@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 typedef struct {
     void **buf;
@@ -15,7 +16,7 @@ typedef struct {
 #define ARRAY_FOR_EACH_REV(T, N, A) for (uint32_t N ## _idx = (A)->size-1; N ## _idx < (A)->size; N ## _idx--) { T N = (T) (A)->buf[N ## _idx];
 #define END_FOR_EACH }
 
-void add_element(Array *arr, void *element);
+bool add_element(Array *arr, void *element);
 
 void remove_element_at(Array *arr, uint32_t index);
 

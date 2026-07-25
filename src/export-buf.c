@@ -237,7 +237,13 @@ static bool egl_initExporter(NVDriver *drv) {
         return false;
     }
     //setup debug logging
-    eglDebugMessageControlKHR(debug, debugAttribs);
+    // EGL_KHR_debug is optional; exporter initialization can continue safely
+    // when the implementation does not expose the callback.
+    if (eglDebugMessageControlKHR != NULL) {
+        eglDebugMessageControlKHR(debug, debugAttribs);
+    } else {
+        LOG("EGL_KHR_debug is unavailable; continuing without EGL debug logging");
+    }
 
     //see if the driver supports 16-bit exports
     EGLint formats[64];
@@ -314,6 +320,14 @@ static BackingImage* createBackingImage(NVDriver *drv, uint32_t width, uint32_t 
                 close(img->fds[i]);
             }
         }
+        if (image != EGL_NO_IMAGE) {
+            eglDestroyImage(drv->eglDisplay, image);
+        }
+        for (int i = 0; i < 3; i++) {
+            if (arrays[i] != NULL) {
+                CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(arrays[i]));
+            }
+        }
         free(img);
         return NULL;
     }
@@ -326,6 +340,10 @@ static BackingImage* createBackingImage(NVDriver *drv, uint32_t width, uint32_t 
 
 
 static bool egl_destroyBackingImage(NVDriver *drv, BackingImage *img) {
+    if (img->isExternalBuffer) {
+        nvDestroyImportedBackingImage(drv, img);
+        return true;
+    }
     //if we're attached to a surface, update the surface to remove us
     if (img->surface != NULL) {
         img->surface->backingImage = NULL;
@@ -340,12 +358,19 @@ static bool egl_destroyBackingImage(NVDriver *drv, BackingImage *img) {
     //eglStreamReleaseImageNV(drv->eglDisplay, drv->eglStream, surface->eglImage, EGL_NO_SYNC);
     //destroy them rather than releasing them
     eglDestroyImage(drv->eglDisplay, img->image);
-    CHECK_CUDA_RESULT_RETURN(drv->cu->cuArrayDestroy(img->arrays[0]), false);
-    CHECK_CUDA_RESULT_RETURN(drv->cu->cuArrayDestroy(img->arrays[1]), false);
-    img->arrays[0] = NULL;
-    img->arrays[1] = NULL;
+    nvDestroyBackingImageVideoProcObjects(drv, img);
+    bool destroyed = true;
+    for (int i = 0; i < 3; i++) {
+        if (img->arrays[i] != NULL) {
+            if (CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(img->arrays[i]))) {
+                destroyed = false;
+            }
+            img->arrays[i] = NULL;
+        }
+    }
+    nvStatsBackingImageDestroyed(drv, img);
     free(img);
-    return true;
+    return destroyed;
 }
 
 static void egl_attachBackingImageToSurface(NVSurface *surface, BackingImage *img) {
@@ -360,7 +385,8 @@ static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface)
         return;
     }
 
-    if (surface->backingImage->fourcc == DRM_FORMAT_NV21) {
+    if (surface->backingImage->isExternalBuffer ||
+        surface->backingImage->fourcc == DRM_FORMAT_NV21) {
         if (!egl_destroyBackingImage(drv, surface->backingImage)) {
             LOG("Unable to destroy backing image");
         }
@@ -371,6 +397,7 @@ static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface)
             //find the entry for this surface
             if (img->surface == surface) {
                 LOG("Detaching BackingImage %p from Surface %p", img, surface);
+                nvStatsBackingImageSetActive(drv, img, false);
                 img->surface = NULL;
                 break;
             }
@@ -393,14 +420,35 @@ static void egl_destroyAllBackingImage(NVDriver *drv) {
     pthread_mutex_unlock(&drv->imagesMutex);
 }
 
+static NVFormat eglFormatForSurface(const NVSurface *surface) {
+    if (surface->format == cudaVideoSurfaceFormat_NV12) {
+        return NV_FORMAT_NV12;
+    }
+    if (surface->format == cudaVideoSurfaceFormat_P016) {
+        if (surface->bitDepth == 10) {
+            return NV_FORMAT_P010;
+        }
+        if (surface->bitDepth == 12) {
+            return NV_FORMAT_P012;
+        }
+        return NV_FORMAT_P016;
+    }
+    return NV_FORMAT_NONE;
+}
+
 static BackingImage* findFreeBackingImage(NVDriver *drv, NVSurface *surface) {
     BackingImage *ret = NULL;
+    const NVFormat requiredFormat = eglFormatForSurface(surface);
     pthread_mutex_lock(&drv->imagesMutex);
     //look through the free'd surfaces and see if we can reuse one
     ARRAY_FOR_EACH(BackingImage*, img, &drv->images)
-        if (img->surface == NULL && img->width == surface->width && img->height == surface->height) {
+        if (img->surface == NULL && img->width == surface->width &&
+            img->height == surface->height && img->format == requiredFormat &&
+            img->numPlanes == 2) {
             LOG("Using BackingImage %p for Surface %p", img, surface);
             egl_attachBackingImageToSurface(surface, img);
+            nvStatsBackingImageSetActive(drv, img, true);
+            nvStatsIncrement(drv, NV_STAT_BACKING_CACHE_HITS);
             ret = img;
             break;
         }
@@ -410,7 +458,7 @@ static BackingImage* findFreeBackingImage(NVDriver *drv, NVSurface *surface) {
 }
 
 
-static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *surface) {
+static BackingImage *egl_allocateBackingImageImpl(NVDriver *drv, const NVSurface *surface) {
     CUeglFrame eglframe = {
         .width = surface->width,
         .height = surface->height,
@@ -456,8 +504,13 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
         .Flags = 0,
         .Format = eglframe.cuFormat
     };
-    CHECK_CUDA_RESULT_RETURN(drv->cu->cuArray3DCreate(&eglframe.frame.pArray[0], &arrDesc), NULL);
-    CHECK_CUDA_RESULT_RETURN(drv->cu->cuArray3DCreate(&eglframe.frame.pArray[1], &arr2Desc), NULL);
+    if (CHECK_CUDA_RESULT(drv->cu->cuArray3DCreate(&eglframe.frame.pArray[0], &arrDesc))) {
+        return NULL;
+    }
+    if (CHECK_CUDA_RESULT(drv->cu->cuArray3DCreate(&eglframe.frame.pArray[1], &arr2Desc))) {
+        CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(eglframe.frame.pArray[0]));
+        return NULL;
+    }
 
     pthread_mutex_lock(&drv->exportMutex);
 
@@ -467,7 +520,8 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
         if (!reconnect(drv) ||
             CHECK_CUDA_RESULT(drv->cu->cuEGLStreamProducerPresentFrame( &drv->cuStreamConnection, eglframe, NULL))) {
             pthread_mutex_unlock(&drv->exportMutex);
-
+            CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(eglframe.frame.pArray[0]));
+            CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(eglframe.frame.pArray[1]));
             return NULL;
         }
     }
@@ -497,6 +551,13 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
             LOG("Acquired image from EGLStream: %p", img);
 
             ret = createBackingImage(drv, surface->width, surface->height, img, eglframe.frame.pArray);
+            if (ret != NULL) {
+                ret->format = eglFormatForSurface(surface);
+                ret->numPlanes = 2;
+                const uint64_t visibleBytes = (uint64_t) surface->width * surface->height *
+                                              (surface->format == cudaVideoSurfaceFormat_NV12 ? 3 : 6) / 2;
+                ret->totalSize = visibleBytes > UINT32_MAX ? UINT32_MAX : (uint32_t) visibleBytes;
+            }
         } else {
             LOG("Unhandled event: %X", event);
         }
@@ -506,7 +567,19 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
     return ret;
 }
 
-static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
+static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *surface) {
+    const uint64_t start = nvStatsTimestamp(drv);
+    BackingImage *img = egl_allocateBackingImageImpl(drv, surface);
+    const uint64_t end = nvStatsTimestamp(drv);
+    nvStatsIncrement(drv, NV_STAT_BACKING_ALLOC_COUNT);
+    if (start != 0 && end >= start) {
+        nvStatsAdd(drv, NV_STAT_BACKING_ALLOC_NS, end - start);
+    }
+    return img;
+}
+
+static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
+                               uint32_t pitch, CUstream stream, CUevent completeEvent) {
     int bpp = surface->format == cudaVideoSurfaceFormat_NV12 ? 1 : 2;
     CUDA_MEMCPY2D cpy = {
         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
@@ -517,7 +590,8 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         .Height = surface->height,
         .WidthInBytes = surface->width * bpp
     };
-    CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2DAsync(&cpy, 0), false);
+    CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2DAsync(&cpy, stream), false);
+    nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) cpy.WidthInBytes * cpy.Height);
     CUDA_MEMCPY2D cpy2 = {
         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
         .srcDevice = ptr,
@@ -528,7 +602,15 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         .Height = surface->height >> 1,
         .WidthInBytes = surface->width * bpp
     };
-    CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2D(&cpy2), false);
+    CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2DAsync(&cpy2, stream), false);
+    nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) cpy2.WidthInBytes * cpy2.Height);
+
+    if (completeEvent != NULL) {
+        CHECK_CUDA_RESULT_RETURN(drv->cu->cuEventRecord(completeEvent, stream), false);
+        CHECK_CUDA_RESULT_RETURN(drv->cu->cuEventSynchronize(completeEvent), false);
+    } else {
+        CHECK_CUDA_RESULT_RETURN(drv->cu->cuStreamSynchronize(stream), false);
+    }
 
     //notify anyone waiting for us to be resolved
     pthread_mutex_lock(&surface->mutex);
@@ -577,8 +659,18 @@ static bool egl_realiseSurface(NVDriver *drv, NVSurface *surface) {
             egl_attachBackingImageToSurface(surface, img);
             //add our newly created BackingImage to the list
             pthread_mutex_lock(&drv->imagesMutex);
-            add_element(&drv->images, img);
+            bool added = add_element(&drv->images, img);
+            if (added) {
+                nvStatsBackingImageCreated(drv, img, true);
+            }
             pthread_mutex_unlock(&drv->imagesMutex);
+            if (!added) {
+                surface->backingImage = NULL;
+                img->surface = NULL;
+                egl_destroyBackingImage(drv, img);
+                pthread_mutex_unlock(&surface->mutex);
+                return false;
+            }
         }
     }
     pthread_mutex_unlock(&surface->mutex);
@@ -586,14 +678,15 @@ static bool egl_realiseSurface(NVDriver *drv, NVSurface *surface) {
     return true;
 }
 
-static bool egl_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
+static bool egl_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
+                              uint32_t pitch, CUstream stream, CUevent completeEvent) {
     if (!egl_realiseSurface(drv, surface)) {
         return false;
     }
 
     if (ptr != 0) {
         nvBackingImageStoreSurfaceColorMetadata(surface->backingImage, surface);
-        if (!copyFrameToSurface(drv, ptr, surface, pitch)) {
+        if (!copyFrameToSurface(drv, ptr, surface, pitch, stream, completeEvent)) {
             LOG("Unable to update surface from frame");
             return false;
         }
@@ -619,10 +712,20 @@ static bool egl_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRMPRI
     desc->num_objects = 2;
 
     desc->objects[0].fd = dup(img->fds[0]);
+    if (desc->objects[0].fd < 0) {
+        desc->num_objects = 0;
+        return false;
+    }
     desc->objects[0].size = img->width * img->height * bpp;
     desc->objects[0].drm_format_modifier = img->mods[0];
 
     desc->objects[1].fd = dup(img->fds[1]);
+    if (desc->objects[1].fd < 0) {
+        close(desc->objects[0].fd);
+        desc->objects[0].fd = -1;
+        desc->num_objects = 0;
+        return false;
+    }
     desc->objects[1].size = img->width * (img->height >> 1) * bpp;
     desc->objects[1].drm_format_modifier = img->mods[1];
 
@@ -649,5 +752,6 @@ const NVBackend EGL_BACKEND = {
     .detachBackingImageFromSurface = egl_detachBackingImageFromSurface,
     .realiseSurface = egl_realiseSurface,
     .fillExportDescriptor = egl_fillExportDescriptor,
-    .destroyAllBackingImage = egl_destroyAllBackingImage
+    .destroyAllBackingImage = egl_destroyAllBackingImage,
+    .pruneToMemoryBudget = NULL
 };

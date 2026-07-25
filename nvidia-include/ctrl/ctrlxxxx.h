@@ -63,5 +63,10 @@
  */
 #define NVXXXX_CTRL_CMD_NULL              (0x00000000)
 
+typedef struct NVXXXX_CTRL_XXX_INFO {
+    NvU32 index;
+    NvU32 data;
+} NVXXXX_CTRL_XXX_INFO;
+
 #define NVxxxx_CTRL_LEGACY_PRIVILEGED     (0xC0)
 #define NVxxxx_CTRL_LEGACY_NON_PRIVILEGED (0x80)

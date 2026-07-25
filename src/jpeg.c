@@ -390,44 +390,45 @@ static uint8_t *writeSOS(uint8_t *ptr, const VASliceParameterBufferJPEGBaseline 
 }
 
 // Reconstruct complete JPEG frame
-static uint8_t *reconstructJPEG(const JPEGContext *jpegCtx,
-                                const VASliceParameterBufferJPEGBaseline *slices,
-                                uint32_t sliceCount,
-                                const uint8_t *sliceData,
-                                uint32_t sliceDataSize,
-                                uint32_t *outSize) {
+static bool reconstructJPEG(const JPEGContext *jpegCtx,
+                            const VASliceParameterBufferJPEGBaseline *slices,
+                            uint32_t sliceCount,
+                            const uint8_t *sliceData,
+                            uint32_t sliceDataSize,
+                            AppendableBuffer *output,
+                            uint32_t *outSize) {
     if (!jpegCtx->hasPicParams || !jpegCtx->hasIQMatrix) {
         LOG("JPEG: Missing picture params or IQ matrix");
-        return NULL;
+        return false;
     }
 
     if (jpegCtx->picParams.picture_width == 0U || jpegCtx->picParams.picture_height == 0U) {
         LOG("JPEG: Invalid dimensions: %ux%u",
             jpegCtx->picParams.picture_width,
             jpegCtx->picParams.picture_height);
-        return NULL;
+        return false;
     }
 
     if (jpegCtx->picParams.num_components == 0U || jpegCtx->picParams.num_components > JPEG_MAX_COMPONENTS) {
         LOG("JPEG: Unsupported frame component count: %u", jpegCtx->picParams.num_components);
-        return NULL;
+        return false;
     }
 
     uint8_t usedQuantMask = 0;
     if (!getUsedQuantTablesMask(&jpegCtx->picParams, &usedQuantMask)) {
-        return NULL;
+        return false;
     }
 
     if ((jpegCtx->validQuantTablesMask & usedQuantMask) != usedQuantMask) {
         LOG("JPEG: Missing required quant tables (used=0x%02x valid=0x%02x)",
             usedQuantMask,
             jpegCtx->validQuantTablesMask);
-        return NULL;
+        return false;
     }
 
     if (sliceCount == 0U) {
         LOG("JPEG: No slice parameters");
-        return NULL;
+        return false;
     }
 
     uint64_t totalEcsSize = 0;
@@ -439,21 +440,21 @@ static uint8_t *reconstructJPEG(const JPEGContext *jpegCtx,
 
         if (slice->slice_data_flag != VA_SLICE_DATA_FLAG_ALL) {
             LOG("JPEG: slice_data_flag=%u not supported (expected ALL)", slice->slice_data_flag);
-            return NULL;
+            return false;
         }
 
         if (!validateSliceAndCollectHuffmanUsage(&jpegCtx->picParams,
                                                  slice,
                                                  &requiredDcMask,
                                                  &requiredAcMask)) {
-            return NULL;
+            return false;
         }
 
         if (slice->slice_data_offset > sliceDataSize) {
             LOG("JPEG: Invalid slice_data_offset (%u) exceeds buffer size (%u)",
                 slice->slice_data_offset,
                 sliceDataSize);
-            return NULL;
+            return false;
         }
 
         uint32_t availableData = sliceDataSize - slice->slice_data_offset;
@@ -461,12 +462,12 @@ static uint8_t *reconstructJPEG(const JPEGContext *jpegCtx,
             LOG("JPEG: Invalid slice_data_size (%u) exceeds available data (%u)",
                 slice->slice_data_size,
                 availableData);
-            return NULL;
+            return false;
         }
 
         if (UINT64_MAX - totalEcsSize < slice->slice_data_size) {
             LOG("JPEG: Total ECS size overflow");
-            return NULL;
+            return false;
         }
         totalEcsSize += slice->slice_data_size;
     }
@@ -512,14 +513,15 @@ static uint8_t *reconstructJPEG(const JPEGContext *jpegCtx,
 
     if (maxSize64 > SIZE_MAX) {
         LOG("JPEG: Frame size too large to allocate (%llu bytes)", (unsigned long long)maxSize64);
-        return NULL;
+        return false;
     }
 
-    uint8_t *frame = (uint8_t *)malloc((size_t)maxSize64);
-    if (frame == NULL) {
-        LOG("JPEG: Failed to allocate frame buffer");
-        return NULL;
+    const size_t frameOffset = output->size;
+    if (!reserveAdditionalBuffer(output, (size_t) maxSize64)) {
+        LOG("JPEG: Failed to reserve frame buffer");
+        return false;
     }
+    uint8_t *frame = (uint8_t *) output->buf + frameOffset;
 
     uint8_t *ptr = frame;
 
@@ -529,8 +531,7 @@ static uint8_t *reconstructJPEG(const JPEGContext *jpegCtx,
 
     // 2. DQT
     if (!writeDQT(&ptr, &jpegCtx->iqMatrix, &jpegCtx->picParams, jpegCtx->validQuantTablesMask)) {
-        free(frame);
-        return NULL;
+        return false;
     }
 
     // 3. SOF0
@@ -594,12 +595,16 @@ static uint8_t *reconstructJPEG(const JPEGContext *jpegCtx,
     uint64_t frameSize64 = (uint64_t)(ptr - frame);
     if (frameSize64 > UINT32_MAX) {
         LOG("JPEG: Reconstructed frame too large (%llu bytes)", (unsigned long long)frameSize64);
-        free(frame);
-        return NULL;
+        return false;
     }
 
     *outSize = (uint32_t)frameSize64;
-    return frame;
+    if (frameOffset > UINT32_MAX - *outSize) {
+        LOG("JPEG: Reconstructed bitstream exceeds CUVID limit");
+        return false;
+    }
+    output->size = frameOffset + *outSize;
+    return true;
 }
 
 static void copyJPEGPicParam(NVContext *ctx, NVBuffer *buffer, CUVIDPICPARAMS *picParams)
@@ -712,34 +717,31 @@ static void copyJPEGSliceData(NVContext *ctx, NVBuffer *buf, CUVIDPICPARAMS *pic
     }
 
     uint32_t frameSize = 0;
-    uint8_t *frame = reconstructJPEG(jpegCtx,
-                                     slices,
-                                     ctx->lastSliceParamsCount,
-                                     (const uint8_t *)buf->ptr,
-                                     (uint32_t)buf->size,
-                                     &frameSize);
-    if (frame == NULL) {
-        LOG("JPEG: Failed to reconstruct JPEG frame");
+    if (ctx->bitstreamBuffer.size > UINT32_MAX) {
+        LOG("JPEG: Reconstructed bitstream offset exceeds CUVID limit");
         return;
     }
-
-    if (ctx->bitstreamBuffer.size > UINT32_MAX - frameSize) {
-        LOG("JPEG: Reconstructed bitstream would overflow CUVID limit");
-        free(frame);
+    const uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
+    if (!appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset))) {
+        return;
+    }
+    if (!reconstructJPEG(jpegCtx,
+                         slices,
+                         ctx->lastSliceParamsCount,
+                         (const uint8_t *)buf->ptr,
+                         (uint32_t)buf->size,
+                         &ctx->bitstreamBuffer,
+                         &frameSize)) {
+        LOG("JPEG: Failed to reconstruct JPEG frame");
+        ctx->sliceOffsets.size -= sizeof(offset);
         return;
     }
 
     // NVDEC can consume a full JPEG as a single "slice" (same approach as FFmpeg's mjpeg_nvdec)
     picParams->nNumSlices = 1U;
-
-    uint32_t offset = (uint32_t)ctx->bitstreamBuffer.size;
-    appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
-    appendBuffer(&ctx->bitstreamBuffer, frame, frameSize);
     picParams->nBitstreamDataLen = (uint32_t)ctx->bitstreamBuffer.size;
 
     LOG("JPEG: Reconstructed %u bytes for NVDEC", frameSize);
-
-    free(frame);
 }
 
 static cudaVideoCodec computeJPEGCudaCodec(VAProfile profile) {

@@ -137,8 +137,9 @@ static void compactAV1BitstreamToCurrentFrame(NVContext *ctx, CUVIDPICPARAMS *pi
         }
     }
 
-    memmove(ctx->bitstreamBuffer.buf, (const uint8_t*) ctx->bitstreamBuffer.buf + start, end - start);
-    ctx->bitstreamBuffer.size = end - start;
+    const size_t compactBytes = end - start;
+    ctx->bitstreamDataOffset = start;
+    ctx->bitstreamBuffer.size = compactBytes;
     picParams->nBitstreamDataLen = (uint32_t) ctx->bitstreamBuffer.size;
     ctx->av1BitstreamCompacted = true;
 }
@@ -178,7 +179,7 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->enable_masked_compound = buf->seq_info_fields.fields.enable_masked_compound;
     pps->enable_dual_filter = buf->seq_info_fields.fields.enable_dual_filter;
     pps->enable_order_hint = buf->seq_info_fields.fields.enable_order_hint;
-    pps->order_hint_bits_minus1 = buf->order_hint_bits_minus_1;
+    pps->order_hint_bits_minus1 = pps->enable_order_hint ? buf->order_hint_bits_minus_1 : 0;
     pps->enable_jnt_comp = buf->seq_info_fields.fields.enable_jnt_comp;
     //TODO not quite correct, use_superres can be 0, and enable_superres can be 1
     pps->enable_superres = buf->pic_info_fields.bits.use_superres;
@@ -196,7 +197,7 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->disable_cdf_update = buf->pic_info_fields.bits.disable_cdf_update;
     pps->allow_screen_content_tools = buf->pic_info_fields.bits.allow_screen_content_tools;
     pps->force_integer_mv = buf->pic_info_fields.bits.force_integer_mv || picParams->intra_pic_flag;
-    pps->coded_denom = buf->superres_scale_denominator;
+    pps->coded_denom = buf->pic_info_fields.bits.use_superres ? buf->superres_scale_denominator - 9 : 0;
     pps->allow_intrabc = buf->pic_info_fields.bits.allow_intrabc;
     pps->allow_high_precision_mv = buf->pic_info_fields.bits.allow_high_precision_mv;
 
@@ -351,12 +352,21 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 
     if (pps->apply_grain) {
         NVSurface *display = nvSurfaceFromSurfaceId(ctx->drv, buf->current_display_picture);
-        if (display != NULL) {
+        // Film grain decodes the clean frame into the render target (kept as a
+        // reference) and writes the grain-applied frame to a separate display
+        // surface. That only works if the display surface is a distinct surface
+        // with a valid decoder picture index; otherwise redirecting would either
+        // pass CurrPicIdx=-1 (decode failure) or make the grained output alias
+        // the reference frame. In those cases decode normally into the render
+        // target instead.
+        if (display != NULL && display != ctx->renderTarget && display->pictureIdx >= 0) {
             ctx->displayTarget = display;
             picParams->CurrPicIdx = display->pictureIdx;
             pps->decodePicIdx = ctx->renderTarget->pictureIdx;
-        } else {
+        } else if (display == NULL) {
             LOG("AV1 film grain requested without a valid display surface: %u", buf->current_display_picture);
+        } else if (display->pictureIdx < 0) {
+            LOG("AV1 film grain display surface %u has no picture index yet, decoding in place", buf->current_display_picture);
         }
     }
 
@@ -464,24 +474,22 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 }
 
 static void ensureAV1SliceOffsetStorage(NVContext *ctx, const uint32_t numSlices) {
-    const uint64_t requiredSize = (uint64_t) numSlices * 2 * sizeof(uint32_t);
-    const uint64_t oldSize = ctx->sliceOffsets.size;
+    if (numSlices > UINT32_MAX / (2U * sizeof(uint32_t))) {
+        ctx->sliceOffsets.failed = true;
+        ctx->sliceOffsets.size = 0;
+        return;
+    }
+    const size_t requiredSize = (size_t) numSlices * 2U * sizeof(uint32_t);
+    const size_t oldSize = ctx->sliceOffsets.size;
     if (requiredSize == 0) {
         ctx->sliceOffsets.size = 0;
         return;
     }
 
-    if (ctx->sliceOffsets.buf == NULL) {
-        ctx->sliceOffsets.allocated = requiredSize * 2;
-        ctx->sliceOffsets.buf = memalign(16, ctx->sliceOffsets.allocated);
-    } else if (requiredSize > ctx->sliceOffsets.allocated) {
-        while (requiredSize > ctx->sliceOffsets.allocated) {
-            ctx->sliceOffsets.allocated += ctx->sliceOffsets.allocated >> 1;
-        }
-        void *newBuffer = memalign(16, ctx->sliceOffsets.allocated);
-        memcpy(newBuffer, ctx->sliceOffsets.buf, oldSize);
-        free(ctx->sliceOffsets.buf);
-        ctx->sliceOffsets.buf = newBuffer;
+    if (!reserveBuffer(&ctx->sliceOffsets, requiredSize)) {
+        LOG("Unable to reserve AV1 slice offset storage");
+        ctx->sliceOffsets.size = 0;
+        return;
     }
 
     if (requiredSize > oldSize) {
@@ -498,7 +506,10 @@ static uint32_t getAV1SliceTileIndex(const CUVIDAV1PICPARAMS *pps, const VASlice
     return fallbackIndex;
 }
 
-static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams, const VASliceParameterBufferAV1 *sliceParams, const unsigned int count, const int64_t offsetAdjustment) {
+static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams,
+                               const VASliceParameterBufferAV1 *sliceParams,
+                               const unsigned int count, const int64_t offsetAdjustment,
+                               const size_t sliceDataSize) {
     CUVIDAV1PICPARAMS *pps = &picParams->CodecSpecific.av1;
     uint32_t numSlices = picParams->nNumSlices;
     if (numSlices == 0) {
@@ -507,7 +518,24 @@ static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams, const 
     }
 
     ensureAV1SliceOffsetStorage(ctx, numSlices);
+    // ensureAV1SliceOffsetStorage leaves buf == NULL (and size == 0) if the
+    // allocation failed under memory pressure. Bail before the loop below writes
+    // offsets[tileIndex * 2], which would dereference NULL and crash the whole
+    // GPU process on OOM.
+    if (ctx->sliceOffsets.buf == NULL) {
+        LOG("AV1 slice offset storage unavailable, skipping %u tile offsets", count);
+        return;
+    }
     for (unsigned int i = 0; i < count; i++) {
+        if ((size_t) sliceParams[i].slice_data_offset > sliceDataSize ||
+            (size_t) sliceParams[i].slice_data_size >
+                sliceDataSize - (size_t) sliceParams[i].slice_data_offset) {
+            LOG("AV1 tile range outside slice data: offset=%u size=%u buffer=%zu",
+                sliceParams[i].slice_data_offset, sliceParams[i].slice_data_size,
+                sliceDataSize);
+            ctx->inputValidationFailed = true;
+            return;
+        }
         uint32_t tileIndex = getAV1SliceTileIndex(pps, &sliceParams[i], i);
         if (tileIndex >= numSlices) {
             LOG("AV1 tile index %u out of range for %u slices", tileIndex, numSlices);
@@ -548,7 +576,8 @@ static void copyAV1SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
     const VASliceParameterBufferAV1 *sliceParams = (const VASliceParameterBufferAV1*) buf->ptr;
     if (ctx->bitstreamBuffer.size > 0 && sliceParams != NULL) {
         // Chromium submits AV1 slice data before per-tile slice parameters.
-        setAV1SliceOffsets(ctx, picParams, sliceParams, buf->elements, 0);
+        setAV1SliceOffsets(ctx, picParams, sliceParams, buf->elements, 0,
+                           ctx->bitstreamBuffer.size);
         ctx->lastSliceParams = NULL;
         ctx->lastSliceParamsCount = 0;
     }
@@ -565,7 +594,10 @@ static void copyAV1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         return;
     }
 
-    setAV1SliceOffsets(ctx, picParams, (const VASliceParameterBufferAV1*) ctx->lastSliceParams, ctx->lastSliceParamsCount, (int64_t) ctx->bitstreamBuffer.size);
+    setAV1SliceOffsets(ctx, picParams,
+                       (const VASliceParameterBufferAV1*) ctx->lastSliceParams,
+                       ctx->lastSliceParamsCount,
+                       (int64_t) ctx->bitstreamBuffer.size, buf->size);
     appendBuffer(&ctx->bitstreamBuffer, buf->ptr, buf->size);
     picParams->nBitstreamDataLen = ctx->bitstreamBuffer.size;
     if (ctx->av1TileOffsetsSeen >= picParams->nNumSlices) {

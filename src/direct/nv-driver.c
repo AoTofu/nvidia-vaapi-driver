@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ */
+
 #define _GNU_SOURCE 1
 
 #include <sys/ioctl.h>
@@ -6,11 +11,13 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #include <drm_fourcc.h>
 
 #include "nv-driver.h"
 #include <nvidia.h>
+#include <ctrl/ctrl2080/ctrl2080fb.h>
 
 #include "../vabackend.h"
 
@@ -29,8 +36,8 @@
 
 static const NvHandle NULL_OBJECT;
 
-static bool nv_alloc_object(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
-                            NvHandle* hObjectNew,const NvV32 hClass, const uint32_t paramSize, void* params) {
+static int nv_alloc_object_with_status(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
+                                       NvHandle* hObjectNew, const NvV32 hClass, const uint32_t paramSize, void* params) {
     NVOS64_PARAMETERS alloc = {
         .hRoot = hRoot,
         .hObjectParent = hObjectParent,
@@ -68,13 +75,25 @@ static bool nv_alloc_object(const int fd, const uint32_t driverMajorVersion, con
         status = (int) alloc.status;
     }
 
-    if (ret != 0 || status != NV_OK) {
-        LOG("nv_alloc_object failed: %d %X %d", ret, status, errno)
-        return false;
+    if (ret != 0) {
+        LOG("nv_alloc_object ioctl failed: %d %X %d", ret, status, errno)
+        return status != NV_OK ? status : NV_ERR_OPERATING_SYSTEM;
     }
 
-    *hObjectNew = alloc.hObjectNew;
+    if (status == NV_OK) {
+        *hObjectNew = alloc.hObjectNew;
+    }
 
+    return status;
+}
+
+static bool nv_alloc_object(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
+                            NvHandle* hObjectNew, const NvV32 hClass, const uint32_t paramSize, void* params) {
+    int status = nv_alloc_object_with_status(fd, driverMajorVersion, hRoot, hObjectParent, hObjectNew, hClass, paramSize, params);
+    if (status != NV_OK) {
+        LOG("nv_alloc_object failed: %X", status)
+        return false;
+    }
     return true;
 }
 
@@ -302,6 +321,46 @@ bool get_device_uuid(const NVDriverContext *context, uint8_t uuid[16]) {
     return true;
 }
 
+// Query memory architecture via RM control.
+// Returns true for unified memory (zero-FB) systems like Grace-Blackwell/Grace-Hopper.
+static bool query_ram_location(NVDriverContext *context) {
+    NV2080_CTRL_FB_GET_INFO_V2_PARAMS params = {
+        .fbInfoListSize = 3,
+        .fbInfoList = {
+            { .index = NV2080_CTRL_FB_INFO_INDEX_RAM_LOCATION, .data = 0 },
+            { .index = NV2080_CTRL_FB_INFO_INDEX_IS_ZERO_FB, .data = 0 },
+            { .index = NV2080_CTRL_FB_INFO_INDEX_COHERENCE_INFO, .data = 0 }
+        }
+    };
+
+    if (!nv_rm_control(context->nvctlFd, context->clientObject, context->subdeviceObject,
+                      NV2080_CTRL_CMD_FB_GET_INFO_V2, 0, sizeof(params), &params)) {
+        LOG("NV2080_CTRL_CMD_FB_GET_INFO_V2 failed, assuming discrete GPU");
+        return false;
+    }
+
+    NvU32 ramLoc = params.fbInfoList[0].data;
+    NvU32 isZeroFb = params.fbInfoList[1].data;
+    NvU32 coherenceInfo = params.fbInfoList[2].data;
+
+    // Primary detection: IS_ZERO_FB indicates no dedicated VRAM (Grace-Blackwell/Grace-Hopper).
+    // RAM_LOCATION is currently hardcoded to GPU_DEDICATED in RM and cannot be relied upon.
+    bool unified = (isZeroFb == 1);
+
+    if (unified) {
+        LOG("Detected unified memory system (IS_ZERO_FB=1, COHERENCE=%s)",
+            coherenceInfo == NV2080_CTRL_FB_INFO_INDEX_COHERENCE_INFO_FULLY_COHERENT
+                ? "FULLY_COHERENT" : "NON_FULLY_COHERENT");
+    } else if (ramLoc == NV2080_CTRL_FB_INFO_RAM_LOCATION_SYS_SHARED) {
+        // Fallback: if RM ever fixes RAM_LOCATION, honour it
+        LOG("Detected unified memory system (RAM_LOCATION=SYS_SHARED)");
+        unified = true;
+    } else {
+        LOG("Detected discrete GPU (IS_ZERO_FB=0, RAM_LOCATION=0x%X)", ramLoc);
+    }
+    return unified;
+}
+
 bool init_nvdriver(NVDriverContext *context, const int drmFd) {
     LOG("Initing nvdriver...")
     int nv0Fd = -1;
@@ -318,14 +377,44 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
 
     //query the version of the api
     char *ver = NULL;
-    nv_get_versions(nvctlFd, &ver);
-    context->driverMajorVersion = atoi(ver);
-    context->driverMinorVersion = atoi(ver+4);
+    const bool versionRecognized = nv_get_versions(nvctlFd, &ver);
+    if (ver == NULL) {
+        LOG("Unable to obtain NVIDIA kernel driver version")
+        goto err;
+    }
+
+    // The parsed values select version-dependent ioctl layouts below. Reject
+    // malformed or truncated strings instead of silently treating them as 0.
+    char *versionEnd = NULL;
+    errno = 0;
+    unsigned long majorVersion = strtoul(ver, &versionEnd, 10);
+    if (versionEnd == ver || *versionEnd != '.' || errno == ERANGE || majorVersion > UINT32_MAX) {
+        LOG("Invalid NVIDIA kernel driver version: %s", ver)
+        free(ver);
+        goto err;
+    }
+
+    char *minorEnd = NULL;
+    errno = 0;
+    unsigned long minorVersion = strtoul(versionEnd + 1, &minorEnd, 10);
+    if (minorEnd == versionEnd + 1 ||
+        (*minorEnd != '.' && *minorEnd != '\0') ||
+        errno == ERANGE || minorVersion > UINT32_MAX) {
+        LOG("Invalid NVIDIA kernel driver version: %s", ver)
+        free(ver);
+        goto err;
+    }
+
+    context->driverMajorVersion = (uint32_t) majorVersion;
+    context->driverMinorVersion = (uint32_t) minorVersion;
+    if (!versionRecognized) {
+        LOG("NVIDIA kernel driver version query was not recognized; using %s", ver)
+    }
     LOG("NVIDIA kernel driver version: %s, major version: %d, minor version: %d", ver, context->driverMajorVersion, context->driverMinorVersion)
     free(ver);
 
     if (!get_device_info(drmFd, context)) {
-        return false;
+        goto err;
     }
 
     LOG("Got dev info: %x %x %x %x", context->gpu_id, context->sector_layout, context->page_kind_generation, context->generic_page_kind)
@@ -384,6 +473,10 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
     context->drmFd = drmFd;
     context->nvctlFd = nvctlFd;
     context->nv0Fd = nv0Fd;
+
+    // Detect if this is a unified memory system (Grace-Blackwell/Grace-Hopper)
+    // Must be after context FD fields are set since query_ram_location uses context->nvctlFd
+    context->useSystemMemory = query_ram_location(context);
     //context->hasHugePage = vaParams.hugePageSize != 0;
 
     return true;
@@ -422,28 +515,45 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
     //allocate the buffer
     NvHandle bufferObject = {0};
 
+    // Choose memory class based on system type
+    NvU32 memoryClass;
     NV_MEMORY_ALLOCATION_PARAMS memParams = {
         .owner = context->clientObject,
         .type = NVOS32_TYPE_IMAGE,
-        .flags = NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT |
-                 NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED |
-                 NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM,
-
-        .attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
-                DRF_DEF(OS32, _ATTR, _DEPTH, _UNKNOWN) |
-                DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
-                DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS),
         .format = 0,
         .width = 0,
         .height = 0,
         .size = size,
-        .alignment = 0, //see flags above
+        .alignment = 0,
         .attr2 = DRF_DEF(OS32, _ATTR2, _ZBC, _PREFER_NO_ZBC) |
                  DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES)
     };
-    bool ret = nv_alloc_object(context->nvctlFd, context->driverMajorVersion, context->clientObject, context->deviceObject, &bufferObject, NV01_MEMORY_LOCAL_USER, sizeof(memParams), &memParams);
+
+    if (context->useSystemMemory) {
+        // Unified memory system (Grace-Blackwell/Grace-Hopper)
+        memoryClass = NV01_MEMORY_SYSTEM;
+        memParams.flags = NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT |
+                          NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED;
+        memParams.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
+                         DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
+                         DRF_DEF(OS32, _ATTR, _DEPTH, _UNKNOWN) |
+                         DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
+                         DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS);
+    } else {
+        // Discrete GPU with local video memory
+        memoryClass = NV01_MEMORY_LOCAL_USER;
+        memParams.flags = NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT |
+                          NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED |
+                          NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+        memParams.attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
+                         DRF_DEF(OS32, _ATTR, _DEPTH, _UNKNOWN) |
+                         DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
+                         DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS);
+    }
+    
+    bool ret = nv_alloc_object(context->nvctlFd, context->driverMajorVersion, context->clientObject, context->deviceObject, &bufferObject, memoryClass, sizeof(memParams), &memParams);
     if (!ret) {
-        LOG("nv_alloc_object NV01_MEMORY_LOCAL_USER failed")
+        LOG("nv_alloc_object failed for memory class 0x%X", memoryClass)
         return false;
     }
 
@@ -532,25 +642,39 @@ static uint32_t calculate_log2_gobs_per_block_y(const uint32_t height) {
 }
 
 uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriverImage images[], const uint32_t width, const uint32_t height,
-                                        const uint32_t bppc, const uint32_t numPlanes, const NVFormatPlane planes[]) {
+                                        const uint32_t bppc, const uint32_t numPlanes, const NVFormatPlane planes[],
+                                        const bool unifyBlockHeight) {
      const uint32_t log2GobsPerBlockX = 0;
      const uint32_t log2GobsPerBlockZ = 0;
 
+     // Each plane's natural block height comes from its own (subsampled) height. How
+     // we use it depends on how the planes get exported:
+     //   - Packed into one shared buffer (single-buffer export): every plane must
+     //     advertise the same DRM modifier, so unify to the largest block height.
+     //     Over-aligning a short plane wastes a little memory but is harmless;
+     //     under-aligning would corrupt it.
+     //   - One dma-buf object per plane (multi-object export): each plane carries its
+     //     own modifier, so keep the exact per-plane value and match what the decoder
+     //     actually produces. A small chroma plane (e.g. a 168x96 video, whose chroma
+     //     is short enough to need a smaller block than luma) is tiled by NVDEC with
+     //     its own block height; forcing it to luma's larger block makes the importer
+     //     detile it wrong -> green chroma.
      uint32_t perPlaneLog2Y[3] = { 0 };
      for (uint32_t i = 0; i < numPlanes; i++) {
          const uint32_t planeHeight = height >> planes[i].ss.y;
          perPlaneLog2Y[i] = calculate_log2_gobs_per_block_y(planeHeight);
      }
 
-     uint32_t log2GobsPerBlockY = perPlaneLog2Y[0];
+     uint32_t unifiedLog2Y = perPlaneLog2Y[0];
      for (uint32_t i = 1; i < numPlanes; i++) {
-         if (perPlaneLog2Y[i] > log2GobsPerBlockY) {
-             log2GobsPerBlockY = perPlaneLog2Y[i];
+         if (perPlaneLog2Y[i] > unifiedLog2Y) {
+             unifiedLog2Y = perPlaneLog2Y[i];
          }
      }
 
      uint32_t offset = 0;
      for (uint32_t i = 0; i < numPlanes; i++) {
+         const uint32_t log2GobsPerBlockY = unifyBlockHeight ? unifiedLog2Y : perPlaneLog2Y[i];
          const uint32_t planeWidth = width >> planes[i].ss.x;
          const uint32_t planeHeight = height >> planes[i].ss.y;
          const uint32_t bytesPerPixel = planes[i].channelCount * bppc;
@@ -579,44 +703,40 @@ uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriver
      return offset;
 }
 
-bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd) {
-     int memFd = -1;
-     bool ret = alloc_memory(context, totalSize, &memFd);
-     if (!ret) {
-         LOG("alloc_memory failed");
-         return false;
-     }
-
+// Imports an already-allocated block-linear buffer (memFd) into NVKMS and exports
+// it as a PRIME dma-buf. On success a kept-alive dup of memFd is returned in *nvFd2
+// (needed for the later CUDA import) along with the exported dma-buf in *drmFd; the
+// caller retains ownership of memFd. On failure every fd allocated here is released
+// and memFd is left untouched for the caller to close.
+static bool import_and_export_buffer(const NVDriverContext *context, const int memFd, const uint32_t importSize,
+                                     const uint32_t pitchInBlocks, const uint32_t log2GobsPerBlockX,
+                                     const uint32_t log2GobsPerBlockY, const uint32_t log2GobsPerBlockZ,
+                                     int *nvFd2, int *drmFd) {
      int memFd2 = dup(memFd);
      if (memFd2 == -1) {
          LOG("dup failed");
-         goto err;
+         return false;
      }
 
-     const uint32_t pitchInBlocks = images[0].pitch / (GOB_WIDTH_IN_BYTES << images[0].log2GobsPerBlockX);
      struct NvKmsKapiPrivImportMemoryParams nvkmsParams = {
          .memFd = memFd2,
          .surfaceParams = {
              .layout = NvKmsSurfaceMemoryLayoutBlockLinear,
              .blockLinear = {
-                 .genericMemory = 0,
+                 .genericMemory = context->useSystemMemory ? 1 : 0,
                  .pitchInBlocks = pitchInBlocks,
-                 .log2GobsPerBlock.x = images[0].log2GobsPerBlockX,
-                 .log2GobsPerBlock.y = images[0].log2GobsPerBlockY,
-                 .log2GobsPerBlock.z = images[0].log2GobsPerBlockZ,
+                 .log2GobsPerBlock.x = log2GobsPerBlockX,
+                 .log2GobsPerBlock.y = log2GobsPerBlockY,
+                 .log2GobsPerBlock.z = log2GobsPerBlockZ,
              }
          }
      };
 
-     const uint32_t imageSizeInBytes = ROUND_UP(totalSize, 65536);
      struct drm_nvidia_gem_import_nvkms_memory_params params = {
-         .mem_size = imageSizeInBytes,
+         .mem_size = importSize,
          .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkmsParams,
          .nvkms_params_size = context->driverMajorVersion == 470 ? 0x20 : sizeof(nvkmsParams) //needs to be 0x20 in the 470 series driver
      };
-
-     LOG_DEBUG("alloc_buffer: totalSize=%u importSize=%u pitchInBlocks=%u log2GobsPerBlockY=%u",
-               totalSize, imageSizeInBytes, pitchInBlocks, images[0].log2GobsPerBlockY);
 
      int drmret = ioctl(context->drmFd, DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, &params);
      if (drmret != 0) {
@@ -643,7 +763,6 @@ bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDr
          goto prime_err;
      }
 
-     *nvFd = memFd;
      *nvFd2 = memFd2;
      *drmFd = prime_handle.fd;
      return true;
@@ -668,11 +787,36 @@ err:
      if (memFd2 >= 0) {
          close(memFd2);
      }
-     if (memFd >= 0) {
-         close(memFd);
-     }
 
      return false;
+}
+
+bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd) {
+     int memFd = -1;
+     bool ret = alloc_memory(context, totalSize, &memFd);
+     if (!ret) {
+         LOG("alloc_memory failed");
+         return false;
+     }
+
+     const uint32_t pitchInBlocks = images[0].pitch / (GOB_WIDTH_IN_BYTES << images[0].log2GobsPerBlockX);
+     const uint32_t imageSizeInBytes = ROUND_UP(totalSize, 65536);
+
+     LOG_DEBUG("alloc_buffer: totalSize=%u importSize=%u pitchInBlocks=%u log2GobsPerBlockY=%u",
+               totalSize, imageSizeInBytes, pitchInBlocks, images[0].log2GobsPerBlockY);
+
+     int memFd2 = -1, primeFd = -1;
+     if (!import_and_export_buffer(context, memFd, imageSizeInBytes, pitchInBlocks,
+                                   images[0].log2GobsPerBlockX, images[0].log2GobsPerBlockY,
+                                   images[0].log2GobsPerBlockZ, &memFd2, &primeFd)) {
+         close(memFd);
+         return false;
+     }
+
+     *nvFd = memFd;
+     *nvFd2 = memFd2;
+     *drmFd = primeFd;
+     return true;
 }
 
  bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint8_t channels, uint8_t bitsPerChannel, uint32_t fourcc, NVDriverImage *image) {
@@ -707,66 +851,22 @@ err:
      //now export the dma-buf
      uint32_t pitchInBlocks = widthInBytes / gobWidthInBytes;
 
-     //printf("got gobsPerBlock: %ux%u %u %u %u %d\n", width, height, log2GobsPerBlockX, log2GobsPerBlockY, log2GobsPerBlockZ, pitchInBlocks);
-     //duplicate the fd so we don't invalidate it by importing it
-     int memFd2 = dup(memFd);
-     if (memFd2 == -1) {
-         LOG("dup failed");
-         goto err;
-     }
-
-     struct NvKmsKapiPrivImportMemoryParams nvkmsParams = {
-         .memFd = memFd2,
-         .surfaceParams = {
-             .layout = NvKmsSurfaceMemoryLayoutBlockLinear,
-             .blockLinear = {
-                 .genericMemory = 0,
-                 .pitchInBlocks = pitchInBlocks,
-                 .log2GobsPerBlock.x = log2GobsPerBlockX,
-                 .log2GobsPerBlock.y = log2GobsPerBlockY,
-                 .log2GobsPerBlock.z = log2GobsPerBlockZ,
-             }
-         }
-     };
-
      //TODO find the proper page size
      imageSizeInBytes = ROUND_UP(imageSizeInBytes, 65536);
 
-     struct drm_nvidia_gem_import_nvkms_memory_params params = {
-         .mem_size = imageSizeInBytes,
-         .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkmsParams,
-         .nvkms_params_size = context->driverMajorVersion == 470 ? 0x20 : sizeof(nvkmsParams) //needs to be 0x20 in the 470 series driver
-     };
-     int drmret = ioctl(context->drmFd, DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, &params);
-     if (drmret != 0) {
-         LOG("DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY failed: %d %d", drmret, errno);
-         goto err;
-     }
-
-     //export dma-buf
-     struct drm_prime_handle prime_handle = {
-         .handle = params.handle
-     };
-     drmret = ioctl(context->drmFd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
-     if (drmret != 0) {
-         LOG("DRM_IOCTL_PRIME_HANDLE_TO_FD failed: %d %d", drmret, errno);
-         goto err;
-     }
-
-     struct drm_gem_close gem_close = {
-         .handle = params.handle
-     };
-     drmret = ioctl(context->drmFd, DRM_IOCTL_GEM_CLOSE, &gem_close);
-     if (drmret != 0) {
-         LOG("DRM_IOCTL_GEM_CLOSE failed: %d %d", drmret, errno);
-         goto prime_err;
+     int memFd2 = -1, primeFd = -1;
+     if (!import_and_export_buffer(context, memFd, imageSizeInBytes, pitchInBlocks,
+                                   log2GobsPerBlockX, log2GobsPerBlockY, log2GobsPerBlockZ,
+                                   &memFd2, &primeFd)) {
+         close(memFd);
+         return false;
      }
 
      image->width = width;
      image->height = height;
      image->nvFd = memFd;
      image->nvFd2 = memFd2; //not sure why we can't close this one, we shouldn't need it after importing the image
-     image->drmFd = prime_handle.fd;
+     image->drmFd = primeFd;
      image->mods = DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, context->sector_layout, context->page_kind_generation, context->generic_page_kind, log2GobsPerBlockY);
      image->offset = 0;
      image->pitch = widthInBytes;
@@ -779,16 +879,4 @@ err:
      //LOG("created image: %dx%d %lx %d %x", width, height, image->mods, widthInBytes, imageSizeInBytes);
 
      return true;
-
- prime_err:
-     if (prime_handle.fd > 0) {
-         close(prime_handle.fd);
-     }
-
- err:
-     if (memFd > 0) {
-         close(memFd);
-     }
-
-     return false;
  }

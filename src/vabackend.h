@@ -12,20 +12,20 @@
 #include <va/va_drmcommon.h>
 #include <va/va_vpp.h>
 
+#include <stdio.h>
 #include <pthread.h>
 #include "list.h"
+#include "resolve-queue.h"
+#include "appendable-buffer.h"
 #include "direct/nv-driver.h"
 #include "common.h"
+#include "stats.h"
+#include "surface-import.h"
+#include "object-table.h"
 
-#define SURFACE_QUEUE_SIZE 16
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
-
-typedef struct {
-    void        *buf;
-    uint64_t    size;
-    uint64_t    allocated;
-} AppendableBuffer;
+#define NVD_BUFFER_POOL_CLASS_COUNT 11
 
 typedef enum
 {
@@ -36,12 +36,7 @@ typedef enum
     OBJECT_TYPE_IMAGE
 } ObjectType;
 
-typedef struct Object_t
-{
-    ObjectType      type;
-    VAGenericID     id;
-    void            *obj;
-} *Object;
+typedef NVDObject *Object;
 
 typedef struct
 {
@@ -50,7 +45,13 @@ typedef struct
     VABufferType    bufferType;
     void            *ptr;
     size_t          offset;
+    size_t          capacity;
+    int8_t          poolClass;
 } NVBuffer;
+
+typedef struct _NVBufferPoolBlock {
+    struct _NVBufferPoolBlock *next;
+} NVBufferPoolBlock;
 
 struct _NVContext;
 struct _BackingImage;
@@ -75,6 +76,7 @@ typedef struct
     int                     fourcc;
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
+    bool                    syncInitialized;
     bool                    decodeFailed;
 } NVSurface;
 
@@ -96,12 +98,18 @@ typedef struct
     uint32_t    height;
     NVFormat    format;
     NVBuffer    *imageBuffer;
+    VABufferID  imageBufferId;
 } NVImage;
 
 typedef struct {
     CUexternalMemory extMem;
     CUmipmappedArray mipmapArray;
 } NVCudaImage;
+
+typedef uint64_t NVCUsurfObject;
+typedef CUresult CUDAAPI NVCuSurfObjectCreate(NVCUsurfObject *surfaceObject,
+                                              const CUDA_RESOURCE_DESC *resourceDesc);
+typedef CUresult CUDAAPI NVCuSurfObjectDestroy(NVCUsurfObject surfaceObject);
 
 typedef struct _BackingImage {
     NVSurface   *surface;
@@ -117,12 +125,16 @@ typedef struct _BackingImage {
     int         strides[4];
     uint64_t    mods[4];
     uint32_t    size[4];
+    uint64_t    objectSize[4];
+    uint32_t    planeObjectIndex[4];
+    uint32_t    numObjects;
+    uint32_t    numPlanes;
     //direct backend only
     NVCudaImage cudaImages[3];
     NVFormat    format;
     VAProcColorStandardType colorStandard;
     bool        colorRangeFull;
-    uint32_t    totalSize;
+    uint64_t    totalSize;
     CUexternalMemory extMem;
     bool        isSingleBuffer;
     bool        isExternalBuffer;
@@ -133,40 +145,36 @@ typedef struct _BackingImage {
     bool        resolving;
     pthread_mutex_t mutex;
     pthread_cond_t  cond;
-    void        *externalMapping;
-    uint32_t    externalMappingSize;
-    CUdeviceptr externalDevicePtr;
-    uint32_t    externalDeviceSize;
+    void        *externalMappings[4];
+    uint64_t    externalMappingSize[4];
+    CUexternalMemory externalObjectMems[4];
+    CUdeviceptr externalDevicePtrs[4];
+    uint64_t    externalDeviceSize[4];
+    CUtexObject cachedVideoProcTextures[3];
+    NVCUsurfObject cachedVideoProcSurfaces[3];
     uint64_t    detachedSerial;
+    struct _BackingImage *detachedPrev;
+    struct _BackingImage *detachedNext;
+    uint64_t    statsBytes;
+    bool        statsTracked;
+    bool        statsActive;
+    bool        statsBorrowed;
+    bool        statsExternal;
 } BackingImage;
 
 struct _NVDriver;
-
-typedef enum {
-    NV_STAT_DECODER_CREATES,
-    NV_STAT_DECODE_PICTURES,
-    NV_STAT_RESOLVE_FRAMES,
-    NV_STAT_EXPORT_COPIES,
-    NV_STAT_EXPORT_HOST_COPIES,
-    NV_STAT_EXPORT_DESCRIPTORS,
-    NV_STAT_EXPORT_DESCRIPTORS_SINGLE,
-    NV_STAT_EXPORT_DESCRIPTORS_MULTI,
-    NV_STAT_VIDEOPROC_REQUESTS,
-    NV_STAT_VIDEOPROC_CUDA,
-    NV_STAT_VIDEOPROC_CUDA_FAILURES,
-    NV_STAT_VIDEOPROC_CPU_FALLBACK,
-    NV_STAT_COUNT
-} NVStatCounter;
 
 typedef struct {
     const char *name;
     bool (*initExporter)(struct _NVDriver *drv);
     void (*releaseExporter)(struct _NVDriver *drv);
-    bool (*exportCudaPtr)(struct _NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch);
+    bool (*exportCudaPtr)(struct _NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
+                          uint32_t pitch, CUstream stream, CUevent completeEvent);
     void (*detachBackingImageFromSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*realiseSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*fillExportDescriptor)(struct _NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc);
     void (*destroyAllBackingImage)(struct _NVDriver *drv);
+    bool (*pruneToMemoryBudget)(struct _NVDriver *drv, uint64_t extraGpuBytes);
 } NVBackend;
 
 typedef struct _NVDriver
@@ -175,9 +183,9 @@ typedef struct _NVDriver
     CuvidFunctions          *cv;
     CUcontext               cudaContext;
     CUvideoctxlock          vidLock;
-    Array/*<Object>*/       objects;
+    NVDObjectTable          objects;
     pthread_mutex_t         objectCreationMutex;
-    VAGenericID             nextObjId;
+    bool                    terminating;
     bool                    useCorrectNV12Format;
     bool                    supports16BitSurface;
     bool                    supports444Surface;
@@ -185,6 +193,12 @@ typedef struct _NVDriver
     int                     drmFd;
     pthread_mutex_t         exportMutex;
     pthread_mutex_t         imagesMutex;
+    pthread_mutex_t         bufferPoolMutex;
+    bool                    bufferPoolMutexInitialized;
+    NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
+    uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
+    uint64_t                bufferPoolBytes;
+    uint64_t                bufferPoolMaxBytes;
     Array/*<NVEGLImage>*/   images;
     const NVBackend         *backend;
     //fields for direct backend
@@ -198,13 +212,20 @@ typedef struct _NVDriver
     int                     numFramesPresented;
     int                     profileCount;
     VAProfile               profiles[MAX_PROFILES];
-    DescriptorMode          descriptorMode;
     CUmodule                videoProcModule;
     CUfunction              nv12ToArgbKernel;
     CUfunction              p010ToArgbKernel;
     CUmodule                videoProcModuleP010;
+    CUmodule                videoProcArrayModule;
+    CUfunction              arrayToArgbKernel;
     bool                    videoProcKernelP010Failed;
     bool                    videoProcKernelFailed;
+    bool                    videoProcArrayKernelFailed;
+    CUstream                videoProcStream;
+    CUevent                 videoProcEvent;
+    NVCuSurfObjectCreate    *cuSurfObjectCreate;
+    NVCuSurfObjectDestroy   *cuSurfObjectDestroy;
+    bool                    surfaceFunctionsLoaded;
     CUdeviceptr             videoProcYBuffer;
     CUdeviceptr             videoProcUVBuffer;
     CUdeviceptr             videoProcArgbBuffer;
@@ -217,12 +238,23 @@ typedef struct _NVDriver
     size_t                  cpuVideoProcYBufferSize;
     size_t                  cpuVideoProcUVBufferSize;
     size_t                  cpuVideoProcArgbBufferSize;
+    uint64_t                videoProcScratchMaxBytes;
+    uint32_t                videoProcCudaFramesSinceCpuFallback;
     bool                    statsEnabled;
     uint64_t                statsLogInterval;
     atomic_uint_fast64_t    stats[NV_STAT_COUNT];
     uint64_t                maxDetachedBackingImageBytes;
     uint32_t                maxDetachedBackingImages;
     uint64_t                detachedBackingImageSerial;
+    BackingImage            *detachedBackingImageHead;
+    BackingImage            *detachedBackingImageTail;
+    uint64_t                detachedBackingImageBytes;
+    uint32_t                detachedBackingImageCount;
+    uint64_t                memoryBudgetBytes;
+    uint32_t                decodeSurfacesOverride;
+    bool                    decodeSurfacesAuto;
+    uint32_t                decodeSurfacesMinimum;
+    uint32_t                decodeSurfacesMaximum;
 } NVDriver;
 
 struct _NVCodec;
@@ -241,6 +273,7 @@ typedef struct _NVContext
     void                *lastSliceParams;
     unsigned int        lastSliceParamsCount;
     AppendableBuffer    bitstreamBuffer;
+    size_t              bitstreamDataOffset;
     AppendableBuffer    sliceOffsets;
     bool                av1SequenceEnableRestoration;
     uint32_t            av1TileOffsetsSeen;
@@ -255,16 +288,21 @@ typedef struct _NVContext
     int                 decoderBitDepth;
     int                 currentPictureId;
     pthread_t           resolveThread;
-    pthread_mutex_t     resolveMutex;
-    pthread_cond_t      resolveCondition;
-    NVSurface*          surfaceQueue[SURFACE_QUEUE_SIZE];
-    int                 surfaceQueueReadIdx;
-    int                 surfaceQueueWriteIdx;
-    volatile bool       exiting;
+    bool                resolveThreadStarted;
+    CUstream            resolveStream;
+    CUevent             resolveCompleteEvent;
+    ResolveQueue        resolveQueue;
     pthread_mutex_t     surfaceCreationMutex;
+    bool                surfaceCreationMutexInitialized;
     int                 surfaceCount;
+    uint32_t            clientRenderTargetCount;
+    uint32_t            decodeSurfaceReferenceHint;
     bool                firstKeyframeValid;
+    bool                inputValidationFailed;
 } NVContext;
+
+bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,
+                          uint32_t offset, size_t size, const void **data);
 
 typedef struct
 {
@@ -279,9 +317,11 @@ typedef struct
 typedef void (*HandlerFunc)(NVContext*, NVBuffer* , CUVIDPICPARAMS*);
 typedef cudaVideoCodec (*ComputeCudaCodec)(VAProfile);
 typedef void (*CodecBeginPictureFunc)(NVContext*);
+typedef void (*CodecDestroyFunc)(NVContext*);
 
-void nvStatsIncrement(NVDriver *drv, NVStatCounter counter);
-void nvStatsLog(NVDriver *drv, const char *reason);
+// Internals exposed for the stats subsystem (src/stats.c).
+pid_t nv_gettid(void);
+FILE *nvStatsOutput(void);
 
 //padding/alignment is very important to this structure as it's placed in it's own section
 //in the executable.
@@ -291,6 +331,7 @@ struct _NVCodec {
     int                 supportedProfileCount;
     const VAProfile     *supportedProfiles;
     CodecBeginPictureFunc beginPicture;
+    CodecDestroyFunc      destroy;
 };
 
 typedef struct _NVCodec NVCodec;
@@ -308,7 +349,6 @@ typedef struct
 
 extern const NVFormatInfo formatsInfo[];
 
-void appendBuffer(AppendableBuffer *ab, const void *buf, uint64_t size);
 int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
 const char *nvColorStandardName(VAProcColorStandardType colorStandard);
@@ -322,6 +362,8 @@ void nvBackingImageCopyColorMetadata(BackingImage *dst, const BackingImage *src)
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line);
 void logger(const char *filename, const char *function, int line, const char *msg, ...);
 bool nvdLogDebugEnabled(void);
+// True only when the client needs all exported planes to share one dma-buf modifier.
+bool nvdUseSingleBufferExport(void);
 #define CHECK_CUDA_RESULT(err) checkCudaErrors(err, __FILE__, __func__, __LINE__)
 #define CHECK_CUDA_RESULT_RETURN(err, ret) if (checkCudaErrors(err, __FILE__, __func__, __LINE__)) { return ret; }
 #define cudaVideoCodec_NONE ((cudaVideoCodec) -1)

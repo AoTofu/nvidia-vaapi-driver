@@ -1,4 +1,5 @@
 #include "vabackend.h"
+#include <stdlib.h>
 
 //squash a compile warning, we know this is an unstable API
 #define GST_USE_UNSTABLE_API
@@ -68,7 +69,20 @@ static void copyVP9PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     }
 }
 
-static GstVp9Parser *parser;
+typedef struct {
+    GstVp9Parser *parser;
+} VP9Context;
+
+static VP9Context *getVP9Context(NVContext *ctx) {
+    if (ctx->codecData == NULL) {
+        ctx->codecData = calloc(1, sizeof(VP9Context));
+    }
+    VP9Context *vp9 = ctx->codecData;
+    if (vp9 != NULL && vp9->parser == NULL) {
+        vp9->parser = gst_vp9_parser_new();
+    }
+    return vp9;
+}
 
 static VAProcColorStandardType vp9ColorStandard(GstVp9ColorSpace colorSpace) {
     switch (colorSpace) {
@@ -91,14 +105,14 @@ static VAProcColorStandardType vp9ColorStandard(GstVp9ColorSpace colorSpace) {
 }
 
 static void parseExtraInfo(NVContext *ctx, void *buf, uint32_t size, CUVIDPICPARAMS *picParams) {
-    //TODO a bit of a hack as we don't have per decoder init/deinit functions atm
-    if (parser == NULL) {
-        parser = gst_vp9_parser_new ();
+    VP9Context *vp9 = getVP9Context(ctx);
+    if (vp9 == NULL || vp9->parser == NULL) {
+        return;
     }
 
     //parse all the extra information that VA-API doesn't support, but NVDEC requires
     GstVp9FrameHdr hdr;
-    GstVp9ParserResult res = gst_vp9_parser_parse_frame_header(parser, &hdr, buf, size);
+    GstVp9ParserResult res = gst_vp9_parser_parse_frame_header(vp9->parser, &hdr, buf, size);
 
     if (res == GST_VP9_PARSER_OK) {
         for (int i = 0; i < 8; i++) {
@@ -127,16 +141,23 @@ static void parseExtraInfo(NVContext *ctx, void *buf, uint32_t size, CUVIDPICPAR
         picParams->CodecSpecific.vp9.qpChDc = hdr.quant_indices.uv_dc_delta;
         picParams->CodecSpecific.vp9.qpChAc = hdr.quant_indices.uv_ac_delta;
 
-        picParams->CodecSpecific.vp9.colorSpace = parser->color_space;
-        VAProcColorStandardType colorStandard = vp9ColorStandard((GstVp9ColorSpace) parser->color_space);
-        bool colorRangeFull = parser->color_range == GST_VP9_CR_FULL;
+        picParams->CodecSpecific.vp9.colorSpace = vp9->parser->color_space;
+        VAProcColorStandardType colorStandard = vp9ColorStandard((GstVp9ColorSpace) vp9->parser->color_space);
+        bool colorRangeFull = vp9->parser->color_range == GST_VP9_CR_FULL;
         nvSurfaceSetColorMetadata(ctx->renderTarget, colorStandard, colorRangeFull);
         LOG_DEBUG("VP9 color metadata: color_space=%u color_standard=%s(%d) full_range=%d render=%p",
-            parser->color_space, nvColorStandardName(colorStandard), colorStandard, colorRangeFull,
+            vp9->parser->color_space, nvColorStandardName(colorStandard), colorStandard, colorRangeFull,
             ctx->renderTarget);
     }
 
-    //gst_vp9_parser_free(parser);
+}
+
+static void destroyVP9Context(NVContext *ctx) {
+    VP9Context *vp9 = ctx->codecData;
+    if (vp9 != NULL && vp9->parser != NULL) {
+        gst_vp9_parser_free(vp9->parser);
+        vp9->parser = NULL;
+    }
 }
 
 static void copyVP9SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams)
@@ -151,6 +172,26 @@ static void copyVP9SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
 
 static void copyVP9SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
 {
+    const size_t frameStart = ctx->bitstreamBuffer.size;
+    size_t frameBytes = 0;
+    for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
+        const VASliceParameterBufferVP9 *sliceParams =
+            &((const VASliceParameterBufferVP9 *) ctx->lastSliceParams)[i];
+        if (!nvValidateSliceRange(ctx, buf, sliceParams->slice_data_offset,
+                                  sliceParams->slice_data_size, NULL)) {
+            return;
+        }
+        if (sliceParams->slice_data_size > SIZE_MAX - frameBytes) {
+            ctx->bitstreamBuffer.failed = true;
+            return;
+        }
+        frameBytes += sliceParams->slice_data_size;
+    }
+    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+                               sizeof(uint32_t)) ||
+        !reserveAdditionalBuffer(&ctx->bitstreamBuffer, frameBytes)) {
+        return;
+    }
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++)
     {
         VASliceParameterBufferVP9 *sliceParams = &((VASliceParameterBufferVP9*) ctx->lastSliceParams)[i];
@@ -158,9 +199,11 @@ static void copyVP9SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
 
-        //TODO this might not be the best place to call as we may not have a complete packet yet...
-        parseExtraInfo(ctx, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size, picParams);
         picParams->nBitstreamDataLen += sliceParams->slice_data_size;
+    }
+    if (frameBytes <= UINT32_MAX) {
+        parseExtraInfo(ctx, PTROFF(ctx->bitstreamBuffer.buf, frameStart),
+                       (uint32_t) frameBytes, picParams);
     }
 }
 
@@ -192,4 +235,5 @@ const DECLARE_CODEC(vp9Codec) = {
     },
     .supportedProfileCount = ARRAY_SIZE(vp9SupportedProfiles),
     .supportedProfiles = vp9SupportedProfiles,
+    .destroy = destroyVP9Context,
 };

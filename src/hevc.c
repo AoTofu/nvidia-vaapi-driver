@@ -77,6 +77,7 @@ static int sortFuncRev(const unsigned char *a, const unsigned char *b, int *POCV
 static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams)
 {
     VAPictureParameterBufferHEVC* buf = (VAPictureParameterBufferHEVC*) buffer->ptr;
+    ctx->decodeSurfaceReferenceHint = (uint32_t) buf->sps_max_dec_pic_buffering_minus1 + 3U;
 
     picParams->PicWidthInMbs    = buf->pic_width_in_luma_samples / 16;
     picParams->FrameHeightInMbs = buf->pic_height_in_luma_samples / 16;
@@ -175,17 +176,15 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
     ppc->num_tile_columns_minus1 = buf->num_tile_columns_minus1;
     ppc->num_tile_rows_minus1 = buf->num_tile_rows_minus1;
 
-    if (ppc->tiles_enabled_flag) {
-        //the uniform_spacing_flag isn't directly exposed in VA-API, so look through the columns and rows
-        //and see if they're all the same, this probably isn't correct
-        for (int i = 0; i < 19; i++) {
+    if (ppc->tiles_enabled_flag && ppc->num_tile_columns_minus1 > 0) {
+        for (int i = 0; i < ppc->num_tile_columns_minus1; i++) {
             if (buf->column_width_minus1[i] != buf->column_width_minus1[i+1]) {
                 ppc->uniform_spacing_flag = 0;
                 break;
             }
         }
         if (ppc->uniform_spacing_flag) {
-            for (int i = 0; i < 21; i++) {
+            for (int i = 0; i < ppc->num_tile_rows_minus1; i++) {
                 if (buf->row_height_minus1[i] != buf->row_height_minus1[i+1]) {
                     ppc->uniform_spacing_flag = 0;
                     break;
@@ -202,8 +201,8 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 //    ppc->chroma_qp_offset_list_len_minus1 = buf->pic_fields.bits.tiles_enabled_flag;
 
     ppc->NumBitsForShortTermRPSInSlice = buf->st_rps_bits;
-    ppc->NumDeltaPocsOfRefRpsIdx = 0;//TODO
-    ppc->NumPocTotalCurr = 0; //this looks to be the amount of reference images...
+    ppc->NumDeltaPocsOfRefRpsIdx = 0; // computed after reference picture loop
+    ppc->NumPocTotalCurr = 0; // computed after reference picture loop
     ppc->NumPocStCurrBefore = 0; //these three are set properly below
     ppc->NumPocStCurrAfter = 0;
     ppc->NumPocLtCurr = 0;
@@ -221,25 +220,44 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 //        ppc->cr_qp_offset_list[i] = buf->cr_qp_offset_list[i];
 //    }
 
-    //double check this
-    VAPictureHEVC *pic = &buf->CurrPic;
+    // NVDEC's arrays contain reference pictures only; the current picture's
+    // POC is carried separately in CurrPicOrderCntVal. Initialize every slot
+    // so the sixteenth entry remains explicitly unused (VA-API exposes 15).
     for (int i = 0; i < 16; i++) {
-        ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx->drv, pic[i].picture_id);
-        ppc->PicOrderCntVal[i] = pic[i].pic_order_cnt;
-        ppc->IsLongTerm[i]     = i != 0 && (pic[i].flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
+        ppc->RefPicIdx[i] = -1;
+        ppc->PicOrderCntVal[i] = 0;
+        ppc->IsLongTerm[i] = 0;
+    }
 
-        if (i != 0 && ppc->RefPicIdx[i] != -1) {
-            ppc->NumPocTotalCurr++;
+    for (int i = 0; i < 15; i++) {
+        const VAPictureHEVC *pic = &buf->ReferenceFrames[i];
+        ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx->drv, pic->picture_id);
+        ppc->PicOrderCntVal[i] = pic->pic_order_cnt;
+        ppc->IsLongTerm[i]     = (pic->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
+
+        // Invalid VA DPB entries must not contribute to an NVDEC reference
+        // picture set even if their remaining flag bits contain stale data.
+        if (ppc->RefPicIdx[i] == -1) {
+            continue;
         }
 
-        if (pic[i].flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
+        if (pic->flags & VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) {
             ppc->RefPicSetStCurrBefore[ppc->NumPocStCurrBefore++] = i;
-        } else if (pic[i].flags & VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) {
+        } else if (pic->flags & VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) {
             ppc->RefPicSetStCurrAfter[ppc->NumPocStCurrAfter++] = i;
-        } else if (pic[i].flags & VA_PICTURE_HEVC_RPS_LT_CURR) {
+        } else if (pic->flags & VA_PICTURE_HEVC_RPS_LT_CURR) {
             ppc->RefPicSetLtCurr[ppc->NumPocLtCurr++] = i;
         }
     }
+
+    ppc->NumPocTotalCurr = ppc->NumPocStCurrBefore + ppc->NumPocStCurrAfter + ppc->NumPocLtCurr;
+
+    int numDeltaPocs = 0;
+    for (int i = 0; i < 16; i++) {
+        if (ppc->RefPicIdx[i] != -1 && !ppc->IsLongTerm[i])
+            numDeltaPocs++;
+    }
+    ppc->NumDeltaPocsOfRefRpsIdx = numDeltaPocs;
 
     //This is required to make sure that the RefPicSetStCurrBefore and RefPicSetStCurrAfter arrays are in the correct order
     //VA-API doesn't pass this is, only marking each picture if it's in the arrays.
@@ -258,6 +276,26 @@ static void copyHEVCSliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS 
 
 static void copyHEVCSliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
 {
+    size_t bitstreamBytes = 0;
+    for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
+        const VASliceParameterBufferHEVC *sliceParams =
+            &((const VASliceParameterBufferHEVC *) ctx->lastSliceParams)[i];
+        if (!nvValidateSliceRange(ctx, buf, sliceParams->slice_data_offset,
+                                  sliceParams->slice_data_size, NULL)) {
+            return;
+        }
+        if (bitstreamBytes > SIZE_MAX - 3U ||
+            sliceParams->slice_data_size > SIZE_MAX - bitstreamBytes - 3U) {
+            ctx->bitstreamBuffer.failed = true;
+            return;
+        }
+        bitstreamBytes += sliceParams->slice_data_size + 3U;
+    }
+    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+                               sizeof(uint32_t)) ||
+        !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bitstreamBytes)) {
+        return;
+    }
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++)
     {
         static const uint8_t header[] = { 0, 0, 1 }; //1 as a 24-bit Big Endian
