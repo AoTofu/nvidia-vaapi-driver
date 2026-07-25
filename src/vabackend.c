@@ -681,9 +681,6 @@ int pictureIdxFromSurfaceId(NVDriver *drv, VASurfaceID surfId) {
     return -1;
 }
 
-static void setSurfaceResolving(NVSurface *surface, bool resolving);
-static void waitSurfaceResolved(NVSurface *surface);
-
 static cudaVideoCodec vaToCuCodec(VAProfile profile) {
     for (const NVCodec *c = __start_nvd_codecs; c < __stop_nvd_codecs; c++) {
         cudaVideoCodec cvc = c->computeCudaCodec(profile);

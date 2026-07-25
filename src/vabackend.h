@@ -164,22 +164,6 @@ typedef struct _BackingImage {
 
 struct _NVDriver;
 
-typedef enum {
-    NV_STAT_DECODER_CREATES,
-    NV_STAT_DECODE_PICTURES,
-    NV_STAT_RESOLVE_FRAMES,
-    NV_STAT_EXPORT_COPIES,
-    NV_STAT_EXPORT_HOST_COPIES,
-    NV_STAT_EXPORT_DESCRIPTORS,
-    NV_STAT_EXPORT_DESCRIPTORS_SINGLE,
-    NV_STAT_EXPORT_DESCRIPTORS_MULTI,
-    NV_STAT_VIDEOPROC_REQUESTS,
-    NV_STAT_VIDEOPROC_CUDA,
-    NV_STAT_VIDEOPROC_CUDA_FAILURES,
-    NV_STAT_VIDEOPROC_CPU_FALLBACK,
-    NV_STAT_COUNT
-} NVStatCounter;
-
 typedef struct {
     const char *name;
     bool (*initExporter)(struct _NVDriver *drv);
@@ -338,9 +322,6 @@ typedef void (*CodecDestroyFunc)(NVContext*);
 // Internals exposed for the stats subsystem (src/stats.c).
 pid_t nv_gettid(void);
 FILE *nvStatsOutput(void);
-
-void nvStatsIncrement(NVDriver *drv, NVStatCounter counter);
-void nvStatsLog(NVDriver *drv, const char *reason);
 
 //padding/alignment is very important to this structure as it's placed in it's own section
 //in the executable.
