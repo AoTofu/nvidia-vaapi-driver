@@ -146,6 +146,7 @@ static void compactAV1BitstreamToCurrentFrame(NVContext *ctx, CUVIDPICPARAMS *pi
 
 static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams) {
     static const int bit_depth_map[] = {0, 2, 4}; //8-bpc, 10-bpc, 12-bpc
+    static const uint8_t lr_type_map[] = {0, 1, 2, 3}; //VA-API and NVDEC use the same AV1 restoration type values
 
     VADecPictureParameterBufferAV1* buf = (VADecPictureParameterBufferAV1*) buffer->ptr;
     CUVIDAV1PICPARAMS *pps = &picParams->CodecSpecific.av1;
@@ -319,9 +320,9 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->delta_lf_res = buf->mode_control_fields.bits.log2_delta_lf_res;
     pps->delta_lf_multi = buf->mode_control_fields.bits.delta_lf_multi;
 
-    pps->lr_type[0] = buf->loop_restoration_fields.bits.yframe_restoration_type;
-    pps->lr_type[1] = buf->loop_restoration_fields.bits.cbframe_restoration_type;
-    pps->lr_type[2] = buf->loop_restoration_fields.bits.crframe_restoration_type;
+    pps->lr_type[0] = lr_type_map[buf->loop_restoration_fields.bits.yframe_restoration_type];
+    pps->lr_type[1] = lr_type_map[buf->loop_restoration_fields.bits.cbframe_restoration_type];
+    pps->lr_type[2] = lr_type_map[buf->loop_restoration_fields.bits.crframe_restoration_type];
     pps->lr_unit_size[0] = 1 + buf->loop_restoration_fields.bits.lr_unit_shift;
     pps->lr_unit_size[1] = 1 + buf->loop_restoration_fields.bits.lr_unit_shift - buf->loop_restoration_fields.bits.lr_uv_shift;
     pps->lr_unit_size[2] = pps->lr_unit_size[1];

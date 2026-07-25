@@ -38,6 +38,10 @@
 #define __has_include(x) 0
 #endif
 
+#ifndef CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_FD
+#define CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_FD ((CUexternalMemoryHandleType)7)
+#endif
+
 #if __has_include(<pthread_np.h>)
 #include <pthread_np.h>
 #define gettid pthread_getthreadid_np
@@ -676,6 +680,9 @@ int pictureIdxFromSurfaceId(NVDriver *drv, VASurfaceID surfId) {
     }
     return -1;
 }
+
+static void setSurfaceResolving(NVSurface *surface, bool resolving);
+static void waitSurfaceResolved(NVSurface *surface);
 
 static cudaVideoCodec vaToCuCodec(VAProfile profile) {
     for (const NVCodec *c = __start_nvd_codecs; c < __stop_nvd_codecs; c++) {
