@@ -505,7 +505,10 @@ static uint32_t getAV1SliceTileIndex(const CUVIDAV1PICPARAMS *pps, const VASlice
     return fallbackIndex;
 }
 
-static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams, const VASliceParameterBufferAV1 *sliceParams, const unsigned int count, const int64_t offsetAdjustment) {
+static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams,
+                               const VASliceParameterBufferAV1 *sliceParams,
+                               const unsigned int count, const int64_t offsetAdjustment,
+                               const size_t sliceDataSize) {
     CUVIDAV1PICPARAMS *pps = &picParams->CodecSpecific.av1;
     uint32_t numSlices = picParams->nNumSlices;
     if (numSlices == 0) {
@@ -523,6 +526,15 @@ static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams, const 
         return;
     }
     for (unsigned int i = 0; i < count; i++) {
+        if ((size_t) sliceParams[i].slice_data_offset > sliceDataSize ||
+            (size_t) sliceParams[i].slice_data_size >
+                sliceDataSize - (size_t) sliceParams[i].slice_data_offset) {
+            LOG("AV1 tile range outside slice data: offset=%u size=%u buffer=%zu",
+                sliceParams[i].slice_data_offset, sliceParams[i].slice_data_size,
+                sliceDataSize);
+            ctx->inputValidationFailed = true;
+            return;
+        }
         uint32_t tileIndex = getAV1SliceTileIndex(pps, &sliceParams[i], i);
         if (tileIndex >= numSlices) {
             LOG("AV1 tile index %u out of range for %u slices", tileIndex, numSlices);
@@ -563,7 +575,8 @@ static void copyAV1SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
     const VASliceParameterBufferAV1 *sliceParams = (const VASliceParameterBufferAV1*) buf->ptr;
     if (ctx->bitstreamBuffer.size > 0 && sliceParams != NULL) {
         // Chromium submits AV1 slice data before per-tile slice parameters.
-        setAV1SliceOffsets(ctx, picParams, sliceParams, buf->elements, 0);
+        setAV1SliceOffsets(ctx, picParams, sliceParams, buf->elements, 0,
+                           ctx->bitstreamBuffer.size);
         ctx->lastSliceParams = NULL;
         ctx->lastSliceParamsCount = 0;
     }
@@ -580,7 +593,10 @@ static void copyAV1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         return;
     }
 
-    setAV1SliceOffsets(ctx, picParams, (const VASliceParameterBufferAV1*) ctx->lastSliceParams, ctx->lastSliceParamsCount, (int64_t) ctx->bitstreamBuffer.size);
+    setAV1SliceOffsets(ctx, picParams,
+                       (const VASliceParameterBufferAV1*) ctx->lastSliceParams,
+                       ctx->lastSliceParamsCount,
+                       (int64_t) ctx->bitstreamBuffer.size, buf->size);
     appendBuffer(&ctx->bitstreamBuffer, buf->ptr, buf->size);
     picParams->nBitstreamDataLen = ctx->bitstreamBuffer.size;
     if (ctx->av1TileOffsetsSeen >= picParams->nNumSlices) {

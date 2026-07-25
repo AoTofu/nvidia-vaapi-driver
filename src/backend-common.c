@@ -101,6 +101,8 @@ void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
         img->borrowedBackingImage = NULL;
     }
 
+    nvDestroyBackingImageVideoProcObjects(drv, img);
+
     for (uint32_t i = 0; i < NVD_MAX_IMPORTED_OBJECTS; i++) {
         if (img->externalMappings[i] != NULL) {
             munmap(img->externalMappings[i], (size_t) img->externalMappingSize[i]);
@@ -121,4 +123,20 @@ void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
     }
     nvStatsBackingImageDestroyed(drv, img);
     free(img);
+}
+
+void nvDestroyBackingImageVideoProcObjects(NVDriver *drv, BackingImage *img) {
+    if (drv == NULL || img == NULL || img->borrowedCudaResources) {
+        return;
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        if (img->cachedVideoProcSurfaces[i] != 0 && drv->cuSurfObjectDestroy != NULL) {
+            CHECK_CUDA_RESULT(drv->cuSurfObjectDestroy(img->cachedVideoProcSurfaces[i]));
+            img->cachedVideoProcSurfaces[i] = 0;
+        }
+        if (img->cachedVideoProcTextures[i] != 0) {
+            CHECK_CUDA_RESULT(drv->cu->cuTexObjectDestroy(img->cachedVideoProcTextures[i]));
+            img->cachedVideoProcTextures[i] = 0;
+        }
+    }
 }

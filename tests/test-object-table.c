@@ -23,19 +23,29 @@ int main(void) {
     assert(second->id != staleId);
     assert(nvdObjectTableGet(&table, 2, second->id) == second);
 
-    // Exhaust the eight-bit generation for this slot. It must be retired
-    // instead of ever making the original stale ID valid again.
-    const uint32_t reusedSlot = second->id & ((1U << 20U) - 1U);
-    for (unsigned int i = 0; i < 254; i++) {
+    // Exercise sustained churn. FIFO slot reuse and generation wrap must not
+    // grow the table while only one object is live.
+    const uint32_t initialCapacity = table.capacity;
+    for (unsigned int i = 0; i < 100000; i++) {
         const uint32_t id = second->id;
         assert(nvdObjectTableRemove(&table, id) == second);
         free(second);
         assert(nvdObjectTableGet(&table, 2, id) == NULL);
-        assert(nvdObjectTableGet(&table, 2, staleId) == NULL);
         second = nvdObjectTableAllocate(&table, 2, sizeof(uint64_t));
         assert(second != NULL);
+        assert(table.capacity == initialCapacity);
     }
-    assert((second->id & ((1U << 20U) - 1U)) != reusedSlot);
+
+    // Force the next free slot through generation wrap and verify it remains
+    // reusable rather than being permanently retired.
+    assert(table.freeHead != NVD_OBJECT_SLOT_NONE);
+    table.slots[table.freeHead].generation = UINT16_MAX;
+    NVDObject *wrapping = nvdObjectTableAllocate(&table, 2, 1);
+    assert(wrapping != NULL);
+    const uint32_t wrappingSlot = wrapping->id & ((1U << 15U) - 1U);
+    assert(nvdObjectTableRemove(&table, wrapping->id) == wrapping);
+    free(wrapping);
+    assert(table.slots[wrappingSlot].generation == 1);
 
     for (unsigned int i = 0; i < 200; i++) {
         assert(nvdObjectTableAllocate(&table, (uint8_t) (i % 5), 17) != NULL);

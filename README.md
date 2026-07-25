@@ -95,8 +95,9 @@ You'll need `meson`, the `gstreamer-plugins-bad` library, and [`nv-codec-headers
 Then run the following commands:
 
 ```sh
-meson setup build
-meson install -C build
+meson setup build --buildtype=release
+meson compile -C build
+sudo meson install -C build
 ```
 
 ## Removal

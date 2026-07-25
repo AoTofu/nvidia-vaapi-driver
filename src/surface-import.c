@@ -32,7 +32,9 @@ static void parsePrimeDescriptor(const VASurfaceAttribExternalBuffers *ext,
     imported->legacyBuffers = ext->buffers;
     imported->numLegacyBuffers = ext->num_buffers;
     if (imported->numPlanes == 0 || imported->numPlanes > NVD_MAX_IMPORTED_PLANES ||
-        imported->numLegacyBuffers == 0 || ext->buffers == NULL ||
+        imported->numLegacyBuffers == 0 ||
+        imported->numLegacyBuffers > NVD_MAX_LEGACY_SURFACE_BUFFERS ||
+        ext->buffers == NULL ||
         (ext->flags & VA_SURFACE_EXTBUF_DESC_ENABLE_TILING) != 0) {
         return;
     }
@@ -101,16 +103,26 @@ void parseSurfaceImportAttributes(const VASurfaceAttrib *attribList,
     importedSurfaceInit(imported);
     const void *externalDescriptor = NULL;
 
+    if (attribList == NULL) {
+        return;
+    }
+
     for (unsigned int i = 0; i < numAttribs; i++) {
         switch (attribList[i].type) {
         case VASurfaceAttribMemoryType:
-            imported->memoryType = (uint32_t) attribList[i].value.value.i;
+            if (attribList[i].value.type == VAGenericValueTypeInteger) {
+                imported->memoryType = (uint32_t) attribList[i].value.value.i;
+            }
             break;
         case VASurfaceAttribExternalBufferDescriptor:
-            externalDescriptor = attribList[i].value.value.p;
+            if (attribList[i].value.type == VAGenericValueTypePointer) {
+                externalDescriptor = attribList[i].value.value.p;
+            }
             break;
         case VASurfaceAttribPixelFormat:
-            imported->pixelFormat = (uint32_t) attribList[i].value.value.i;
+            if (attribList[i].value.type == VAGenericValueTypeInteger) {
+                imported->pixelFormat = (uint32_t) attribList[i].value.value.i;
+            }
             break;
         default:
             break;

@@ -166,10 +166,34 @@ static void testShutdownWakesFullQueue(void) {
     resolveQueueDestroy(&queue);
 }
 
+static void testCancelReturnsPendingItems(void) {
+    ResolveQueue queue;
+    assert(resolveQueueInit(&queue));
+    atomic_uint_fast64_t depth = 0;
+    resolveQueueSetTelemetry(&queue, (ResolveQueueTelemetry) { .depth = &depth });
+    for (uintptr_t i = 1; i <= RESOLVE_QUEUE_CAPACITY; i++) {
+        assert(resolveQueuePush(&queue, (void *) i));
+    }
+
+    void *cancelled[RESOLVE_QUEUE_CAPACITY] = { 0 };
+    assert(resolveQueueCancel(&queue, cancelled, RESOLVE_QUEUE_CAPACITY) ==
+           RESOLVE_QUEUE_CAPACITY);
+    for (uintptr_t i = 0; i < RESOLVE_QUEUE_CAPACITY; i++) {
+        assert(cancelled[i] == (void *) (i + 1));
+    }
+    assert(queue.count == 0);
+    assert(atomic_load(&depth) == 0);
+    assert(!resolveQueuePush(&queue, (void *) 100));
+    void *item = NULL;
+    assert(!resolveQueuePop(&queue, &item));
+    resolveQueueDestroy(&queue);
+}
+
 int main(void) {
     testWrapAndBackpressure();
     testMultipleProducersConsumers();
     testShutdownWakesFullQueue();
+    testCancelReturnsPendingItems();
     puts("resolve queue tests passed");
     return 0;
 }

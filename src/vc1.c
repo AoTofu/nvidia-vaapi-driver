@@ -78,6 +78,10 @@ static void copyVC1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
         const VASliceParameterBufferVC1 *slice =
             &((const VASliceParameterBufferVC1 *) ctx->lastSliceParams)[i];
+        if (!nvValidateSliceRange(ctx, buf, slice->slice_data_offset,
+                                  slice->slice_data_size, NULL)) {
+            return;
+        }
         if (slice->slice_data_size > SIZE_MAX - bytes) {
             ctx->bitstreamBuffer.failed = true;
             return;

@@ -16,13 +16,14 @@ typedef struct NVDObject {
 typedef struct {
     NVDObject *object;
     uint32_t nextFree;
-    uint8_t generation;
+    uint16_t generation;
 } NVDObjectSlot;
 
 typedef struct {
     NVDObjectSlot *slots;
     uint32_t capacity;
     uint32_t freeHead;
+    uint32_t freeTail;
     uint32_t liveCount;
 } NVDObjectTable;
 

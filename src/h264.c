@@ -95,6 +95,10 @@ static void copyH264SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
         const VASliceParameterBufferH264 *sliceParams =
             &((const VASliceParameterBufferH264 *) ctx->lastSliceParams)[i];
+        if (!nvValidateSliceRange(ctx, buf, sliceParams->slice_data_offset,
+                                  sliceParams->slice_data_size, NULL)) {
+            return;
+        }
         if (bitstreamBytes > SIZE_MAX - 3U ||
             sliceParams->slice_data_size > SIZE_MAX - bitstreamBytes - 3U) {
             ctx->bitstreamBuffer.failed = true;

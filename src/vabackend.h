@@ -25,7 +25,7 @@
 
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
-#define NVD_BUFFER_POOL_CLASS_COUNT 6
+#define NVD_BUFFER_POOL_CLASS_COUNT 11
 
 typedef enum
 {
@@ -150,6 +150,8 @@ typedef struct _BackingImage {
     CUexternalMemory externalObjectMems[4];
     CUdeviceptr externalDevicePtrs[4];
     uint64_t    externalDeviceSize[4];
+    CUtexObject cachedVideoProcTextures[3];
+    NVCUsurfObject cachedVideoProcSurfaces[3];
     uint64_t    detachedSerial;
     struct _BackingImage *detachedPrev;
     struct _BackingImage *detachedNext;
@@ -166,7 +168,8 @@ typedef struct {
     const char *name;
     bool (*initExporter)(struct _NVDriver *drv);
     void (*releaseExporter)(struct _NVDriver *drv);
-    bool (*exportCudaPtr)(struct _NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch);
+    bool (*exportCudaPtr)(struct _NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
+                          uint32_t pitch, CUstream stream, CUevent completeEvent);
     void (*detachBackingImageFromSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*realiseSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*fillExportDescriptor)(struct _NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc);
@@ -286,6 +289,8 @@ typedef struct _NVContext
     int                 currentPictureId;
     pthread_t           resolveThread;
     bool                resolveThreadStarted;
+    CUstream            resolveStream;
+    CUevent             resolveCompleteEvent;
     ResolveQueue        resolveQueue;
     pthread_mutex_t     surfaceCreationMutex;
     bool                surfaceCreationMutexInitialized;
@@ -293,7 +298,11 @@ typedef struct _NVContext
     uint32_t            clientRenderTargetCount;
     uint32_t            decodeSurfaceReferenceHint;
     bool                firstKeyframeValid;
+    bool                inputValidationFailed;
 } NVContext;
+
+bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,
+                          uint32_t offset, size_t size, const void **data);
 
 typedef struct
 {

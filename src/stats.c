@@ -163,7 +163,7 @@ void nvStatsLog(NVDriver *drv, const char *reason) {
     clock_gettime(CLOCK_MONOTONIC, &tp);
 #define S(counter) ((unsigned long long) statLoad(drv, counter))
     fprintf(out,
-        "%10ld.%09ld [%d-%d] Stats[%s]: decoder_creates=%llu decode_surfaces_selected=%llu decode_surfaces_auto_candidate=%llu decode_surfaces_legacy=%llu decode_pictures=%llu resolve_frames=%llu export_copies=%llu export_host_copies=%llu export_descriptors=%llu single_descriptors=%llu multi_descriptors=%llu videoproc_requests=%llu videoproc_cuda=%llu videoproc_cuda_failures=%llu videoproc_cpu_fallback=%llu device_copy_bytes=%llu host_copy_bytes=%llu host_fallback_frames=%llu resolve_queue_depth=%llu resolve_queue_high_water=%llu resolve_queue_full_waits=%llu resolve_queue_wait_ns=%llu backing_alloc_count=%llu backing_alloc_ns=%llu backing_prune_count=%llu backing_cache_hits=%llu active_backing_images=%llu detached_backing_images=%llu borrowed_backing_images=%llu external_backing_images=%llu active_backing_bytes=%llu detached_backing_bytes=%llu active_backing_bytes_peak=%llu detached_backing_bytes_peak=%llu total_backing_bytes_peak=%llu videoproc_gpu_scratch_bytes=%llu videoproc_gpu_scratch_bytes_peak=%llu videoproc_cpu_scratch_bytes=%llu videoproc_cpu_scratch_bytes_peak=%llu tracked_vram_equivalent_bytes=%llu tracked_vram_equivalent_bytes_peak=%llu tracked_ram_equivalent_bytes=%llu tracked_ram_equivalent_bytes_peak=%llu videoproc_ns=%llu object_lookup_count=%llu object_lookup_steps=%llu buffer_pool_hits=%llu buffer_pool_misses=%llu av1_compact_count=%llu av1_compact_bytes=%llu jpeg_copy_bytes=%llu detached_backing_limit_bytes=%llu detached_backing_limit_images=%u memory_budget_bytes=%llu\n",
+        "%10ld.%09ld [%d-%d] Stats[%s]: decoder_creates=%llu decode_surfaces_selected=%llu decode_surfaces_auto_candidate=%llu decode_surfaces_legacy=%llu decode_pictures=%llu resolve_frames=%llu export_copies=%llu export_host_copies=%llu export_descriptors=%llu single_descriptors=%llu multi_descriptors=%llu videoproc_requests=%llu videoproc_cuda=%llu videoproc_cuda_failures=%llu videoproc_cpu_fallback=%llu device_copy_bytes=%llu host_copy_bytes=%llu host_fallback_frames=%llu resolve_queue_depth=%llu resolve_queue_high_water=%llu resolve_queue_full_waits=%llu resolve_queue_wait_ns=%llu backing_alloc_count=%llu backing_alloc_ns=%llu backing_prune_count=%llu backing_cache_hits=%llu active_backing_images=%llu detached_backing_images=%llu borrowed_backing_images=%llu external_backing_images=%llu active_backing_bytes=%llu detached_backing_bytes=%llu active_backing_bytes_peak=%llu detached_backing_bytes_peak=%llu total_backing_bytes_peak=%llu videoproc_gpu_scratch_bytes=%llu videoproc_gpu_scratch_bytes_peak=%llu videoproc_cpu_scratch_bytes=%llu videoproc_cpu_scratch_bytes_peak=%llu tracked_vram_equivalent_bytes=%llu tracked_vram_equivalent_bytes_peak=%llu tracked_ram_equivalent_bytes=%llu tracked_ram_equivalent_bytes_peak=%llu videoproc_ns=%llu videoproc_texture_creates=%llu videoproc_surface_creates=%llu videoproc_object_create_ns=%llu videoproc_mutex_wait_ns=%llu videoproc_direct_array_frames=%llu object_lookup_count=%llu object_lookup_steps=%llu buffer_pool_hits=%llu buffer_pool_misses=%llu buffer_requested_bytes=%llu buffer_capacity_bytes=%llu buffer_internal_fragmentation_bytes=%llu buffer_pool_retained_bytes=%llu security_clear_bytes=%llu security_clear_ns=%llu av1_compact_count=%llu av1_compact_bytes=%llu jpeg_copy_bytes=%llu detached_backing_limit_bytes=%llu detached_backing_limit_images=%u memory_budget_bytes=%llu\n",
         (long)tp.tv_sec, tp.tv_nsec, getpid(), nv_gettid(), reason,
         S(NV_STAT_DECODER_CREATES), S(NV_STAT_DECODE_SURFACES_SELECTED),
         S(NV_STAT_DECODE_SURFACES_AUTO_CANDIDATE), S(NV_STAT_DECODE_SURFACES_LEGACY),
@@ -186,8 +186,15 @@ void nvStatsLog(NVDriver *drv, const char *reason) {
         S(NV_STAT_VIDEOPROC_CPU_SCRATCH_BYTES_PEAK), S(NV_STAT_TRACKED_GPU_BYTES),
         S(NV_STAT_TRACKED_GPU_BYTES_PEAK), S(NV_STAT_TRACKED_HOST_BYTES),
         S(NV_STAT_TRACKED_HOST_BYTES_PEAK), S(NV_STAT_VIDEOPROC_NS),
+        S(NV_STAT_VIDEOPROC_TEXTURE_CREATES), S(NV_STAT_VIDEOPROC_SURFACE_CREATES),
+        S(NV_STAT_VIDEOPROC_OBJECT_CREATE_NS), S(NV_STAT_VIDEOPROC_MUTEX_WAIT_NS),
+        S(NV_STAT_VIDEOPROC_DIRECT_ARRAY_FRAMES),
         S(NV_STAT_OBJECT_LOOKUP_COUNT), S(NV_STAT_OBJECT_LOOKUP_STEPS),
         S(NV_STAT_BUFFER_POOL_HITS), S(NV_STAT_BUFFER_POOL_MISSES),
+        S(NV_STAT_BUFFER_REQUESTED_BYTES), S(NV_STAT_BUFFER_CAPACITY_BYTES),
+        S(NV_STAT_BUFFER_INTERNAL_FRAGMENTATION_BYTES),
+        S(NV_STAT_BUFFER_POOL_RETAINED_BYTES), S(NV_STAT_SECURITY_CLEAR_BYTES),
+        S(NV_STAT_SECURITY_CLEAR_NS),
         S(NV_STAT_AV1_COMPACT_COUNT), S(NV_STAT_AV1_COMPACT_BYTES), S(NV_STAT_JPEG_COPY_BYTES),
         (unsigned long long) drv->maxDetachedBackingImageBytes, drv->maxDetachedBackingImages,
         (unsigned long long) drv->memoryBudgetBytes);

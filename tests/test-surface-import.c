@@ -170,12 +170,36 @@ static void testLegacyPrimeRejectsUnknownTiling(void) {
     assert(imported.requested && !imported.valid);
 }
 
+static void testRejectsInvalidAttributeTypesAndCounts(void) {
+    ImportedSurface imported;
+    parseSurfaceImportAttributes(NULL, 1, &imported);
+    assert(!imported.requested && !imported.valid);
+
+    VASurfaceAttribExternalBuffers descriptor = { 0 };
+    descriptor.num_buffers = NVD_MAX_LEGACY_SURFACE_BUFFERS + 1U;
+    uintptr_t buffer = 60;
+    descriptor.buffers = &buffer;
+    descriptor.num_planes = 1;
+
+    VASurfaceAttrib attributes[] = {
+        memoryTypeAttribute(VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME),
+        descriptorAttribute(&descriptor),
+    };
+    parseSurfaceImportAttributes(attributes, 2, &imported);
+    assert(imported.requested && !imported.valid);
+
+    attributes[1].value.type = VAGenericValueTypeInteger;
+    parseSurfaceImportAttributes(attributes, 2, &imported);
+    assert(!imported.requested && !imported.valid);
+}
+
 int main(void) {
     testPrime2SingleObject();
     testPrime2MultipleObjects();
     testInvalidPrime2ObjectIndex();
     testLegacyPrimeSurfaceBuffers();
     testLegacyPrimeRejectsUnknownTiling();
+    testRejectsInvalidAttributeTypesAndCounts();
     puts("surface import tests passed");
     return 0;
 }

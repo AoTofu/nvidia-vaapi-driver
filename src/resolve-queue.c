@@ -121,6 +121,34 @@ void resolveQueueShutdown(ResolveQueue *queue) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
+size_t resolveQueueCancel(ResolveQueue *queue, void **cancelled, size_t capacity) {
+    if (!queue->initialized) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&queue->mutex);
+    queue->exiting = true;
+    const size_t pending = queue->count;
+    const size_t returned = pending < capacity ? pending : capacity;
+    for (size_t i = 0; i < pending; i++) {
+        void *item = queue->items[queue->readIdx];
+        queue->items[queue->readIdx] = NULL;
+        queue->readIdx = (queue->readIdx + 1) % RESOLVE_QUEUE_CAPACITY;
+        if (i < returned && cancelled != NULL) {
+            cancelled[i] = item;
+        }
+    }
+    queue->count = 0;
+    queue->writeIdx = queue->readIdx;
+    if (queue->telemetry.depth != NULL && pending != 0) {
+        atomic_fetch_sub_explicit(queue->telemetry.depth, pending, memory_order_relaxed);
+    }
+    pthread_cond_broadcast(&queue->notEmpty);
+    pthread_cond_broadcast(&queue->notFull);
+    pthread_mutex_unlock(&queue->mutex);
+    return returned;
+}
+
 void resolveQueueDestroy(ResolveQueue *queue) {
     if (!queue->initialized) {
         return;

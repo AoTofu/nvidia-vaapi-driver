@@ -52,6 +52,7 @@ sources = [
     'src/appendable-buffer.c',
     'src/av1.c',
     'src/backend-common.c',
+    'src/codec-utils.c',
     'src/decode-surfaces.c',
     'src/export-buf.c',
     'src/direct/direct-export-buf.c',
@@ -127,6 +128,14 @@ object_table_test = executable(
     include_directories: include_directories('src'),
 )
 test('object table', object_table_test, timeout: 30)
+
+codec_utils_test = executable(
+    'test-codec-utils',
+    ['tests/test-codec-utils.c', 'src/codec-utils.c'],
+    include_directories: [include_directories('src'), nvidia_incdir],
+    dependencies: deps,
+)
+test('codec slice ranges', codec_utils_test, timeout: 30)
 
 meson.add_devenv(environment({
     'NVD_LOG': '1',

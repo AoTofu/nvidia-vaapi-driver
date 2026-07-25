@@ -177,6 +177,10 @@ static void copyVP9SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
         const VASliceParameterBufferVP9 *sliceParams =
             &((const VASliceParameterBufferVP9 *) ctx->lastSliceParams)[i];
+        if (!nvValidateSliceRange(ctx, buf, sliceParams->slice_data_offset,
+                                  sliceParams->slice_data_size, NULL)) {
+            return;
+        }
         if (sliceParams->slice_data_size > SIZE_MAX - frameBytes) {
             ctx->bitstreamBuffer.failed = true;
             return;

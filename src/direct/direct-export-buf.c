@@ -295,7 +295,7 @@ static bool clearBackingImagePlane(NVDriver *drv, BackingImage *img, uint32_t pl
             failed = true;
             break;
         }
-        nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, widthInBytes * rowsToCopy);
+        nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_BYTES, widthInBytes * rowsToCopy);
     }
 
     free(rows);
@@ -303,11 +303,16 @@ static bool clearBackingImagePlane(NVDriver *drv, BackingImage *img, uint32_t pl
 }
 
 static bool clearBackingImage(NVDriver *drv, BackingImage *img) {
+    const uint64_t start = nvStatsTimestamp(drv);
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         if (!clearBackingImagePlane(drv, img, i)) {
             return false;
         }
+    }
+    const uint64_t end = nvStatsTimestamp(drv);
+    if (start != 0 && end >= start) {
+        nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_NS, end - start);
     }
     return true;
 }
@@ -778,6 +783,7 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
     }
 
     if (!img->borrowedCudaResources) {
+        nvDestroyBackingImageVideoProcObjects(drv, img);
         for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
             if (img->arrays[i] != NULL) {
                 CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(img->arrays[i]));
@@ -892,13 +898,23 @@ static bool direct_pruneToMemoryBudget(NVDriver *drv, uint64_t extraGpuBytes) {
     return fits;
 }
 
-static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
+static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
+                               uint32_t pitch, CUstream stream, CUevent completeEvent) {
     BackingImage *img = surface->backingImage;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     uint32_t y = 0;
     const bool hostDestination = nvBackingImageHasExternalHostMemory(img);
     const bool deviceDestination = nvBackingImageHasExternalDeviceMemory(img);
     if (hostDestination && !nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE)) {
+        nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        return false;
+    }
+
+    // mmap-backed destinations are not guaranteed to be page-locked, so keep
+    // their copies synchronous. If NVDEC queued output processing on the
+    // context stream, finish that work before reading the mapped frame.
+    if (hostDestination && stream != NULL &&
+        CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream))) {
         nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
         return false;
     }
@@ -945,9 +961,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
             cpy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
             cpy.dstArray = img->arrays[i];
         }
-        failed = i == fmtInfo->numPlanes - 1
-            ? CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))
-            : CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
+        failed = CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, stream));
         if (failed) {
             break;
         }
@@ -958,6 +972,12 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
     if (hostDestination &&
         !nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE)) {
         failed = true;
+    }
+    if (!hostDestination && !failed) {
+        failed = completeEvent != NULL
+            ? CHECK_CUDA_RESULT(drv->cu->cuEventRecord(completeEvent, stream)) ||
+              CHECK_CUDA_RESULT(drv->cu->cuEventSynchronize(completeEvent))
+            : CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream));
     }
     if (failed) {
         return false;
@@ -1038,7 +1058,8 @@ static void finishSurfaceResolve(NVSurface *surface) {
     pthread_mutex_unlock(&surface->mutex);
 }
 
-static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
+static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
+                                 uint32_t pitch, CUstream stream, CUevent completeEvent) {
     if (!direct_realiseSurface(drv, surface)) {
         finishSurfaceResolve(surface);
         return false;
@@ -1058,7 +1079,7 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
             nvStatsIncrement(drv, NV_STAT_HOST_FALLBACK_FRAMES);
         }
         nvBackingImageStoreSurfaceColorMetadata(img, surface);
-        bool copied = copyFrameToSurface(drv, ptr, surface, pitch);
+        bool copied = copyFrameToSurface(drv, ptr, surface, pitch, stream, completeEvent);
         if (syncImg != NULL && syncImg->syncInitialized) {
             pthread_mutex_lock(&syncImg->mutex);
             syncImg->resolving = false;
@@ -1092,6 +1113,10 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
         desc->num_objects = 1;
         desc->objects[0].fd = dup(img->fds[0]);
+        if (desc->objects[0].fd < 0) {
+            desc->num_objects = 0;
+            return false;
+        }
         desc->objects[0].size = img->totalSize;
         desc->objects[0].drm_format_modifier = img->mods[0];
 
@@ -1108,6 +1133,14 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
 
         for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
             desc->objects[i].fd = dup(img->fds[i]);
+            if (desc->objects[i].fd < 0) {
+                for (uint32_t j = 0; j < i; j++) {
+                    close(desc->objects[j].fd);
+                    desc->objects[j].fd = -1;
+                }
+                desc->num_objects = 0;
+                return false;
+            }
             desc->objects[i].size = img->size[i];
             desc->objects[i].drm_format_modifier = img->mods[i];
 

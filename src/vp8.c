@@ -35,6 +35,9 @@ static void copyVP8SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
 
 static void copyVP8SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
 {
+    if (!nvValidateSliceRange(ctx, buf, 0, 1, NULL)) {
+        return;
+    }
     // Manually extract show_frame bit
     picParams->CodecSpecific.vp8.vp8_frame_tag.show_frame = (((uint8_t*) buf->ptr)[0] & 0x10) != 0;
     
@@ -44,12 +47,23 @@ static void copyVP8SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         
-        uint8_t *sliceData = PTROFF(buf->ptr, sliceParams->slice_data_offset);
+        if (sliceParams->slice_data_size > SIZE_MAX - buf->offset) {
+            ctx->inputValidationFailed = true;
+            return;
+        }
         size_t sliceDataSize = sliceParams->slice_data_size + buf->offset;
+        const void *validatedData = NULL;
+        if (!nvValidateSliceRange(ctx, buf, sliceParams->slice_data_offset,
+                                  sliceDataSize, &validatedData)) {
+            return;
+        }
+        const uint8_t *sliceData = validatedData;
         
         bool isKeyFrame = (picParams->CodecSpecific.vp8.vp8_frame_tag.frame_type == 0);
         // Keyframe: need sync code 0x9d012a
-        if (isKeyFrame && (sliceData[3] == 0x9d || sliceData[4] == 0x01 || sliceData[5] == 0x2a) && ctx->firstKeyframeValid == false)
+        if (isKeyFrame && sliceDataSize >= 6 &&
+            sliceData[3] == 0x9d && sliceData[4] == 0x01 && sliceData[5] == 0x2a &&
+            ctx->firstKeyframeValid == false)
             ctx->firstKeyframeValid = true;
         
         if (ctx->firstKeyframeValid == false)

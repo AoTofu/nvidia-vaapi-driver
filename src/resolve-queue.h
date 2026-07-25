@@ -33,6 +33,7 @@ void resolveQueueSetTelemetry(ResolveQueue *queue, ResolveQueueTelemetry telemet
 bool resolveQueuePush(ResolveQueue *queue, void *item);
 bool resolveQueuePop(ResolveQueue *queue, void **item);
 void resolveQueueShutdown(ResolveQueue *queue);
+size_t resolveQueueCancel(ResolveQueue *queue, void **cancelled, size_t capacity);
 void resolveQueueDestroy(ResolveQueue *queue);
 
 #endif

@@ -9,6 +9,7 @@
 
 #define NVD_MAX_IMPORTED_OBJECTS 4
 #define NVD_MAX_IMPORTED_PLANES 4
+#define NVD_MAX_LEGACY_SURFACE_BUFFERS 1024
 
 typedef struct {
     int fd;
