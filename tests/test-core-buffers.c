@@ -46,6 +46,34 @@ static void testAppendOverflowIsNonDestructive(void) {
     assert(reserve.failed);
 }
 
+static void testTrimPreservesData(void) {
+    AppendableBuffer buffer = {0};
+    unsigned char expected[4096];
+    for (size_t i = 0; i < sizeof(expected); i++) {
+        expected[i] = (unsigned char) (i * 17U);
+    }
+    assert(appendBuffer(&buffer, expected, sizeof(expected)));
+    assert(reserveBuffer(&buffer, 16U * 1024U * 1024U));
+    assert(buffer.allocated >= 16U * 1024U * 1024U);
+
+    assert(trimBuffer(&buffer, 8192));
+    assert(buffer.allocated == 8192);
+    assert(buffer.size == sizeof(expected));
+    assert(memcmp(buffer.buf, expected, sizeof(expected)) == 0);
+
+    // A target smaller than live data is raised to the live size.
+    assert(trimBuffer(&buffer, 1));
+    assert(buffer.allocated == sizeof(expected));
+    assert(memcmp(buffer.buf, expected, sizeof(expected)) == 0);
+
+    // Empty buffers can release all retained capacity.
+    buffer.size = 0;
+    assert(trimBuffer(&buffer, 0));
+    assert(buffer.buf == NULL);
+    assert(buffer.allocated == 0);
+    freeAppendableBuffer(&buffer);
+}
+
 static void testArrayGrowthAndExhaustion(void) {
     Array array = {0};
     int values[100];
@@ -68,6 +96,7 @@ static void testArrayGrowthAndExhaustion(void) {
 int main(void) {
     testAppendAndGrow();
     testAppendOverflowIsNonDestructive();
+    testTrimPreservesData();
     testArrayGrowthAndExhaustion();
     return 0;
 }

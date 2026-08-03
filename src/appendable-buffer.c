@@ -71,6 +71,38 @@ bool appendBuffer(AppendableBuffer *buffer, const void *data, size_t size) {
     return true;
 }
 
+bool trimBuffer(AppendableBuffer *buffer, size_t targetCapacity) {
+    if (buffer == NULL) {
+        return false;
+    }
+    if (targetCapacity < buffer->size) {
+        targetCapacity = buffer->size;
+    }
+    if (targetCapacity >= buffer->allocated) {
+        return true;
+    }
+    if (targetCapacity == 0) {
+        free(buffer->buf);
+        buffer->buf = NULL;
+        buffer->allocated = 0;
+        return true;
+    }
+
+    void *newBuffer = memalign(16, targetCapacity);
+    if (newBuffer == NULL) {
+        // Trimming is opportunistic: keep the usable old allocation and do not
+        // poison later decode work merely because the smaller allocation failed.
+        return false;
+    }
+    if (buffer->buf != NULL && buffer->size != 0) {
+        memcpy(newBuffer, buffer->buf, buffer->size);
+    }
+    free(buffer->buf);
+    buffer->buf = newBuffer;
+    buffer->allocated = targetCapacity;
+    return true;
+}
+
 void freeAppendableBuffer(AppendableBuffer *buffer) {
     free(buffer->buf);
     buffer->buf = NULL;
