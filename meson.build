@@ -137,6 +137,14 @@ codec_utils_test = executable(
 )
 test('codec slice ranges', codec_utils_test, timeout: 30)
 
+bash = find_program('bash')
+test(
+    'install script',
+    bash,
+    args: [files('tests/test-install-script.sh'), meson.project_source_root()],
+    timeout: 30,
+)
+
 meson.add_devenv(environment({
     'NVD_LOG': '1',
     'LIBVA_DRIVER_NAME': 'nvidia',

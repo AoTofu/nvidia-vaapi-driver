@@ -70,7 +70,11 @@ The installer builds the driver, backs up any existing `nvidia_drv_video.so`, in
 ./install.sh --clean
 ```
 
-The installer prints a rollback command if it replaced an existing driver.
+The installer prints a rollback command if it replaced an existing driver. When Chrome or Chromium is installed, it also prints a reusable command that selects this VA-API driver. To print that command without rebuilding or installing anything:
+
+```sh
+./install.sh --print-chrome-command
+```
 
 ## Packaging status
 
@@ -185,7 +189,19 @@ LIBVA_DRIVER_NAME=nvidia google-chrome \
 
 On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
 
-Chrome and Chromium receive one buffer with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
+The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or `chromium-browser` and generate the same command with the direct backend and automatic export-layout policy enabled:
+
+```sh
+# Print a copy-and-paste command without building or installing.
+./install.sh --print-chrome-command --chrome-wayland -- https://example.com/
+
+# Install the driver, run the normal smoke test, then launch Chrome.
+./install.sh --launch-chrome --chrome-wayland -- https://example.com/
+```
+
+Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=auto`. It does not modify desktop entries or global browser configuration. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
+
+Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
 ## MPV
 
