@@ -130,6 +130,12 @@ const DECLARE_CODEC(vc1Codec) = {
         [VASliceDataBufferType] = copyVC1SliceData,
         [VABitPlaneBufferType] = copyVC1BitPlane,
     },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VAPictureParameterBufferVC1, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferVC1, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+        [VABitPlaneBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+    },
     .supportedProfileCount = ARRAY_SIZE(vc1SupportedProfiles),
     .supportedProfiles = vc1SupportedProfiles,
 };

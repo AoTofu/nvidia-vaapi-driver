@@ -770,6 +770,13 @@ const DECLARE_CODEC(jpegCodec) = {
         [VASliceParameterBufferType] = copyJPEGSliceParam,
         [VASliceDataBufferType] = copyJPEGSliceData,
     },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VAPictureParameterBufferJPEGBaseline, 1, 1),
+        [VAIQMatrixBufferType] = NVD_BUFFER_SCHEMA(VAIQMatrixBufferJPEGBaseline, 1, 1),
+        [VAHuffmanTableBufferType] = NVD_BUFFER_SCHEMA(VAHuffmanTableBufferJPEGBaseline, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferJPEGBaseline, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+    },
     .supportedProfileCount = ARRAY_SIZE(jpegSupportedProfiles),
     .supportedProfiles = jpegSupportedProfiles,
     .beginPicture = jpegBeginPicture,

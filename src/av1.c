@@ -144,12 +144,60 @@ static void compactAV1BitstreamToCurrentFrame(NVContext *ctx, CUVIDPICPARAMS *pi
     ctx->av1BitstreamCompacted = true;
 }
 
+static bool validateAV1PictureParams(const VADecPictureParameterBufferAV1 *buf,
+                                     const CUVIDAV1PICPARAMS *pps) {
+    if (buf->bit_depth_idx >= 3U ||
+        (buf->seq_info_fields.fields.enable_order_hint &&
+         buf->order_hint_bits_minus_1 > 7U) ||
+        (buf->pic_info_fields.bits.use_superres &&
+         (buf->superres_scale_denominator < 9U ||
+          buf->superres_scale_denominator > 16U)) ||
+        buf->tile_cols == 0 || buf->tile_rows == 0 ||
+        buf->tile_cols > ARRAY_SIZE(buf->width_in_sbs_minus_1) ||
+        buf->tile_cols > ARRAY_SIZE(pps->tile_widths) ||
+        buf->tile_rows > ARRAY_SIZE(buf->height_in_sbs_minus_1) ||
+        buf->tile_rows > ARRAY_SIZE(pps->tile_heights) ||
+        (uint32_t) buf->tile_cols > UINT32_MAX / (uint32_t) buf->tile_rows ||
+        buf->context_update_tile_id >=
+            (uint32_t) buf->tile_cols * (uint32_t) buf->tile_rows ||
+        buf->cdef_bits > 3U ||
+        (1U << buf->cdef_bits) > ARRAY_SIZE(buf->cdef_y_strengths) ||
+        (1U << buf->cdef_bits) > ARRAY_SIZE(buf->cdef_uv_strengths) ||
+        (1U << buf->cdef_bits) > ARRAY_SIZE(pps->cdef_y_strength) ||
+        (1U << buf->cdef_bits) > ARRAY_SIZE(pps->cdef_uv_strength) ||
+        buf->primary_ref_frame > 7U ||
+        buf->film_grain_info.num_y_points >
+            ARRAY_SIZE(buf->film_grain_info.point_y_value) ||
+        buf->film_grain_info.num_y_points > ARRAY_SIZE(pps->scaling_points_y) ||
+        buf->film_grain_info.num_cb_points >
+            ARRAY_SIZE(buf->film_grain_info.point_cb_value) ||
+        buf->film_grain_info.num_cb_points > ARRAY_SIZE(pps->scaling_points_cb) ||
+        buf->film_grain_info.num_cr_points >
+            ARRAY_SIZE(buf->film_grain_info.point_cr_value) ||
+        buf->film_grain_info.num_cr_points > ARRAY_SIZE(pps->scaling_points_cr) ||
+        buf->loop_restoration_fields.bits.lr_uv_shift >
+            1U + buf->loop_restoration_fields.bits.lr_unit_shift) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ARRAY_SIZE(buf->ref_frame_idx); i++) {
+        if (buf->ref_frame_idx[i] >= ARRAY_SIZE(pps->ref_frame_map)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams) {
     static const int bit_depth_map[] = {0, 2, 4}; //8-bpc, 10-bpc, 12-bpc
     static const uint8_t lr_type_map[] = {0, 1, 2, 3}; //VA-API and NVDEC use the same AV1 restoration type values
 
     VADecPictureParameterBufferAV1* buf = (VADecPictureParameterBufferAV1*) buffer->ptr;
     CUVIDAV1PICPARAMS *pps = &picParams->CodecSpecific.av1;
+    if (!validateAV1PictureParams(buf, pps)) {
+        ctx->inputValidationFailed = true;
+        return;
+    }
     VAProcColorStandardType colorStandard = nvColorStandardFromMatrixCoefficients(buf->matrix_coefficients);
     bool colorRangeFull = buf->seq_info_fields.fields.color_range != 0;
 
@@ -626,6 +674,11 @@ const DECLARE_CODEC(av1Codec) = {
         [VAPictureParameterBufferType] = copyAV1PicParam,
         [VASliceParameterBufferType] = copyAV1SliceParam,
         [VASliceDataBufferType] = copyAV1SliceData
+    },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VADecPictureParameterBufferAV1, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferAV1, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
     },
     .supportedProfileCount = ARRAY_SIZE(av1SupportedProfiles),
     .supportedProfiles = av1SupportedProfiles,

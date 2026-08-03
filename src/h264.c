@@ -159,6 +159,12 @@ const DECLARE_CODEC(h264Codec) = {
         [VASliceParameterBufferType] = copyH264SliceParam,
         [VASliceDataBufferType] = copyH264SliceData,
     },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VAPictureParameterBufferH264, 1, 1),
+        [VAIQMatrixBufferType] = NVD_BUFFER_SCHEMA(VAIQMatrixBufferH264, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferH264, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+    },
     .supportedProfileCount = ARRAY_SIZE(h264SupportedProfiles),
     .supportedProfiles = h264SupportedProfiles,
 };

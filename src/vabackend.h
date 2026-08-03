@@ -41,10 +41,10 @@ typedef NVDObject *Object;
 typedef struct
 {
     unsigned int    elements;
+    size_t          elementSize;
     size_t          size;
     VABufferType    bufferType;
     void            *ptr;
-    size_t          offset;
     size_t          capacity;
     int8_t          poolClass;
 } NVBuffer;
@@ -55,6 +55,8 @@ typedef struct _NVBufferPoolBlock {
 
 struct _NVContext;
 struct _BackingImage;
+
+#define NVD_MAX_DECODE_SURFACES 32U
 
 typedef struct
 {
@@ -195,6 +197,11 @@ typedef struct _NVDriver
     pthread_mutex_t         imagesMutex;
     pthread_mutex_t         bufferPoolMutex;
     bool                    bufferPoolMutexInitialized;
+    pthread_mutex_t         securityClearMutex;
+    bool                    securityClearMutexInitialized;
+    CUstream                securityClearStream;
+    CUdeviceptr             securityClearBuffer;
+    size_t                  securityClearBufferSize;
     NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
     uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
     uint64_t                bufferPoolBytes;
@@ -255,6 +262,8 @@ typedef struct _NVDriver
     bool                    decodeSurfacesAuto;
     uint32_t                decodeSurfacesMinimum;
     uint32_t                decodeSurfacesMaximum;
+    uint64_t                hostBufferTrimThresholdBytes;
+    uint32_t                hostBufferTrimFrames;
 } NVDriver;
 
 struct _NVCodec;
@@ -275,6 +284,7 @@ typedef struct _NVContext
     AppendableBuffer    bitstreamBuffer;
     size_t              bitstreamDataOffset;
     AppendableBuffer    sliceOffsets;
+    AppendableBuffer    sliceParamsBuffer;
     bool                av1SequenceEnableRestoration;
     uint32_t            av1TileOffsetsSeen;
     uint32_t            av1TileMinOffset;
@@ -287,6 +297,10 @@ typedef struct _NVContext
     cudaVideoChromaFormat decoderChromaFormat;
     int                 decoderBitDepth;
     int                 currentPictureId;
+    NVSurface           *pictureIndexOwners[NVD_MAX_DECODE_SURFACES];
+    uint32_t            activeReferenceMask;
+    uint32_t            buildingReferenceMask;
+    uint32_t            pictureIndexRecycleCursor;
     pthread_t           resolveThread;
     bool                resolveThreadStarted;
     CUstream            resolveStream;
@@ -297,12 +311,17 @@ typedef struct _NVContext
     int                 surfaceCount;
     uint32_t            clientRenderTargetCount;
     uint32_t            decodeSurfaceReferenceHint;
-    bool                firstKeyframeValid;
+    uint32_t            hostBufferUnderuseFrames;
+    bool                destroying;
     bool                inputValidationFailed;
 } NVContext;
 
 bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,
                           uint32_t offset, size_t size, const void **data);
+size_t nvBuildVP8FrameHeader(uint8_t header[10], bool keyFrame,
+                             uint8_t version, bool showFrame,
+                             uint32_t firstPartitionSize,
+                             uint16_t width, uint16_t height);
 
 typedef struct
 {
@@ -319,6 +338,25 @@ typedef cudaVideoCodec (*ComputeCudaCodec)(VAProfile);
 typedef void (*CodecBeginPictureFunc)(NVContext*);
 typedef void (*CodecDestroyFunc)(NVContext*);
 
+typedef struct {
+    size_t minElementSize;
+    uint32_t minElements;
+    uint32_t maxElements; /* zero means no schema-specific maximum */
+} BufferSchema;
+
+#define NVD_BUFFER_SCHEMA(type, minimum, maximum) \
+    { .minElementSize = sizeof(type), .minElements = (minimum), \
+      .maxElements = (maximum) }
+#define NVD_BUFFER_SCHEMA_BYTES(minimumSize, minimum, maximum) \
+    { .minElementSize = (minimumSize), .minElements = (minimum), \
+      .maxElements = (maximum) }
+
+bool nvValidateBufferSchema(const NVBuffer *buffer,
+                            const BufferSchema *schema);
+int nvdSelectPictureIndex(uint32_t allocatedCount, uint32_t surfaceLimit,
+                          uint32_t activeMask, uint32_t busyMask,
+                          uint32_t recycleCursor);
+
 // Internals exposed for the stats subsystem (src/stats.c).
 pid_t nv_gettid(void);
 FILE *nvStatsOutput(void);
@@ -328,6 +366,7 @@ FILE *nvStatsOutput(void);
 struct _NVCodec {
     ComputeCudaCodec    computeCudaCodec;
     HandlerFunc         handlers[VABufferTypeMax];
+    BufferSchema        schemas[VABufferTypeMax];
     int                 supportedProfileCount;
     const VAProfile     *supportedProfiles;
     CodecBeginPictureFunc beginPicture;
@@ -362,7 +401,14 @@ void nvBackingImageCopyColorMetadata(BackingImage *dst, const BackingImage *src)
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line);
 void logger(const char *filename, const char *function, int line, const char *msg, ...);
 bool nvdLogDebugEnabled(void);
-// True only when the client needs all exported planes to share one dma-buf modifier.
+typedef enum {
+    NVD_EXPORT_LAYOUT_PER_PLANE_NATURAL = 0,
+    NVD_EXPORT_LAYOUT_PER_PLANE_SHARED_MODIFIER,
+    NVD_EXPORT_LAYOUT_PACKED,
+} NVDExportLayout;
+
+NVDExportLayout nvdGetExportLayout(void);
+// Compatibility helper for the legacy packed-layout selector.
 bool nvdUseSingleBufferExport(void);
 #define CHECK_CUDA_RESULT(err) checkCudaErrors(err, __FILE__, __func__, __LINE__)
 #define CHECK_CUDA_RESULT_RETURN(err, ret) if (checkCudaErrors(err, __FILE__, __func__, __LINE__)) { return ret; }

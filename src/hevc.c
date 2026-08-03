@@ -1,17 +1,5 @@
-#define _GNU_SOURCE
-
 #include "vabackend.h"
 #include <stdlib.h>
-
-#if !defined(__GLIBC__)
-typedef int (*__compar_d_fn_t) (const void *, const void *, void *);
-#if defined(__FreeBSD__) && __FreeBSD__ < 14
-// https://github.com/freebsd/freebsd-src/commit/af3c78886fd8
-typedef int (*__old_compar_d_fn_t) (void *, const void *, const void *);
-#define qsort_r(base, nmemb, size, compar, thunk) \
-        qsort_r(base, nmemb, size, thunk, (__old_compar_d_fn_t)compar)
-#endif
-#endif
 
 static const uint8_t ff_hevc_diag_scan4x4_x[16] = {
     0, 0, 1, 0,
@@ -65,12 +53,34 @@ static const uint8_t ff_hevc_diag_scan8x8_y[64] = {
     5, 7, 6, 7,
 };
 
-static int sortFunc(const unsigned char *a, const unsigned char *b, int *POCV) {
-    return POCV[*a] < POCV[*b] ? -1 : 1;
-}
-
-static int sortFuncRev(const unsigned char *a, const unsigned char *b, int *POCV) {
-    return POCV[*a] < POCV[*b] ? 1 : -1;
+static void sortReferenceSet(unsigned char *refs, size_t count,
+                             const int *POCV, bool descending,
+                             bool descendingTie) {
+    // Equal POCs can occur for otherwise distinct reference entries.  Use the
+    // picture index as a deterministic secondary key instead of violating the
+    // qsort comparator contract.  NVDEC expects opposite tie ordering for the
+    // before and after reference sets, hence descendingTie is set per set.
+    for (size_t i = 1; i < count; i++) {
+        const unsigned char key = refs[i];
+        const int keyPOC = POCV[key];
+        size_t j = i;
+        while (j > 0) {
+            const unsigned char previous = refs[j - 1];
+            const int previousPOC = POCV[previous];
+            const bool pocOutOfOrder = descending
+                ? previousPOC < keyPOC
+                : previousPOC > keyPOC;
+            const bool tieOutOfOrder = previousPOC == keyPOC &&
+                (descendingTie ? previous < key : previous > key);
+            const bool outOfOrder = pocOutOfOrder || tieOutOfOrder;
+            if (!outOfOrder) {
+                break;
+            }
+            refs[j] = refs[j - 1];
+            j--;
+        }
+        refs[j] = key;
+    }
 }
 
 
@@ -171,12 +181,22 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
     ppc->deblocking_filter_override_enabled_flag = buf->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag;
     ppc->pps_deblocking_filter_disabled_flag = buf->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag;
 
+    const size_t tileColumnCount = (size_t) buf->num_tile_columns_minus1 + 1U;
+    const size_t tileRowCount = (size_t) buf->num_tile_rows_minus1 + 1U;
+    if (tileColumnCount > ARRAY_SIZE(buf->column_width_minus1) ||
+        tileColumnCount > ARRAY_SIZE(ppc->column_width_minus1) ||
+        tileRowCount > ARRAY_SIZE(buf->row_height_minus1) ||
+        tileRowCount > ARRAY_SIZE(ppc->row_height_minus1)) {
+        ctx->inputValidationFailed = true;
+        return;
+    }
+
     ppc->tiles_enabled_flag = buf->pic_fields.bits.tiles_enabled_flag;
     ppc->uniform_spacing_flag = 1;
     ppc->num_tile_columns_minus1 = buf->num_tile_columns_minus1;
     ppc->num_tile_rows_minus1 = buf->num_tile_rows_minus1;
 
-    if (ppc->tiles_enabled_flag && ppc->num_tile_columns_minus1 > 0) {
+    if (ppc->tiles_enabled_flag) {
         for (int i = 0; i < ppc->num_tile_columns_minus1; i++) {
             if (buf->column_width_minus1[i] != buf->column_width_minus1[i+1]) {
                 ppc->uniform_spacing_flag = 0;
@@ -262,8 +282,12 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
     //This is required to make sure that the RefPicSetStCurrBefore and RefPicSetStCurrAfter arrays are in the correct order
     //VA-API doesn't pass this is, only marking each picture if it's in the arrays.
     //I'm not sure this is correct
-    qsort_r(ppc->RefPicSetStCurrBefore, ppc->NumPocStCurrBefore, sizeof(unsigned char), (__compar_d_fn_t) sortFuncRev, ppc->PicOrderCntVal);
-    qsort_r(ppc->RefPicSetStCurrAfter, ppc->NumPocStCurrAfter, sizeof(unsigned char), (__compar_d_fn_t) sortFunc, ppc->PicOrderCntVal);
+    sortReferenceSet(ppc->RefPicSetStCurrBefore,
+                     ppc->NumPocStCurrBefore, ppc->PicOrderCntVal, true,
+                     false);
+    sortReferenceSet(ppc->RefPicSetStCurrAfter,
+                     ppc->NumPocStCurrAfter, ppc->PicOrderCntVal, false,
+                     true);
 }
 
 static void copyHEVCSliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams)
@@ -365,6 +389,12 @@ const DECLARE_CODEC(hevcCodec) = {
         [VAIQMatrixBufferType] = copyHEVCIQMatrix,
         [VASliceParameterBufferType] = copyHEVCSliceParam,
         [VASliceDataBufferType] = copyHEVCSliceData,
+    },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VAPictureParameterBufferHEVC, 1, 1),
+        [VAIQMatrixBufferType] = NVD_BUFFER_SCHEMA(VAIQMatrixBufferHEVC, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferHEVC, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
     },
     .supportedProfileCount = ARRAY_SIZE(hevcSupportedProfiles),
     .supportedProfiles = hevcSupportedProfiles,

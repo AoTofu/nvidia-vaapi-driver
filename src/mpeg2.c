@@ -172,6 +172,12 @@ const DECLARE_CODEC(mpeg2Codec) = {
         [VASliceParameterBufferType] = copyMPEG2SliceParam,
         [VASliceDataBufferType] = copyMPEG2SliceData,
     },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VAPictureParameterBufferMPEG2, 1, 1),
+        [VAIQMatrixBufferType] = NVD_BUFFER_SCHEMA(VAIQMatrixBufferMPEG2, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferMPEG2, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+    },
     .supportedProfileCount = ARRAY_SIZE(mpeg2SupportedProfiles),
     .supportedProfiles = mpeg2SupportedProfiles,
 };

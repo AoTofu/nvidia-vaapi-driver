@@ -138,6 +138,12 @@ const DECLARE_DISABLED_CODEC(mpeg4Codec) = {
         [VASliceParameterBufferType] = copyMPEG4SliceParam,
         [VASliceDataBufferType] = copyMPEG4SliceData,
     },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VAPictureParameterBufferMPEG4, 1, 1),
+        [VAIQMatrixBufferType] = NVD_BUFFER_SCHEMA(VAIQMatrixBufferMPEG4, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferMPEG4, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+    },
     .supportedProfileCount = ARRAY_SIZE(mpeg4SupportProfiles),
     .supportedProfiles = mpeg4SupportProfiles,
 };
