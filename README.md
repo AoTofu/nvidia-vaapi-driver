@@ -64,13 +64,13 @@ cd nvidia-vaapi-driver
 ./install.sh --deps --clean
 ```
 
-The installer builds the driver, backs up any existing `nvidia_drv_video.so`, installs the new driver into libva's driver directory, and runs a `vainfo` smoke test when possible. To skip dependency installation:
+The installer builds the driver, backs up any existing `nvidia_drv_video.so`, installs the new driver into libva's driver directory, runs a `vainfo` smoke test when possible, and automatically enables the driver in installed Chrome/Chromium desktop launchers for the current user. Existing custom launchers are preserved and backed up before the required environment and flags are merged. Fully close and reopen Chrome after installation. To skip dependency installation:
 
 ```sh
 ./install.sh --clean
 ```
 
-The installer prints a rollback command if it replaced an existing driver. When Chrome or Chromium is installed, it also prints a reusable command that selects this VA-API driver. To print that command without rebuilding or installing anything:
+The installer prints a rollback command if it replaced an existing driver. No additional Chrome command is required after the normal quick-install steps. Use `--no-chrome-integration` if the installer should leave desktop launchers unchanged. When Chrome or Chromium is installed, the installer also prints a reusable command that selects this VA-API driver. To print that command without rebuilding or installing anything:
 
 ```sh
 ./install.sh --print-chrome-command
@@ -199,7 +199,7 @@ The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or
 ./install.sh --launch-chrome --chrome-wayland -- https://example.com/
 ```
 
-Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=auto`. It does not modify desktop entries or global browser configuration. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
+Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=auto`. Normal installation creates current-user desktop overrides with the same settings; it does not change system desktop files or global browser policy. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
 
 Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
