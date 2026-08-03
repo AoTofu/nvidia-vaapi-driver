@@ -233,6 +233,11 @@ const DECLARE_CODEC(vp9Codec) = {
         [VASliceParameterBufferType] = copyVP9SliceParam,
         [VASliceDataBufferType] = copyVP9SliceData,
     },
+    .schemas = {
+        [VAPictureParameterBufferType] = NVD_BUFFER_SCHEMA(VADecPictureParameterBufferVP9, 1, 1),
+        [VASliceParameterBufferType] = NVD_BUFFER_SCHEMA(VASliceParameterBufferVP9, 1, 0),
+        [VASliceDataBufferType] = NVD_BUFFER_SCHEMA_BYTES(1, 1, 0),
+    },
     .supportedProfileCount = ARRAY_SIZE(vp9SupportedProfiles),
     .supportedProfiles = vp9SupportedProfiles,
     .destroy = destroyVP9Context,
