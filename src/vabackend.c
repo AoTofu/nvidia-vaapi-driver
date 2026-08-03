@@ -953,10 +953,12 @@ static int assignSurfacePictureIndex(NVContext *nvCtx, NVSurface *surface,
                   selected, nvCtx->activeReferenceMask, previousOwner, surface);
         pthread_mutex_lock(&previousOwner->mutex);
         if (previousOwner->pictureIdx == selected) {
+            // The NVDEC index can be reused after resolve without invalidating
+            // the decoded backing image. Keep the context association so a
+            // client may still synchronize or read the old surface (for
+            // example, FFmpeg's delayed vaGetImage) until the context is
+            // destroyed or the surface is assigned to another context.
             previousOwner->pictureIdx = -1;
-            if (previousOwner->context == nvCtx) {
-                previousOwner->context = NULL;
-            }
         }
         pthread_mutex_unlock(&previousOwner->mutex);
     }
