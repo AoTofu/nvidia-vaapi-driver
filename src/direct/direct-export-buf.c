@@ -347,6 +347,13 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
 static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
                                       uint32_t plane) {
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+    // The minimum supported ffnvcodec loader only exposes cuMemsetD8Async.
+    // Multi-byte neutral patterns (P010/P016 and ARGB) therefore continue to
+    // use the host staging fallback instead of depending on newer loader
+    // members that may be absent at build time.
+    if (img->format == NV_FORMAT_ARGB || fmtInfo->bppc != 1) {
+        return false;
+    }
     const NVFormatPlane *p = &fmtInfo->plane[plane];
     const uint32_t width = nvPlaneExtent(img->width, p->ss.x);
     const uint32_t height = nvPlaneExtent(img->height, p->ss.y);
@@ -369,19 +376,9 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
     pthread_mutex_lock(&drv->securityClearMutex);
     bool failed = !ensureSecurityClearResourcesLocked(drv, chunkBytes);
     if (!failed) {
-        if (img->format == NV_FORMAT_ARGB) {
-            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD32Async(
-                drv->securityClearBuffer, 0xff000000U,
-                chunkBytes / sizeof(uint32_t), drv->securityClearStream));
-        } else if (fmtInfo->bppc == 1) {
-            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD8Async(
-                drv->securityClearBuffer, plane == 0 ? 16 : 128,
-                chunkBytes, drv->securityClearStream));
-        } else {
-            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD16Async(
-                drv->securityClearBuffer, plane == 0 ? 0x1000 : 0x8000,
-                chunkBytes / sizeof(uint16_t), drv->securityClearStream));
-        }
+        failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD8Async(
+            drv->securityClearBuffer, plane == 0 ? 16 : 128,
+            chunkBytes, drv->securityClearStream));
     }
 
     for (uint32_t y = 0; !failed && y < height; y += chunkRows) {
@@ -419,7 +416,9 @@ static bool clearBackingImage(NVDriver *drv, BackingImage *img) {
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         if (!clearBackingImagePlaneGpu(drv, img, i)) {
             nvStatsIncrement(drv, NV_STAT_SECURITY_CLEAR_HOST_FALLBACKS);
-            LOG("GPU backing-image clear failed; falling back to host staging");
+            if (img->format != NV_FORMAT_ARGB && fmtInfo->bppc == 1) {
+                LOG("GPU backing-image clear failed; falling back to host staging");
+            }
             if (!clearBackingImagePlaneHost(drv, img, i)) {
                 return false;
             }
