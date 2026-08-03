@@ -18,6 +18,7 @@
 
 #include <drm.h>
 #include <drm_fourcc.h>
+#include <errno.h>
 
 #ifndef CUDA_ARRAY3D_SURFACE_LDST
 #define CUDA_ARRAY3D_SURFACE_LDST 0x02
@@ -98,8 +99,8 @@ static bool import_to_cuda(NVDriver *drv, NVDriverImage *image, int bpc, int cha
 
     //For some reason, this close *must* be *here*, otherwise we will get random visual glitches.
     close(image->nvFd2);
-    image->nvFd = 0;
-    image->nvFd2 = 0;
+    image->nvFd = -1;
+    image->nvFd2 = -1;
 
     CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mipmapArrayDesc = {
         .arrayDesc = {
@@ -146,31 +147,35 @@ static bool direct_initExporter(NVDriver *drv) {
             nvdGpu = 0;
         }
 
-        int fd;
+        int fd = -1;
         int nvIdx = 0;
-        uint8_t drmIdx = 128;
         char node[20] = {0, };
-        do {
+        for (uint16_t drmIdx = 128; drmIdx < 128 + 16; drmIdx++) {
             LOG("Searching for GPU: %d %d %d", nvIdx, nvdGpu, drmIdx)
-            snprintf(node, 20, "/dev/dri/renderD%d", drmIdx++);
+            snprintf(node, sizeof(node), "/dev/dri/renderD%u", drmIdx);
             fd = open(node, O_RDWR|O_CLOEXEC);
             if (fd == -1) {
-                LOG("Unable to find NVIDIA GPU %d", nvdGpu);
-                return false;
+                continue;
             }
 
             if (!isNvidiaDrmFd(fd, true) || !checkModesetParameterFromFd(fd)) {
                 close(fd);
+                fd = -1;
                 continue;
             }
 
             if (nvIdx != nvdGpu) {
                 close(fd);
+                fd = -1;
                 nvIdx++;
                 continue;
             }
             break;
-        } while (drmIdx < 128 + 16);
+        }
+        if (fd < 0) {
+            LOG("Unable to find NVIDIA GPU %d", nvdGpu);
+            return false;
+        }
 
         drv->drmFd = fd;
         LOG("Found NVIDIA GPU %d at %s", nvdGpu, node);
@@ -180,7 +185,12 @@ static bool direct_initExporter(NVDriver *drv) {
         }
 
         //dup it so we can close it later and not effect firefox
-        drv->drmFd = dup(drv->drmFd);
+        const int duplicatedFd = dup(drv->drmFd);
+        if (duplicatedFd < 0) {
+            LOG("Unable to duplicate DRM fd: %s", strerror(errno));
+            return false;
+        }
+        drv->drmFd = duplicatedFd;
     }
 
     const bool ret = init_nvdriver(&drv->driverContext, drv->drmFd);
@@ -243,11 +253,12 @@ static void fillBackingImageClearRows(uint8_t *rows, size_t widthInBytes, uint32
     }
 }
 
-static bool clearBackingImagePlane(NVDriver *drv, BackingImage *img, uint32_t plane) {
+static bool clearBackingImagePlaneHost(NVDriver *drv, BackingImage *img,
+                                       uint32_t plane) {
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     const NVFormatPlane *p = &fmtInfo->plane[plane];
-    const uint32_t width = img->width >> p->ss.x;
-    const uint32_t height = img->height >> p->ss.y;
+    const uint32_t width = nvPlaneExtent(img->width, p->ss.x);
+    const uint32_t height = nvPlaneExtent(img->height, p->ss.y);
     const size_t widthInBytes = (size_t) width * fmtInfo->bppc * p->channelCount;
     if (widthInBytes == 0 || height == 0) {
         return true;
@@ -302,12 +313,116 @@ static bool clearBackingImagePlane(NVDriver *drv, BackingImage *img, uint32_t pl
     return !failed;
 }
 
+static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
+                                               size_t requiredBytes) {
+    if (drv->securityClearStream == NULL &&
+        CHECK_CUDA_RESULT(drv->cu->cuStreamCreate(
+            &drv->securityClearStream, CU_STREAM_NON_BLOCKING))) {
+        return false;
+    }
+    if (drv->securityClearBufferSize >= requiredBytes &&
+        drv->securityClearBuffer != 0) {
+        return true;
+    }
+
+    if (drv->securityClearBuffer != 0) {
+        if (CHECK_CUDA_RESULT(
+                drv->cu->cuStreamSynchronize(drv->securityClearStream)) ||
+            CHECK_CUDA_RESULT(drv->cu->cuMemFree(
+                drv->securityClearBuffer))) {
+            return false;
+        }
+        drv->securityClearBuffer = 0;
+        drv->securityClearBufferSize = 0;
+    }
+    if (CHECK_CUDA_RESULT(drv->cu->cuMemAlloc(
+            &drv->securityClearBuffer, requiredBytes))) {
+        drv->securityClearBuffer = 0;
+        return false;
+    }
+    drv->securityClearBufferSize = requiredBytes;
+    return true;
+}
+
+static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
+                                      uint32_t plane) {
+    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+    const NVFormatPlane *p = &fmtInfo->plane[plane];
+    const uint32_t width = nvPlaneExtent(img->width, p->ss.x);
+    const uint32_t height = nvPlaneExtent(img->height, p->ss.y);
+    const size_t widthInBytes =
+        (size_t) width * fmtInfo->bppc * p->channelCount;
+    if (widthInBytes == 0 || height == 0) {
+        return true;
+    }
+
+    const size_t maxChunkBytes = 8 * 1024 * 1024;
+    uint32_t chunkRows = (uint32_t) (maxChunkBytes / widthInBytes);
+    if (chunkRows == 0) {
+        chunkRows = 1;
+    }
+    if (chunkRows > height) {
+        chunkRows = height;
+    }
+    const size_t chunkBytes = widthInBytes * chunkRows;
+
+    pthread_mutex_lock(&drv->securityClearMutex);
+    bool failed = !ensureSecurityClearResourcesLocked(drv, chunkBytes);
+    if (!failed) {
+        if (img->format == NV_FORMAT_ARGB) {
+            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD32Async(
+                drv->securityClearBuffer, 0xff000000U,
+                chunkBytes / sizeof(uint32_t), drv->securityClearStream));
+        } else if (fmtInfo->bppc == 1) {
+            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD8Async(
+                drv->securityClearBuffer, plane == 0 ? 16 : 128,
+                chunkBytes, drv->securityClearStream));
+        } else {
+            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD16Async(
+                drv->securityClearBuffer, plane == 0 ? 0x1000 : 0x8000,
+                chunkBytes / sizeof(uint16_t), drv->securityClearStream));
+        }
+    }
+
+    for (uint32_t y = 0; !failed && y < height; y += chunkRows) {
+        const uint32_t rowsToCopy = chunkRows < height - y
+            ? chunkRows : height - y;
+        CUDA_MEMCPY2D cpy = {
+            .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+            .srcDevice = drv->securityClearBuffer,
+            .srcPitch = widthInBytes,
+            .dstMemoryType = CU_MEMORYTYPE_ARRAY,
+            .dstArray = img->arrays[plane],
+            .dstY = y,
+            .WidthInBytes = widthInBytes,
+            .Height = rowsToCopy,
+        };
+        failed = CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(
+            &cpy, drv->securityClearStream));
+        if (!failed) {
+            const uint64_t bytes = (uint64_t) widthInBytes * rowsToCopy;
+            nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_BYTES, bytes);
+            nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_GPU_BYTES, bytes);
+        }
+    }
+    if (!failed) {
+        failed = CHECK_CUDA_RESULT(
+            drv->cu->cuStreamSynchronize(drv->securityClearStream));
+    }
+    pthread_mutex_unlock(&drv->securityClearMutex);
+    return !failed;
+}
+
 static bool clearBackingImage(NVDriver *drv, BackingImage *img) {
     const uint64_t start = nvStatsTimestamp(drv);
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (!clearBackingImagePlane(drv, img, i)) {
-            return false;
+        if (!clearBackingImagePlaneGpu(drv, img, i)) {
+            nvStatsIncrement(drv, NV_STAT_SECURITY_CLEAR_HOST_FALLBACKS);
+            LOG("GPU backing-image clear failed; falling back to host staging");
+            if (!clearBackingImagePlaneHost(drv, img, i)) {
+                return false;
+            }
         }
     }
     const uint64_t end = nvStatsTimestamp(drv);
@@ -433,8 +548,15 @@ static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
 // own object, so per-plane importers (mpv/GStreamer/ffmpeg) detile the chroma plane
 // correctly -- unlike the single-buffer layout, where chroma sits at a non-zero offset
 // inside a shared tiled buffer and those importers mis-detile it.
-static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv, NVSurface *surface) {
+static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv,
+                                                          NVSurface *surface,
+                                                          bool sharedModifier) {
     NVDriverImage driverImages[3] = { 0 };
+    for (uint32_t i = 0; i < ARRAY_SIZE(driverImages); i++) {
+        driverImages[i].nvFd = -1;
+        driverImages[i].nvFd2 = -1;
+        driverImages[i].drmFd = -1;
+    }
     BackingImage *backingImage = calloc(1, sizeof(BackingImage));
     if (backingImage == NULL) {
         return NULL;
@@ -450,14 +572,15 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv, NVSurfa
     backingImage->format = nvFormatForSurface(surface);
     const NVFormatInfo *fmtInfo = &formatsInfo[backingImage->format];
 
-    // Reuse the layout purely to obtain each plane's block height and pitch/aligned
-    // size; the packed offsets it returns are ignored (each plane is offset 0 in its
-    // own buffer). Pass unifyBlockHeight=false: each plane is its own dma-buf object
-    // with its own modifier, so it keeps its natural per-plane block height and
-    // matches what the decoder produced (see calculate_unified_image_layout).
+    // The packed offsets returned here are ignored because each plane starts at
+    // offset zero in its own object. Generic clients use natural per-plane block
+    // heights; Chromium/ANGLE uses the largest block height for every plane so
+    // every object advertises one shared modifier.
     calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
-                                   fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane, false);
-    LOG_DEBUG("Allocating per-plane BackingImage: %p %ux%u", backingImage, surface->width, surface->height);
+                                   fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane,
+                                   sharedModifier);
+    LOG_DEBUG("Allocating per-plane BackingImage: %p %ux%u shared_modifier=%d",
+              backingImage, surface->width, surface->height, sharedModifier);
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         int memFd = -1, memFd2 = -1, drmFd = -1;
@@ -482,18 +605,16 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv, NVSurfa
         backingImage->fds[i] = drmFd;
         cacheBackingImageFdStat(backingImage, (int) i);
 
-        // Create the array at the plane's natural height. Each plane is its own object
-        // carrying its own modifier, and calculate_unified_image_layout (called with
-        // unifyBlockHeight=false) already advertised each plane's per-plane block height.
-        // Handing CUDA the natural height makes it derive that same per-plane block, so
-        // the array tiling matches the modifier. (Rounding up to the shared max block --
-        // as the single-buffer path must -- would instead make CUDA pick the larger block
-        // and disagree with the per-plane modifier -> the importer detiles wrong -> green
-        // chroma, e.g. NV12 chroma at a 256x144 coded height.)
+        // CUDA derives block height from the array height. For shared-modifier
+        // objects use the aligned allocation height, just like the packed path;
+        // for natural objects use the visible plane height.
+        const uint32_t arrayHeight = sharedModifier && driverImages[i].pitch != 0
+            ? driverImages[i].memorySize / driverImages[i].pitch
+            : driverImages[i].height;
         CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC mipmapArrayDesc = {
             .arrayDesc = {
                 .Width = driverImages[i].width,
-                .Height = driverImages[i].height,
+                .Height = arrayHeight,
                 .Depth = 0,
                 .Format = fmtInfo->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
                 .NumChannels = fmtInfo->plane[i].channelCount,
@@ -532,6 +653,11 @@ fail:
 
 static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface *surface) {
     NVDriverImage driverImages[3] = { 0 };
+    for (uint32_t i = 0; i < ARRAY_SIZE(driverImages); i++) {
+        driverImages[i].nvFd = -1;
+        driverImages[i].nvFd2 = -1;
+        driverImages[i].drmFd = -1;
+    }
     BackingImage *backingImage = calloc(1, sizeof(BackingImage));
     if (backingImage == NULL) {
         return NULL;
@@ -647,30 +773,22 @@ fail:
 }
 
 static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *surface) {
-    // Multi-plane YUV surfaces must be exported as a single buffer holding every
-    // plane at an offset, so all planes share one DRM modifier. Chromium's
-    // vaapi_wrapper enforces one-modifier-per-buffer, so a per-plane export (a
-    // distinct modifier per fd) trips its CHECK and aborts the GPU process.
-    // Single-plane / packed surfaces (e.g. RGB) have nothing to unify and use the
-    // straightforward per-plane allocator below.
     if (!isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
-        // Multi-plane YUV: give every plane one shared block-linear modifier (required by
-        // Chromium's one-modifier-per-buffer rule) but put each plane in its OWN dma-buf
-        // object at offset 0. Packing the planes into a single buffer (chroma at a non-zero
-        // offset) is imported fine by Chromium's multi-plane path but mis-detiled by
-        // per-plane importers (mpv/GStreamer/ffmpeg), which import each layer as a
-        // standalone dma-buf and can't handle a tiled plane starting at a byte offset. The
-        // Chrome cannot represent different modifiers for separate objects, so
-        // nvdUseSingleBufferExport selects the packed path only for Chromium (or
-        // an explicit NVD_SINGLE_BUFFER override). Other clients keep a2833b2's
-        // natural per-plane block heights and offset-zero dma-buf objects.
-        if (nvdUseSingleBufferExport()) {
+        const NVDExportLayout layout = nvdGetExportLayout();
+        if (layout == NVD_EXPORT_LAYOUT_PACKED) {
             return direct_allocateBackingImage_single(drv, surface);
         }
-        return direct_allocateBackingImage_perPlane(drv, surface);
+        return direct_allocateBackingImage_perPlane(
+            drv, surface,
+            layout == NVD_EXPORT_LAYOUT_PER_PLANE_SHARED_MODIFIER);
     }
 
     NVDriverImage driverImages[3] = { 0 };
+    for (uint32_t i = 0; i < ARRAY_SIZE(driverImages); i++) {
+        driverImages[i].nvFd = -1;
+        driverImages[i].nvFd2 = -1;
+        driverImages[i].drmFd = -1;
+    }
     BackingImage *backingImage = calloc(1, sizeof(BackingImage));
     if (backingImage == NULL) {
         return NULL;
@@ -687,7 +805,9 @@ static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *s
 
     LOG_DEBUG("Allocating BackingImages: %p %dx%d", backingImage, surface->width, surface->height);
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (!alloc_image(&drv->driverContext, surface->width >> p[i].ss.x, surface->height >> p[i].ss.y,
+        if (!alloc_image(&drv->driverContext,
+                         nvPlaneExtent(surface->width, p[i].ss.x),
+                         nvPlaneExtent(surface->height, p[i].ss.y),
                          p[i].channelCount, 8 * fmtInfo->bppc, p[i].fourcc, &driverImages[i])) {
             goto bail;
         }
@@ -715,13 +835,13 @@ bail:
     // release any CUDA arrays/external-memory already imported by import_to_cuda
     // and the sync mutex/cond -- a plain free() here leaked all of those.
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (driverImages[i].nvFd != 0) {
+        if (driverImages[i].nvFd >= 0) {
             close(driverImages[i].nvFd);
         }
-        if (driverImages[i].nvFd2 != 0) {
+        if (driverImages[i].nvFd2 >= 0) {
             close(driverImages[i].nvFd2);
         }
-        if (driverImages[i].drmFd != 0) {
+        if (driverImages[i].drmFd >= 0) {
             close(driverImages[i].drmFd);
         }
     }
@@ -922,8 +1042,8 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
     bool failed = false;
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
-        const uint32_t widthInBytes = (surface->width >> p->ss.x) * fmtInfo->bppc * p->channelCount;
-        const uint32_t height = surface->height >> p->ss.y;
+        const uint32_t widthInBytes = nvPlaneExtent(surface->width, p->ss.x) * fmtInfo->bppc * p->channelCount;
+        const uint32_t height = nvPlaneExtent(surface->height, p->ss.y);
         if (hostDestination) {
             CUDA_MEMCPY2D cpy = {
                 .srcMemoryType = CU_MEMORYTYPE_DEVICE,
@@ -974,20 +1094,20 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         failed = true;
     }
     if (!hostDestination && !failed) {
-        failed = completeEvent != NULL
-            ? CHECK_CUDA_RESULT(drv->cu->cuEventRecord(completeEvent, stream)) ||
-              CHECK_CUDA_RESULT(drv->cu->cuEventSynchronize(completeEvent))
-            : CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream));
+        if (completeEvent != NULL) {
+            failed = CHECK_CUDA_RESULT(drv->cu->cuEventRecord(completeEvent, stream));
+        }
+        if (!failed) {
+            // The exported external-memory array is consumed outside CUDA.
+            // A completed event alone was not consistently sufficient on the
+            // release-build hardware matrix; synchronize the owning stream
+            // before NVDEC unmap and publication.
+            failed = CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream));
+        }
     }
     if (failed) {
         return false;
     }
-
-    //notify anyone waiting for us to be resolved
-    pthread_mutex_lock(&surface->mutex);
-    surface->resolving = 0;
-    pthread_cond_broadcast(&surface->cond);
-    pthread_mutex_unlock(&surface->mutex);
 
     return true;
 }
@@ -1051,17 +1171,9 @@ static BackingImage *resolveSyncImage(BackingImage *img) {
     return img;
 }
 
-static void finishSurfaceResolve(NVSurface *surface) {
-    pthread_mutex_lock(&surface->mutex);
-    surface->resolving = 0;
-    pthread_cond_broadcast(&surface->cond);
-    pthread_mutex_unlock(&surface->mutex);
-}
-
 static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
                                  uint32_t pitch, CUstream stream, CUevent completeEvent) {
     if (!direct_realiseSurface(drv, surface)) {
-        finishSurfaceResolve(surface);
         return false;
     }
 
@@ -1080,14 +1192,17 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
         }
         nvBackingImageStoreSurfaceColorMetadata(img, surface);
         bool copied = copyFrameToSurface(drv, ptr, surface, pitch, stream, completeEvent);
-        if (syncImg != NULL && syncImg->syncInitialized) {
+        // The resolve worker clears an asynchronous image only after NVDEC
+        // unmap. Publishing the backing image here permits an exporter to race
+        // that final ownership transition even though the CUDA copy completed.
+        if ((completeEvent == NULL || !copied) &&
+            syncImg != NULL && syncImg->syncInitialized) {
             pthread_mutex_lock(&syncImg->mutex);
             syncImg->resolving = false;
             pthread_cond_broadcast(&syncImg->cond);
             pthread_mutex_unlock(&syncImg->mutex);
         }
         if (!copied) {
-            finishSurfaceResolve(surface);
             return false;
         }
     } else {

@@ -211,7 +211,7 @@ static bool nv_get_versions(const int fd, char **versionString) {
         //Fall back to reading a file from /proc.
         int procFd = open("/proc/driver/nvidia/version", O_RDONLY);
         bool successful = false;
-        if (procFd > 0) {
+        if (procFd >= 0) {
             char buf[257];
             ssize_t readBytes = read(procFd, buf, 256);
             close(procFd);
@@ -363,6 +363,12 @@ static bool query_ram_location(NVDriverContext *context) {
 
 bool init_nvdriver(NVDriverContext *context, const int drmFd) {
     LOG("Initing nvdriver...")
+    if (context == NULL || drmFd < 0) {
+        return false;
+    }
+    context->nvctlFd = -1;
+    context->nv0Fd = -1;
+    context->drmFd = -1;
     int nv0Fd = -1;
 
     int nvctlFd = open("/dev/nvidiactl", O_RDWR|O_CLOEXEC);
@@ -493,21 +499,38 @@ err:
 }
 
 bool free_nvdriver(NVDriverContext *context) {
-    nv_free_object(context->nvctlFd, context->clientObject, context->subdeviceObject);
-    nv_free_object(context->nvctlFd, context->clientObject, context->deviceObject);
-    nv_free_object(context->nvctlFd, context->clientObject, context->clientObject);
+    if (context == NULL) {
+        return false;
+    }
+    if (context->nvctlFd >= 0) {
+        if (context->subdeviceObject != 0) {
+            nv_free_object(context->nvctlFd, context->clientObject,
+                           context->subdeviceObject);
+        }
+        if (context->deviceObject != 0) {
+            nv_free_object(context->nvctlFd, context->clientObject,
+                           context->deviceObject);
+        }
+        if (context->clientObject != 0) {
+            nv_free_object(context->nvctlFd, context->clientObject,
+                           context->clientObject);
+        }
+    }
 
-    if (context->nvctlFd > 0) {
+    if (context->nvctlFd >= 0) {
         close(context->nvctlFd);
     }
-    if (context->drmFd > 0) {
+    if (context->drmFd >= 0) {
         close(context->drmFd);
     }
-    if (context->nv0Fd > 0) {
+    if (context->nv0Fd >= 0) {
         close(context->nv0Fd);
     }
 
     memset(context, 0, sizeof(NVDriverContext));
+    context->nvctlFd = -1;
+    context->nv0Fd = -1;
+    context->drmFd = -1;
     return true;
 }
 
@@ -589,7 +612,7 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
 
  err:
     LOG("error")
-    if (nvctlFd2 > 0) {
+    if (nvctlFd2 >= 0) {
         close(nvctlFd2);
     }
 
@@ -661,7 +684,7 @@ uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriver
      //     detile it wrong -> green chroma.
      uint32_t perPlaneLog2Y[3] = { 0 };
      for (uint32_t i = 0; i < numPlanes; i++) {
-         const uint32_t planeHeight = height >> planes[i].ss.y;
+         const uint32_t planeHeight = nvPlaneExtent(height, planes[i].ss.y);
          perPlaneLog2Y[i] = calculate_log2_gobs_per_block_y(planeHeight);
      }
 
@@ -675,8 +698,8 @@ uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriver
      uint32_t offset = 0;
      for (uint32_t i = 0; i < numPlanes; i++) {
          const uint32_t log2GobsPerBlockY = unifyBlockHeight ? unifiedLog2Y : perPlaneLog2Y[i];
-         const uint32_t planeWidth = width >> planes[i].ss.x;
-         const uint32_t planeHeight = height >> planes[i].ss.y;
+         const uint32_t planeWidth = nvPlaneExtent(width, planes[i].ss.x);
+         const uint32_t planeHeight = nvPlaneExtent(height, planes[i].ss.y);
          const uint32_t bytesPerPixel = planes[i].channelCount * bppc;
 
          const uint32_t widthInBytes = ROUND_UP(planeWidth * bytesPerPixel, GOB_WIDTH_IN_BYTES << log2GobsPerBlockX);

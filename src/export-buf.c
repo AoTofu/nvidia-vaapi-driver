@@ -497,8 +497,8 @@ static BackingImage *egl_allocateBackingImageImpl(NVDriver *drv, const NVSurface
         .Format = eglframe.cuFormat
     };
     CUDA_ARRAY3D_DESCRIPTOR arr2Desc = {
-        .Width = eglframe.width >> 1,
-        .Height = eglframe.height >> 1,
+        .Width = nvPlaneExtent(eglframe.width, 1),
+        .Height = nvPlaneExtent(eglframe.height, 1),
         .Depth = 0,
         .NumChannels = 2,
         .Flags = 0,
@@ -599,7 +599,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         .srcPitch = pitch,
         .dstMemoryType = CU_MEMORYTYPE_ARRAY,
         .dstArray = surface->backingImage->arrays[1],
-        .Height = surface->height >> 1,
+        .Height = nvPlaneExtent(surface->height, 1),
         .WidthInBytes = surface->width * bpp
     };
     CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2DAsync(&cpy2, stream), false);
@@ -607,16 +607,8 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
 
     if (completeEvent != NULL) {
         CHECK_CUDA_RESULT_RETURN(drv->cu->cuEventRecord(completeEvent, stream), false);
-        CHECK_CUDA_RESULT_RETURN(drv->cu->cuEventSynchronize(completeEvent), false);
-    } else {
-        CHECK_CUDA_RESULT_RETURN(drv->cu->cuStreamSynchronize(stream), false);
     }
-
-    //notify anyone waiting for us to be resolved
-    pthread_mutex_lock(&surface->mutex);
-    surface->resolving = 0;
-    pthread_cond_signal(&surface->cond);
-    pthread_mutex_unlock(&surface->mutex);
+    CHECK_CUDA_RESULT_RETURN(drv->cu->cuStreamSynchronize(stream), false);
 
     return true;
 }
@@ -726,7 +718,7 @@ static bool egl_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRMPRI
         desc->num_objects = 0;
         return false;
     }
-    desc->objects[1].size = img->width * (img->height >> 1) * bpp;
+    desc->objects[1].size = img->width * nvPlaneExtent(img->height, 1) * bpp;
     desc->objects[1].drm_format_modifier = img->mods[1];
 
     desc->layers[0].drm_format = img->fourcc == DRM_FORMAT_NV12 ? DRM_FORMAT_R8 : DRM_FORMAT_R16;

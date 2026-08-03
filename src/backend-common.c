@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 bool checkModesetParameterFromFd(int fd) {
-    if (fd > 0) {
+    if (fd >= 0) {
         //this ioctl should fail if modeset=0
         struct drm_get_cap caps = { .capability = DRM_CAP_DUMB_BUFFER };
         int ret = ioctl(fd, DRM_IOCTL_GET_CAP, &caps);
@@ -23,7 +23,7 @@ bool checkModesetParameterFromFd(int fd) {
 }
 
 bool isNvidiaDrmFd(int fd, bool log) {
-    if (fd > 0) {
+    if (fd >= 0) {
         char name[16] = {0};
         struct drm_version ver = {
             .name = name,
