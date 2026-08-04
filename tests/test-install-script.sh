@@ -107,3 +107,61 @@ if [ "$FIRST_HASH" != "$SECOND_HASH" ]; then
     echo "Chrome integration is not idempotent" >&2
     exit 1
 fi
+
+FLATPAK_USER_DATA="$TMP_DIR/flatpak-user-data"
+FLATPAK_SYSTEM_DATA="$TMP_DIR/flatpak-system-data"
+FLATPAK_APPLICATION_DIR="$FLATPAK_SYSTEM_DATA/applications"
+FLATPAK_SOURCE="$FLATPAK_APPLICATION_DIR/com.google.Chrome.desktop"
+FLATPAK_TARGET="$FLATPAK_USER_DATA/applications/com.google.Chrome.desktop"
+FLATPAK_OUTPUT="$TMP_DIR/flatpak-output"
+mkdir -p "$FLATPAK_APPLICATION_DIR"
+cat >"$FLATPAK_SOURCE" <<'EOF'
+[Desktop Entry]
+Name=Google Chrome
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=/app/bin/chrome --file-forwarding com.google.Chrome @@u %U @@
+EOF
+
+FLATPAK_HASH="$(sha256sum "$FLATPAK_SOURCE" | awk '{print $1}')"
+XDG_DATA_HOME="$FLATPAK_USER_DATA" XDG_DATA_DIRS="$FLATPAK_SYSTEM_DATA" \
+    "$ROOT_DIR/install.sh" --chrome-integration-only >"$FLATPAK_OUTPUT"
+grep -F "Skipping Flatpak Chrome launcher $FLATPAK_SOURCE" "$FLATPAK_OUTPUT"
+if [ -e "$FLATPAK_TARGET" ]; then
+    echo "Flatpak Chrome launcher was unexpectedly overridden" >&2
+    exit 1
+fi
+if [ "$FLATPAK_HASH" != "$(sha256sum "$FLATPAK_SOURCE" | awk '{print $1}')" ]; then
+    echo "Flatpak Chrome launcher was unexpectedly modified" >&2
+    exit 1
+fi
+
+FAIL_USER_DATA="$TMP_DIR/failure-user-data"
+FAIL_APPLICATION_DIR="$FAIL_USER_DATA/applications"
+FAIL_DESKTOP_FILE="$FAIL_APPLICATION_DIR/google-chrome.desktop"
+FAIL_BIN="$TMP_DIR/failure-bin"
+mkdir -p "$FAIL_APPLICATION_DIR" "$FAIL_BIN"
+cat >"$FAIL_DESKTOP_FILE" <<'EOF'
+[Desktop Entry]
+Name=Failure Chrome
+Exec=/opt/failure-chrome %U
+EOF
+cat >"$FAIL_BIN/cp" <<'EOF'
+#!/usr/bin/env bash
+exit 42
+EOF
+chmod +x "$FAIL_BIN/cp"
+
+FAIL_HASH="$(sha256sum "$FAIL_DESKTOP_FILE" | awk '{print $1}')"
+if PATH="$FAIL_BIN:$PATH" XDG_DATA_HOME="$FAIL_USER_DATA" \
+        XDG_DATA_DIRS="$TMP_DIR/no-system-data" \
+        "$ROOT_DIR/install.sh" --chrome-integration-only >/dev/null 2>&1; then
+    echo "Chrome integration ignored a launcher backup failure" >&2
+    exit 1
+fi
+if [ "$FAIL_HASH" != "$(sha256sum "$FAIL_DESKTOP_FILE" | awk '{print $1}')" ]; then
+    echo "Chrome launcher changed after its backup failed" >&2
+    exit 1
+fi
+if grep -Fq '# Managed by AoTofu nvidia-vaapi-driver install.sh' "$FAIL_DESKTOP_FILE"; then
+    echo "Chrome launcher was marked managed after its backup failed" >&2
+    exit 1
+fi
