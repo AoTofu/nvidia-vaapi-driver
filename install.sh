@@ -267,6 +267,24 @@ patch_chrome_exec() {
     printf '%s\n' "$command"
 }
 
+is_flatpak_chrome_desktop_file() {
+    local source="$1"
+    local line command
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" != Exec=* ]]; then
+            continue
+        fi
+        command="${line#Exec=}"
+        if [[ "$command" =~ (^|[[:space:]])([^[:space:]]*/)?flatpak[[:space:]]+run([[:space:]]|$) ]] ||
+           [[ "$command" =~ (^|[[:space:]])--file-forwarding([[:space:]]|$) ]] ||
+           [[ "$command" =~ (^|[[:space:]])@@[uf]?[[:space:]] ]]; then
+            return 0
+        fi
+    done <"$source"
+    return 1
+}
+
 patch_chrome_desktop_file() {
     local source="$1"
     local target="$2"
@@ -333,6 +351,10 @@ install_chrome_integration() {
         if [ -z "$source" ]; then
             continue
         fi
+        if is_flatpak_chrome_desktop_file "$source"; then
+            echo "Skipping Flatpak Chrome launcher $source; sandboxed launchers are not supported."
+            continue
+        fi
         patch_chrome_desktop_file "$source" "$target"
         echo "Enabled nvidia-vaapi-driver in $target"
         installed=$((installed + 1))
@@ -340,7 +362,7 @@ install_chrome_integration() {
 
     if [ "$installed" -eq 0 ]; then
         echo "No Chrome/Chromium desktop entry was found; launcher integration was skipped."
-        return 1
+        return 0
     fi
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$target_dir" >/dev/null 2>&1 || true
@@ -466,7 +488,7 @@ backup_existing_driver
 run_sudo meson install -C "$BUILD_DIR"
 
 if [ "$CHROME_INTEGRATION" -eq 1 ]; then
-    install_chrome_integration || true
+    install_chrome_integration
 fi
 
 if [ "$RUN_TEST" -eq 1 ]; then
