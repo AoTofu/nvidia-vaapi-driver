@@ -198,7 +198,7 @@ prepare_chrome_command() {
         "LIBVA_DRIVER_NAME=nvidia"
         "LIBVA_DRIVERS_PATH=$(driver_dir)"
         "NVD_BACKEND=direct"
-        "NVD_EXPORT_LAYOUT=auto"
+        "NVD_EXPORT_LAYOUT=packed"
     )
     CHROME_COMMAND=(
         "$chrome"
@@ -300,7 +300,7 @@ patch_chrome_exec() {
 
     # Apply in reverse display order because each missing assignment is
     # inserted immediately after /usr/bin/env.
-    command="$(ensure_exec_environment "$command" NVD_EXPORT_LAYOUT auto)"
+    command="$(ensure_exec_environment "$command" NVD_EXPORT_LAYOUT packed)"
     command="$(ensure_exec_environment "$command" NVD_BACKEND direct)"
     command="$(ensure_exec_environment "$command" LIBVA_DRIVERS_PATH "$(driver_dir)")"
     command="$(ensure_exec_environment "$command" LIBVA_DRIVER_NAME nvidia)"
