@@ -47,7 +47,48 @@ Environment:
   BUILD_DIR         Same as --build-dir.
   RENDER_DEVICE    Same as --render-device.
   CHROME_BIN        Same as --chrome-bin.
+  NVD_DRIVER_DIR    Override the VA-API driver directory used by Chrome integration.
+  NVD_ALLOW_UNSAFE_CLEAN=1
+                    Permit cleaning a marked build directory outside this checkout.
 EOF
+}
+
+canonicalize_build_dir() {
+    if [ -z "$BUILD_DIR" ]; then
+        echo "Build directory must not be empty." >&2
+        return 1
+    fi
+    if [[ "$BUILD_DIR" != /* ]]; then
+        BUILD_DIR="$ROOT_DIR/$BUILD_DIR"
+    fi
+    BUILD_DIR="$(realpath -m -- "$BUILD_DIR")"
+}
+
+validate_clean_build_dir() {
+    local canonical_home
+    canonical_home="$(realpath -m -- "$HOME")"
+
+    case "$BUILD_DIR" in
+        /|"$canonical_home"|"$ROOT_DIR")
+            echo "Refusing to clean dangerous build directory: $BUILD_DIR" >&2
+            return 1
+            ;;
+    esac
+    if [[ "$BUILD_DIR" != "$ROOT_DIR/"* ]] &&
+       [ "${NVD_ALLOW_UNSAFE_CLEAN:-0}" != 1 ]; then
+        echo "Refusing to clean a build directory outside $ROOT_DIR." >&2
+        echo "Set NVD_ALLOW_UNSAFE_CLEAN=1 only for a trusted marked directory." >&2
+        return 1
+    fi
+    if [ -e "$BUILD_DIR" ] && [ ! -d "$BUILD_DIR" ]; then
+        echo "Refusing to clean non-directory path: $BUILD_DIR" >&2
+        return 1
+    fi
+    if [ -d "$BUILD_DIR" ] &&
+       [ ! -f "$BUILD_DIR/.nvidia-vaapi-driver-build" ]; then
+        echo "Refusing to clean unmarked directory: $BUILD_DIR" >&2
+        return 1
+    fi
 }
 
 run_sudo() {
@@ -86,6 +127,10 @@ install_deps() {
 
 driver_dir() {
     local dir=""
+    if [ -n "${NVD_DRIVER_DIR:-}" ]; then
+        realpath -m -- "$NVD_DRIVER_DIR"
+        return
+    fi
     if command -v pkg-config >/dev/null 2>&1; then
         dir="$(pkg-config --variable=driverdir libva 2>/dev/null || true)"
     fi
@@ -462,6 +507,8 @@ fi
 
 cd "$ROOT_DIR"
 
+canonicalize_build_dir
+
 if [ "$INSTALL_DEPS" -eq 1 ]; then
     install_deps
 fi
@@ -474,7 +521,8 @@ for cmd in meson pkg-config; do
 done
 
 if [ "$CLEAN_BUILD" -eq 1 ]; then
-    rm -rf "$BUILD_DIR"
+    validate_clean_build_dir
+    rm -rf -- "$BUILD_DIR"
 fi
 
 if [ -d "$BUILD_DIR" ]; then
@@ -482,6 +530,7 @@ if [ -d "$BUILD_DIR" ]; then
 else
     meson setup "$BUILD_DIR" --prefix=/usr --buildtype=release
 fi
+touch "$BUILD_DIR/.nvidia-vaapi-driver-build"
 
 meson compile -C "$BUILD_DIR"
 backup_existing_driver

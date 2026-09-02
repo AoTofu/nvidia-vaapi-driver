@@ -24,6 +24,30 @@ EOF
 chmod +x "$FAKE_CHROME"
 export CAPTURE_FILE
 
+for DANGEROUS_BUILD_DIR in / "$HOME" "$ROOT_DIR"; do
+    if BUILD_DIR="$DANGEROUS_BUILD_DIR" \
+        "$ROOT_DIR/install.sh" --clean --no-test --no-chrome-integration \
+        >/dev/null 2>&1; then
+        echo "dangerous clean target was accepted: $DANGEROUS_BUILD_DIR" >&2
+        exit 1
+    fi
+done
+
+UNMARKED_BUILD_DIR="$ROOT_DIR/.install-test-unmarked-$$"
+mkdir -p "$UNMARKED_BUILD_DIR"
+touch "$UNMARKED_BUILD_DIR/must-survive"
+if BUILD_DIR="$UNMARKED_BUILD_DIR" \
+    "$ROOT_DIR/install.sh" --clean --no-test --no-chrome-integration \
+    >/dev/null 2>&1; then
+    echo "unmarked clean target was accepted" >&2
+    exit 1
+fi
+if [ ! -f "$UNMARKED_BUILD_DIR/must-survive" ]; then
+    echo "unmarked clean target was modified" >&2
+    exit 1
+fi
+rm -r -- "$UNMARKED_BUILD_DIR"
+
 PROFILE_ARG="--user-data-dir=$TMP_DIR/Profile Test"
 URL_ARG='https://example.test/watch?v=1&codec=h264'
 COMMAND="$({
