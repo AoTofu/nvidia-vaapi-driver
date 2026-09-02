@@ -101,6 +101,7 @@ static JPEGContext *getJPEGContext(NVContext *ctx, bool createIfMissing) {
         ctx->codecData = calloc(1, sizeof(JPEGContext));
         if (ctx->codecData == NULL) {
             LOG("JPEG: Failed to allocate codec context");
+            ctx->bitstreamBuffer.failed = true;
             return NULL;
         }
     }
@@ -696,11 +697,15 @@ static void copyJPEGSliceData(NVContext *ctx, NVBuffer *buf, CUVIDPICPARAMS *pic
     JPEGContext *jpegCtx = getJPEGContext(ctx, false);
     if (jpegCtx == NULL) {
         LOG("JPEG: No codec context available");
+        if (!ctx->bitstreamBuffer.failed) {
+            ctx->inputValidationFailed = true;
+        }
         return;
     }
 
     if (ctx->lastSliceParams == NULL || ctx->lastSliceParamsCount == 0U) {
         LOG("JPEG: No slice parameters available");
+        ctx->inputValidationFailed = true;
         return;
     }
 
@@ -713,12 +718,14 @@ static void copyJPEGSliceData(NVContext *ctx, NVBuffer *buf, CUVIDPICPARAMS *pic
 
     if (buf->size > UINT32_MAX) {
         LOG("JPEG: Slice data too large (%zu bytes)", buf->size);
+        ctx->inputValidationFailed = true;
         return;
     }
 
     uint32_t frameSize = 0;
     if (ctx->bitstreamBuffer.size > UINT32_MAX) {
         LOG("JPEG: Reconstructed bitstream offset exceeds CUVID limit");
+        ctx->inputValidationFailed = true;
         return;
     }
     const uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
@@ -734,12 +741,15 @@ static void copyJPEGSliceData(NVContext *ctx, NVBuffer *buf, CUVIDPICPARAMS *pic
                          &frameSize)) {
         LOG("JPEG: Failed to reconstruct JPEG frame");
         ctx->sliceOffsets.size -= sizeof(offset);
+        if (!ctx->bitstreamBuffer.failed) {
+            ctx->inputValidationFailed = true;
+        }
         return;
     }
 
     // NVDEC can consume a full JPEG as a single "slice" (same approach as FFmpeg's mjpeg_nvdec)
     picParams->nNumSlices = 1U;
-    picParams->nBitstreamDataLen = (uint32_t)ctx->bitstreamBuffer.size;
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 
     LOG("JPEG: Reconstructed %u bytes for NVDEC", frameSize);
 }

@@ -19,6 +19,40 @@ bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,
     return true;
 }
 
+bool nvAddCuvidSlices(NVContext *ctx, CUVIDPICPARAMS *picParams, size_t count) {
+    if (ctx == NULL || picParams == NULL || count > UINT32_MAX ||
+        count > UINT32_MAX - picParams->nNumSlices) {
+        if (ctx != NULL) {
+            ctx->inputValidationFailed = true;
+        }
+        return false;
+    }
+    picParams->nNumSlices += (uint32_t) count;
+    return true;
+}
+
+bool nvCanAppendCuvidBitstream(NVContext *ctx, size_t additionalBytes) {
+    if (ctx == NULL || ctx->bitstreamBuffer.size > UINT32_MAX ||
+        additionalBytes > UINT32_MAX - ctx->bitstreamBuffer.size) {
+        if (ctx != NULL) {
+            ctx->inputValidationFailed = true;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool nvCommitCuvidBitstreamLength(NVContext *ctx, CUVIDPICPARAMS *picParams) {
+    if (ctx == NULL || picParams == NULL || ctx->bitstreamBuffer.size > UINT32_MAX) {
+        if (ctx != NULL) {
+            ctx->inputValidationFailed = true;
+        }
+        return false;
+    }
+    picParams->nBitstreamDataLen = (uint32_t) ctx->bitstreamBuffer.size;
+    return true;
+}
+
 bool nvValidateBufferSchema(const NVBuffer *buffer,
                             const BufferSchema *schema) {
     if (buffer == NULL || schema == NULL || schema->minElementSize == 0 ||

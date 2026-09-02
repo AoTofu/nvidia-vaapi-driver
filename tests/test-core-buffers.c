@@ -1,7 +1,9 @@
 #include "appendable-buffer.h"
+#include "common.h"
 #include "list.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,10 +95,34 @@ static void testArrayGrowthAndExhaustion(void) {
     assert(exhausted.size == UINT32_MAX);
 }
 
+static void testDuplicatedFdIsCloseOnExec(void) {
+    int pipeFds[2];
+    assert(pipe(pipeFds) == 0);
+
+    const int duplicatedFd = nvDupFdCloexec(pipeFds[0]);
+    assert(duplicatedFd >= 0);
+    assert((fcntl(duplicatedFd, F_GETFD) & FD_CLOEXEC) != 0);
+
+    close(duplicatedFd);
+    close(pipeFds[0]);
+    close(pipeFds[1]);
+}
+
+static void testPlaneGeometryHelpers(void) {
+    assert(nvPlaneExtent(7, 1) == 4);
+    assert(nvPlaneExtent(8, 1) == 4);
+    assert(nvPlaneExtent(UINT32_MAX, 32) == 1);
+    assert(nvPlaneCoordinate(7, 1) == 3);
+    assert(nvPlaneCoordinate(8, 1) == 4);
+    assert(nvPlaneCoordinate(UINT32_MAX, 32) == 0);
+}
+
 int main(void) {
     testAppendAndGrow();
     testAppendOverflowIsNonDestructive();
     testTrimPreservesData();
     testArrayGrowthAndExhaustion();
+    testDuplicatedFdIsCloseOnExec();
+    testPlaneGeometryHelpers();
     return 0;
 }

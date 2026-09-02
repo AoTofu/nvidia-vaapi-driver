@@ -39,6 +39,7 @@ typedef struct {
     uint32_t height;
     uint64_t mods;
     uint32_t memorySize;
+    uint32_t allocationSize;
     uint32_t offset;
     uint32_t pitch;
     uint32_t fourcc;
@@ -55,6 +56,6 @@ bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint
 uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriverImage images[], uint32_t width, uint32_t height,
                                         uint32_t bppc, uint32_t numPlanes, const NVFormatPlane planes[],
                                         bool unifyBlockHeight);
-bool alloc_buffer(NVDriverContext *context, uint32_t totalSize, const NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd);
+bool alloc_buffer(NVDriverContext *context, uint32_t totalSize, NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd);
 
 #endif

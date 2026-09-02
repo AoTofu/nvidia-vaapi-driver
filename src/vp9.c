@@ -15,9 +15,9 @@ static void copyVP9PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     picParams->CodecSpecific.vp9.width = buf->frame_width;
     picParams->CodecSpecific.vp9.height = buf->frame_height;
 
-    picParams->CodecSpecific.vp9.LastRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->reference_frames[buf->pic_fields.bits.last_ref_frame]);
-    picParams->CodecSpecific.vp9.GoldenRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->reference_frames[buf->pic_fields.bits.golden_ref_frame]);
-    picParams->CodecSpecific.vp9.AltRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->reference_frames[buf->pic_fields.bits.alt_ref_frame]);
+    picParams->CodecSpecific.vp9.LastRefIdx = pictureIdxFromSurfaceId(ctx, buf->reference_frames[buf->pic_fields.bits.last_ref_frame]);
+    picParams->CodecSpecific.vp9.GoldenRefIdx = pictureIdxFromSurfaceId(ctx, buf->reference_frames[buf->pic_fields.bits.golden_ref_frame]);
+    picParams->CodecSpecific.vp9.AltRefIdx = pictureIdxFromSurfaceId(ctx, buf->reference_frames[buf->pic_fields.bits.alt_ref_frame]);
 
     picParams->CodecSpecific.vp9.profile = buf->profile;
     picParams->CodecSpecific.vp9.frameContextIdx = buf->pic_fields.bits.frame_context_idx;
@@ -76,10 +76,18 @@ typedef struct {
 static VP9Context *getVP9Context(NVContext *ctx) {
     if (ctx->codecData == NULL) {
         ctx->codecData = calloc(1, sizeof(VP9Context));
+        if (ctx->codecData == NULL) {
+            ctx->bitstreamBuffer.failed = true;
+            return NULL;
+        }
     }
     VP9Context *vp9 = ctx->codecData;
     if (vp9 != NULL && vp9->parser == NULL) {
         vp9->parser = gst_vp9_parser_new();
+        if (vp9->parser == NULL) {
+            ctx->bitstreamBuffer.failed = true;
+            return NULL;
+        }
     }
     return vp9;
 }
@@ -167,7 +175,7 @@ static void copyVP9SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
     ctx->lastSliceParams = buffer->ptr;
     ctx->lastSliceParamsCount = buffer->elements;
 
-    picParams->nNumSlices += buffer->elements;
+    nvAddCuvidSlices(ctx, picParams, buffer->elements);
 }
 
 static void copyVP9SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -187,7 +195,8 @@ static void copyVP9SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         }
         frameBytes += sliceParams->slice_data_size;
     }
-    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+    if (!nvCanAppendCuvidBitstream(ctx, frameBytes) ||
+        !reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
                                sizeof(uint32_t)) ||
         !reserveAdditionalBuffer(&ctx->bitstreamBuffer, frameBytes)) {
         return;
@@ -199,8 +208,8 @@ static void copyVP9SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
 
-        picParams->nBitstreamDataLen += sliceParams->slice_data_size;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
     if (frameBytes <= UINT32_MAX) {
         parseExtraInfo(ctx, PTROFF(ctx->bitstreamBuffer.buf, frameStart),
                        (uint32_t) frameBytes, picParams);

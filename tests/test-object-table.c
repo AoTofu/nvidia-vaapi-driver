@@ -14,7 +14,10 @@ int main(void) {
     const uint32_t staleId = first->id;
     assert(nvdObjectTableGet(&table, 2, staleId) == first);
     assert(nvdObjectTableGet(&table, 3, staleId) == NULL);
-    assert(nvdObjectTableRemove(&table, staleId) == first);
+    assert(nvdObjectTableRemoveTyped(&table, 3, staleId) == NULL);
+    assert(nvdObjectTableGet(&table, 2, staleId) == first);
+    assert(table.liveCount == 1);
+    assert(nvdObjectTableRemoveTyped(&table, 2, staleId) == first);
     free(first);
     assert(nvdObjectTableGet(&table, 2, staleId) == NULL);
 

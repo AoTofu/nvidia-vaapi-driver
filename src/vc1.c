@@ -31,8 +31,8 @@ static void copyVC1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 
     CUVIDVC1PICPARAMS *pps = &picParams->CodecSpecific.vc1;
 
-    pps->ForwardRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->forward_reference_picture);
-    pps->BackwardRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->backward_reference_picture);
+    pps->ForwardRefIdx = pictureIdxFromSurfaceId(ctx, buf->forward_reference_picture);
+    pps->BackwardRefIdx = pictureIdxFromSurfaceId(ctx, buf->backward_reference_picture);
 
     pps->FrameWidth = ctx->width;
     pps->FrameHeight = ctx->height;
@@ -69,7 +69,7 @@ static void copyVC1SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
     ctx->lastSliceParams = buf->ptr;
     ctx->lastSliceParamsCount = buf->elements;
 
-    picParams->nNumSlices += buf->elements;
+    nvAddCuvidSlices(ctx, picParams, buf->elements);
 }
 
 static void copyVC1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -88,7 +88,8 @@ static void copyVC1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         }
         bytes += slice->slice_data_size;
     }
-    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+    if (!nvCanAppendCuvidBitstream(ctx, bytes) ||
+        !reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
                                sizeof(uint32_t)) ||
         !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bytes)) {
         return;
@@ -99,8 +100,8 @@ static void copyVC1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
         uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen += sliceParams->slice_data_size;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 }
 
 static void copyVC1BitPlane(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)

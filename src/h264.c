@@ -52,7 +52,7 @@ static void copyH264PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 
     for (int i = 0; i < 16; i++) {
         if (!(buf->ReferenceFrames[i].flags & VA_PICTURE_H264_INVALID)) {
-            picParams->CodecSpecific.h264.dpb[i].PicIdx = pictureIdxFromSurfaceId(ctx->drv, buf->ReferenceFrames[i].picture_id);
+            picParams->CodecSpecific.h264.dpb[i].PicIdx = pictureIdxFromSurfaceId(ctx, buf->ReferenceFrames[i].picture_id);
             picParams->CodecSpecific.h264.dpb[i].FrameIdx = buf->ReferenceFrames[i].frame_idx;
             picParams->CodecSpecific.h264.dpb[i].FieldOrderCnt[0] = buf->ReferenceFrames[i].TopFieldOrderCnt;
             picParams->CodecSpecific.h264.dpb[i].FieldOrderCnt[1] = buf->ReferenceFrames[i].BottomFieldOrderCnt;
@@ -86,7 +86,7 @@ static void copyH264SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS 
     ctx->lastSliceParams = buffer->ptr;
     ctx->lastSliceParamsCount = buffer->elements;
 
-    picParams->nNumSlices += buffer->elements;
+    nvAddCuvidSlices(ctx, picParams, buffer->elements);
 }
 
 static void copyH264SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -106,7 +106,8 @@ static void copyH264SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
         }
         bitstreamBytes += sliceParams->slice_data_size + 3U;
     }
-    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+    if (!nvCanAppendCuvidBitstream(ctx, bitstreamBytes) ||
+        !reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
                                sizeof(uint32_t)) ||
         !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bitstreamBytes)) {
         return;
@@ -120,8 +121,8 @@ static void copyH264SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, header, sizeof(header));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen += sliceParams->slice_data_size + 3;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 }
 
 static void copyH264IQMatrix(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)

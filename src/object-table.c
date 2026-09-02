@@ -133,6 +133,11 @@ NVDObject *nvdObjectTableRemove(NVDObjectTable *table, uint32_t id) {
     return object;
 }
 
+NVDObject *nvdObjectTableRemoveTyped(NVDObjectTable *table, uint8_t type, uint32_t id) {
+    NVDObject *object = nvdObjectTableGet(table, type, id);
+    return object != NULL ? nvdObjectTableRemove(table, id) : NULL;
+}
+
 NVDObject *nvdObjectTableAt(const NVDObjectTable *table, uint32_t slotIndex) {
     return slotIndex < table->capacity ? table->slots[slotIndex].object : NULL;
 }

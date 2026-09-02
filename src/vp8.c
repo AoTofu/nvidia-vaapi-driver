@@ -11,9 +11,9 @@ static void copyVP8PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     picParams->CodecSpecific.vp8.width = buf->frame_width;
     picParams->CodecSpecific.vp8.height = buf->frame_height;
 
-    picParams->CodecSpecific.vp8.LastRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->last_ref_frame);
-    picParams->CodecSpecific.vp8.GoldenRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->golden_ref_frame);
-    picParams->CodecSpecific.vp8.AltRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->alt_ref_frame);
+    picParams->CodecSpecific.vp8.LastRefIdx = pictureIdxFromSurfaceId(ctx, buf->last_ref_frame);
+    picParams->CodecSpecific.vp8.GoldenRefIdx = pictureIdxFromSurfaceId(ctx, buf->golden_ref_frame);
+    picParams->CodecSpecific.vp8.AltRefIdx = pictureIdxFromSurfaceId(ctx, buf->alt_ref_frame);
 
     picParams->CodecSpecific.vp8.vp8_frame_tag.frame_type = buf->pic_fields.bits.key_frame;
     picParams->CodecSpecific.vp8.vp8_frame_tag.version = buf->pic_fields.bits.version;
@@ -30,7 +30,7 @@ static void copyVP8SliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
     ctx->lastSliceParams = buffer->ptr;
     ctx->lastSliceParamsCount = buffer->elements;
 
-    picParams->nNumSlices += buffer->elements;
+    nvAddCuvidSlices(ctx, picParams, buffer->elements);
 }
 
 static void copyVP8SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -38,9 +38,6 @@ static void copyVP8SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
     for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++)
     {
         VASliceParameterBufferVP8 *sliceParams = &((VASliceParameterBufferVP8*) ctx->lastSliceParams)[i];
-        uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
-        appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
-
         const void *validatedData = NULL;
         if (!nvValidateSliceRange(ctx, buf, sliceParams->slice_data_offset,
                                   sliceParams->slice_data_size, &validatedData)) {
@@ -59,17 +56,20 @@ static void copyVP8SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
             picParams->CodecSpecific.vp8.width,
             picParams->CodecSpecific.vp8.height);
         if (frameHeaderSize == 0 ||
-            sliceParams->slice_data_size > UINT32_MAX - frameHeaderSize) {
+            sliceParams->slice_data_size > UINT32_MAX - frameHeaderSize ||
+            !nvCanAppendCuvidBitstream(
+                ctx, frameHeaderSize + sliceParams->slice_data_size)) {
             ctx->inputValidationFailed = true;
             return;
         }
 
+        uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
+        appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, frameHeader, frameHeaderSize);
         appendBuffer(&ctx->bitstreamBuffer, validatedData,
                      sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen +=
-            (uint32_t) frameHeaderSize + sliceParams->slice_data_size;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 }
 
 static void ignoreVP8Buffer(NVContext *ctx, NVBuffer *buffer, CUVIDPICPARAMS *picParams)

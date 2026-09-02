@@ -61,8 +61,8 @@ static void copyMPEG2PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
     picParams->ref_pic_flag      = buf->picture_coding_type == 1 || //Intra
                                    buf->picture_coding_type == 2; //Predicted
 
-    picParams->CodecSpecific.mpeg2.ForwardRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->forward_reference_picture);
-    picParams->CodecSpecific.mpeg2.BackwardRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->backward_reference_picture);
+    picParams->CodecSpecific.mpeg2.ForwardRefIdx = pictureIdxFromSurfaceId(ctx, buf->forward_reference_picture);
+    picParams->CodecSpecific.mpeg2.BackwardRefIdx = pictureIdxFromSurfaceId(ctx, buf->backward_reference_picture);
 
     picParams->CodecSpecific.mpeg2.picture_coding_type = buf->picture_coding_type;
     picParams->CodecSpecific.mpeg2.full_pel_forward_vector = 0;
@@ -85,7 +85,7 @@ static void copyMPEG2SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *p
     ctx->lastSliceParams = buf->ptr;
     ctx->lastSliceParamsCount = buf->elements;
 
-    picParams->nNumSlices += buf->elements;
+    nvAddCuvidSlices(ctx, picParams, buf->elements);
 }
 
 static void copyMPEG2SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -104,7 +104,8 @@ static void copyMPEG2SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pi
         }
         bytes += slice->slice_data_size;
     }
-    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+    if (!nvCanAppendCuvidBitstream(ctx, bytes) ||
+        !reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
                                sizeof(uint32_t)) ||
         !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bytes)) {
         return;
@@ -115,8 +116,8 @@ static void copyMPEG2SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pi
         uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen += sliceParams->slice_data_size;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 }
 
 static void copyMPEG2IQMatrix(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)

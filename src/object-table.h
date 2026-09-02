@@ -31,6 +31,7 @@ void nvdObjectTableInit(NVDObjectTable *table);
 NVDObject *nvdObjectTableAllocate(NVDObjectTable *table, uint8_t type, size_t payloadSize);
 NVDObject *nvdObjectTableGet(const NVDObjectTable *table, uint8_t type, uint32_t id);
 NVDObject *nvdObjectTableRemove(NVDObjectTable *table, uint32_t id);
+NVDObject *nvdObjectTableRemoveTyped(NVDObjectTable *table, uint8_t type, uint32_t id);
 NVDObject *nvdObjectTableAt(const NVDObjectTable *table, uint32_t slotIndex);
 void nvdObjectTableDestroy(NVDObjectTable *table);
 

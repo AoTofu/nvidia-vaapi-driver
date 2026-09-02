@@ -251,7 +251,7 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
 
     for (int i = 0; i < 15; i++) {
         const VAPictureHEVC *pic = &buf->ReferenceFrames[i];
-        ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx->drv, pic->picture_id);
+        ppc->RefPicIdx[i]      = pictureIdxFromSurfaceId(ctx, pic->picture_id);
         ppc->PicOrderCntVal[i] = pic->pic_order_cnt;
         ppc->IsLongTerm[i]     = (pic->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
 
@@ -295,7 +295,7 @@ static void copyHEVCSliceParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS 
     ctx->lastSliceParams = buffer->ptr;
     ctx->lastSliceParamsCount = buffer->elements;
 
-    picParams->nNumSlices += buffer->elements;
+    nvAddCuvidSlices(ctx, picParams, buffer->elements);
 }
 
 static void copyHEVCSliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -315,7 +315,8 @@ static void copyHEVCSliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
         }
         bitstreamBytes += sliceParams->slice_data_size + 3U;
     }
-    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+    if (!nvCanAppendCuvidBitstream(ctx, bitstreamBytes) ||
+        !reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
                                sizeof(uint32_t)) ||
         !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bitstreamBytes)) {
         return;
@@ -329,8 +330,8 @@ static void copyHEVCSliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pic
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, header, sizeof(header));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen += sliceParams->slice_data_size + 3;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 }
 
 static void copyHEVCIQMatrix(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)

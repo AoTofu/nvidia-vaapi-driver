@@ -89,6 +89,22 @@ bool nvSyncBackingImageHostAccess(BackingImage *img, uint64_t flags) {
     return true;
 }
 
+void nvReleaseBackingImageBorrow(BackingImage *img) {
+    if (img == NULL || img->borrowedBackingImage == NULL) {
+        return;
+    }
+
+    BackingImage *borrowed = img->borrowedBackingImage;
+    unsigned int count = atomic_load(&borrowed->borrowCount);
+    while (count != 0U &&
+           !atomic_compare_exchange_weak(&borrowed->borrowCount, &count, count - 1U)) {
+    }
+    if (count == 0U) {
+        LOG("BackingImage borrow count was already zero during release");
+    }
+    img->borrowedBackingImage = NULL;
+}
+
 void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
     if (img == NULL) {
         return;
@@ -96,10 +112,7 @@ void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
     if (img->surface != NULL) {
         img->surface->backingImage = NULL;
     }
-    if (img->borrowedBackingImage != NULL && atomic_load(&img->borrowedBackingImage->borrowCount) > 0) {
-        atomic_fetch_sub(&img->borrowedBackingImage->borrowCount, 1);
-        img->borrowedBackingImage = NULL;
-    }
+    nvReleaseBackingImageBorrow(img);
 
     nvDestroyBackingImageVideoProcObjects(drv, img);
 

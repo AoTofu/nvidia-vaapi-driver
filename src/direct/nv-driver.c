@@ -490,11 +490,28 @@ err:
 
     LOG("Got error initing")
     if (nvctlFd != -1) {
+        if (context->subdeviceObject != 0) {
+            nv_free_object(nvctlFd, context->clientObject,
+                           context->subdeviceObject);
+        }
+        if (context->deviceObject != 0) {
+            nv_free_object(nvctlFd, context->clientObject,
+                           context->deviceObject);
+        }
+        if (context->clientObject != 0) {
+            nv_free_object(nvctlFd, context->clientObject,
+                           context->clientObject);
+        }
+    }
+    if (nvctlFd != -1) {
         close(nvctlFd);
     }
     if (nv0Fd != -1) {
         close(nv0Fd);
     }
+    context->clientObject = 0;
+    context->deviceObject = 0;
+    context->subdeviceObject = 0;
     return false;
 }
 
@@ -735,7 +752,7 @@ static bool import_and_export_buffer(const NVDriverContext *context, const int m
                                      const uint32_t pitchInBlocks, const uint32_t log2GobsPerBlockX,
                                      const uint32_t log2GobsPerBlockY, const uint32_t log2GobsPerBlockZ,
                                      int *nvFd2, int *drmFd) {
-     int memFd2 = dup(memFd);
+     int memFd2 = nvDupFdCloexec(memFd);
      if (memFd2 == -1) {
          LOG("dup failed");
          return false;
@@ -769,6 +786,7 @@ static bool import_and_export_buffer(const NVDriverContext *context, const int m
 
      struct drm_prime_handle prime_handle = {
          .handle = params.handle,
+         .flags = DRM_CLOEXEC,
          .fd = -1
      };
      drmret = ioctl(context->drmFd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
@@ -814,22 +832,35 @@ err:
      return false;
 }
 
-bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd) {
+bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd) {
+     if (context == NULL || totalSize == 0 || images == NULL || nvFd == NULL ||
+         nvFd2 == NULL || drmFd == NULL) {
+         return false;
+     }
+     *nvFd = -1;
+     *nvFd2 = -1;
+     *drmFd = -1;
+     const uint64_t allocationSize64 =
+         ((uint64_t) totalSize + 65535U) & ~UINT64_C(65535);
+     if (allocationSize64 > UINT32_MAX) {
+         return false;
+     }
+     const uint32_t allocationSize = (uint32_t) allocationSize64;
+     images[0].allocationSize = allocationSize;
      int memFd = -1;
-     bool ret = alloc_memory(context, totalSize, &memFd);
+     bool ret = alloc_memory(context, allocationSize, &memFd);
      if (!ret) {
          LOG("alloc_memory failed");
          return false;
      }
 
      const uint32_t pitchInBlocks = images[0].pitch / (GOB_WIDTH_IN_BYTES << images[0].log2GobsPerBlockX);
-     const uint32_t imageSizeInBytes = ROUND_UP(totalSize, 65536);
-
-     LOG_DEBUG("alloc_buffer: totalSize=%u importSize=%u pitchInBlocks=%u log2GobsPerBlockY=%u",
-               totalSize, imageSizeInBytes, pitchInBlocks, images[0].log2GobsPerBlockY);
+     LOG_DEBUG("alloc_buffer: layoutSize=%u allocationSize=%u importSize=%u pitchInBlocks=%u log2GobsPerBlockY=%u",
+               totalSize, allocationSize, allocationSize, pitchInBlocks,
+               images[0].log2GobsPerBlockY);
 
      int memFd2 = -1, primeFd = -1;
-     if (!import_and_export_buffer(context, memFd, imageSizeInBytes, pitchInBlocks,
+     if (!import_and_export_buffer(context, memFd, allocationSize, pitchInBlocks,
                                    images[0].log2GobsPerBlockX, images[0].log2GobsPerBlockY,
                                    images[0].log2GobsPerBlockZ, &memFd2, &primeFd)) {
          close(memFd);
@@ -861,11 +892,16 @@ bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDr
      uint32_t alignedHeight = ROUND_UP(height, gobHeightInBytes << log2GobsPerBlockY);
 
      uint32_t imageSizeInBytes = widthInBytes * alignedHeight;
-     uint32_t size = imageSizeInBytes;
+     const uint64_t allocationSize64 =
+         ((uint64_t) imageSizeInBytes + 65535U) & ~UINT64_C(65535);
+     if (allocationSize64 > UINT32_MAX) {
+         return false;
+     }
+     const uint32_t allocationSize = (uint32_t) allocationSize64;
 
      //this gets us some memory, and the fd to import into cuda
      int memFd = -1;
-     bool ret = alloc_memory(context, size, &memFd);
+     bool ret = alloc_memory(context, allocationSize, &memFd);
      if (!ret) {
          LOG("alloc_memory failed");
          return false;
@@ -874,11 +910,8 @@ bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDr
      //now export the dma-buf
      uint32_t pitchInBlocks = widthInBytes / gobWidthInBytes;
 
-     //TODO find the proper page size
-     imageSizeInBytes = ROUND_UP(imageSizeInBytes, 65536);
-
      int memFd2 = -1, primeFd = -1;
-     if (!import_and_export_buffer(context, memFd, imageSizeInBytes, pitchInBlocks,
+     if (!import_and_export_buffer(context, memFd, allocationSize, pitchInBlocks,
                                    log2GobsPerBlockX, log2GobsPerBlockY, log2GobsPerBlockZ,
                                    &memFd2, &primeFd)) {
          close(memFd);
@@ -894,6 +927,7 @@ bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDr
      image->offset = 0;
      image->pitch = widthInBytes;
      image->memorySize = imageSizeInBytes;
+     image->allocationSize = allocationSize;
      image->fourcc = fourcc;
      image->log2GobsPerBlockX = log2GobsPerBlockX;
      image->log2GobsPerBlockY = log2GobsPerBlockY;

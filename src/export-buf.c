@@ -84,7 +84,7 @@ static void egl_releaseExporter(NVDriver *drv) {
     }
 
     if (drv->eglDisplay != EGL_NO_DISPLAY) {
-        if (drv->eglStream != EGL_NO_STREAM_KHR) {
+        if (drv->eglStream != EGL_NO_STREAM_KHR && eglDestroyStreamKHR != NULL) {
             eglDestroyStreamKHR(drv->eglDisplay, drv->eglStream);
             drv->eglStream = EGL_NO_STREAM_KHR;
         }
@@ -125,7 +125,8 @@ static void findGPUIndexFromFd(NVDriver *drv) {
     PFNEGLQUERYDEVICEATTRIBEXTPROC eglQueryDeviceAttribEXT = (PFNEGLQUERYDEVICEATTRIBEXTPROC) eglGetProcAddress("eglQueryDeviceAttribEXT");
     PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceStringEXT = (PFNEGLQUERYDEVICESTRINGEXTPROC) eglGetProcAddress("eglQueryDeviceStringEXT");
 
-    if (eglQueryDevicesEXT == NULL || eglQueryDeviceAttribEXT == NULL) {
+    if (eglQueryDevicesEXT == NULL || eglQueryDeviceAttribEXT == NULL ||
+        eglQueryDeviceStringEXT == NULL) {
         LOG("No support for EGL_EXT_device_enumeration");
         drv->cudaGpuId = 0;
         return;
@@ -219,6 +220,14 @@ static bool egl_initExporter(NVDriver *drv) {
     eglDestroyStreamKHR = (PFNEGLDESTROYSTREAMKHRPROC) eglGetProcAddress("eglDestroyStreamKHR");
     eglStreamImageConsumerConnectNV = (PFNEGLSTREAMIMAGECONSUMERCONNECTNVPROC) eglGetProcAddress("eglStreamImageConsumerConnectNV");
 
+    if (eglQueryStreamConsumerEventNV == NULL || eglStreamAcquireImageNV == NULL ||
+        eglExportDMABUFImageMESA == NULL || eglExportDMABUFImageQueryMESA == NULL ||
+        eglCreateStreamKHR == NULL || eglDestroyStreamKHR == NULL ||
+        eglStreamImageConsumerConnectNV == NULL) {
+        LOG("Required EGLStream or dma-buf export functions are unavailable");
+        return false;
+    }
+
     PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT = (PFNEGLQUERYDMABUFFORMATSEXTPROC) eglGetProcAddress("eglQueryDmaBufFormatsEXT");
     PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR = (PFNEGLDEBUGMESSAGECONTROLKHRPROC) eglGetProcAddress("eglDebugMessageControlKHR");
 
@@ -248,7 +257,8 @@ static bool egl_initExporter(NVDriver *drv) {
     //see if the driver supports 16-bit exports
     EGLint formats[64];
     EGLint formatCount;
-    if (eglQueryDmaBufFormatsEXT(drv->eglDisplay, 64, formats, &formatCount)) {
+    if (eglQueryDmaBufFormatsEXT != NULL &&
+        eglQueryDmaBufFormatsEXT(drv->eglDisplay, 64, formats, &formatCount)) {
         bool r16 = false, rg1616 = false;
         for (int i = 0; i < formatCount; i++) {
             if (formats[i] == DRM_FORMAT_R16) {
@@ -271,20 +281,102 @@ static bool egl_initExporter(NVDriver *drv) {
 
 static bool exportBackingImage(NVDriver *drv, BackingImage *img) {
     int planes = 0;
-    if (!eglExportDMABUFImageQueryMESA(drv->eglDisplay, img->image, &img->fourcc, &planes, img->mods)) {
+    EGLuint64KHR planeModifiers[4] = {0};
+    int planeFds[4] = {-1, -1, -1, -1};
+    EGLint planeStrides[4] = {0};
+    EGLint planeOffsets[4] = {0};
+    if (!eglExportDMABUFImageQueryMESA(drv->eglDisplay, img->image,
+                                       &img->fourcc, &planes,
+                                       planeModifiers)) {
         LOG("eglExportDMABUFImageQueryMESA failed");
         return false;
     }
+    if (planes <= 0 || planes > 4) {
+        LOG("Invalid EGL dma-buf plane count: %d", planes);
+        return false;
+    }
 
-    LOG("eglExportDMABUFImageQueryMESA: %p %.4s (%x) planes:%d mods:%lx %lx", img, (char*)&img->fourcc, img->fourcc, planes, img->mods[0], img->mods[1]);
-    EGLBoolean r = eglExportDMABUFImageMESA(drv->eglDisplay, img->image, img->fds, img->strides, img->offsets);
+    LOG("eglExportDMABUFImageQueryMESA: %p %.4s (%x) planes:%d mods:%lx %lx", img, (char*)&img->fourcc, img->fourcc, planes, planeModifiers[0], planeModifiers[1]);
+    EGLBoolean r = eglExportDMABUFImageMESA(drv->eglDisplay, img->image,
+                                            planeFds, planeStrides,
+                                            planeOffsets);
     //LOG("Offset/Pitch: %d %d %d %d", surface->offsets[0], surface->offsets[1], surface->strides[0], surface->strides[1]);
 
     if (!r) {
         LOG("Unable to export image");
         return false;
     }
+
+    img->numPlanes = (uint32_t) planes;
+    img->numObjects = 0;
+    for (int plane = 0; plane < planes; plane++) {
+        if (planeStrides[plane] <= 0 || planeOffsets[plane] < 0) {
+            LOG("Invalid EGL dma-buf layout for plane %d", plane);
+            goto fail;
+        }
+        img->strides[plane] = planeStrides[plane];
+        img->offsets[plane] = planeOffsets[plane];
+
+        uint32_t objectIndex = UINT32_MAX;
+        if (planeFds[plane] < 0) {
+            // MESA export permits a later plane to share the preceding
+            // dma-buf by returning -1 for that plane's fd slot.
+            if (plane == 0) {
+                LOG("EGL dma-buf plane 0 has no fd");
+                goto fail;
+            }
+            objectIndex = img->planeObjectIndex[plane - 1];
+        } else {
+            struct stat candidateStat;
+            const bool candidateStatValid =
+                fstat(planeFds[plane], &candidateStat) == 0;
+            for (uint32_t object = 0; object < img->numObjects; object++) {
+                if (candidateStatValid && img->st_ino[object] != 0 &&
+                    img->st_dev[object] == candidateStat.st_dev &&
+                    img->st_ino[object] == candidateStat.st_ino) {
+                    objectIndex = object;
+                    break;
+                }
+            }
+            if (objectIndex == UINT32_MAX) {
+                objectIndex = img->numObjects++;
+                img->fds[objectIndex] = planeFds[plane];
+                planeFds[plane] = -1;
+                img->mods[objectIndex] = planeModifiers[plane];
+                if (candidateStatValid) {
+                    img->st_dev[objectIndex] = candidateStat.st_dev;
+                    img->st_ino[objectIndex] = candidateStat.st_ino;
+                    if (candidateStat.st_size > 0) {
+                        img->objectSize[objectIndex] =
+                            (uint64_t) candidateStat.st_size;
+                    }
+                }
+            } else {
+                close(planeFds[plane]);
+                planeFds[plane] = -1;
+            }
+        }
+        if (img->mods[objectIndex] != (uint64_t) planeModifiers[plane]) {
+            LOG("Shared EGL dma-buf planes report different modifiers");
+            goto fail;
+        }
+        img->planeObjectIndex[plane] = objectIndex;
+    }
     return true;
+
+fail:
+    for (int i = 0; i < 4; i++) {
+        if (planeFds[i] >= 0) {
+            close(planeFds[i]);
+        }
+        if (img->fds[i] >= 0) {
+            close(img->fds[i]);
+            img->fds[i] = -1;
+        }
+    }
+    img->numObjects = 0;
+    img->numPlanes = 0;
+    return false;
 }
 
 static void cacheBackingImageFdStat(BackingImage *img, int index) {
@@ -379,6 +471,77 @@ static void egl_attachBackingImageToSurface(NVSurface *surface, BackingImage *im
     nvBackingImageStoreSurfaceColorMetadata(img, surface);
 }
 
+static uint64_t eglBackingImageMemorySize(const BackingImage *img) {
+    if (img == NULL) {
+        return 0;
+    }
+    if (img->totalSize != 0) {
+        return img->totalSize;
+    }
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < img->numPlanes; i++) {
+        bytes += img->size[i];
+    }
+    return bytes;
+}
+
+static bool eglDetachedCacheOverLimit(const NVDriver *drv) {
+    if (drv->detachedBackingImageCount == 0) {
+        return false;
+    }
+    if (drv->maxDetachedBackingImages == 0 ||
+        drv->maxDetachedBackingImageBytes == 0) {
+        return true;
+    }
+    const uint64_t scratch = drv->videoProcYBufferSize +
+                             drv->videoProcUVBufferSize +
+                             drv->videoProcArgbBufferSize;
+    const bool budgetExceeded = drv->memoryBudgetBytes != 0 &&
+        (drv->detachedBackingImageBytes > drv->memoryBudgetBytes ||
+         scratch > drv->memoryBudgetBytes - drv->detachedBackingImageBytes);
+    return drv->detachedBackingImageCount > drv->maxDetachedBackingImages ||
+           drv->detachedBackingImageBytes > drv->maxDetachedBackingImageBytes ||
+           budgetExceeded;
+}
+
+static void eglPruneDetachedBackingImages(NVDriver *drv) {
+    for (;;) {
+        BackingImage *victim = NULL;
+        uint32_t victimIndex = UINT32_MAX;
+
+        pthread_mutex_lock(&drv->imagesMutex);
+        if (!eglDetachedCacheOverLimit(drv)) {
+            pthread_mutex_unlock(&drv->imagesMutex);
+            return;
+        }
+        ARRAY_FOR_EACH(BackingImage*, candidate, &drv->images)
+            if (candidate->surface == NULL &&
+                atomic_load(&candidate->borrowCount) == 0 &&
+                (victim == NULL ||
+                 candidate->detachedSerial < victim->detachedSerial)) {
+                victim = candidate;
+                victimIndex = candidate_idx;
+            }
+        END_FOR_EACH
+        if (victim == NULL) {
+            pthread_mutex_unlock(&drv->imagesMutex);
+            return;
+        }
+        const uint64_t bytes = eglBackingImageMemorySize(victim);
+        drv->detachedBackingImageBytes =
+            drv->detachedBackingImageBytes >= bytes
+                ? drv->detachedBackingImageBytes - bytes : 0;
+        if (drv->detachedBackingImageCount > 0) {
+            drv->detachedBackingImageCount--;
+        }
+        remove_element_at(&drv->images, victimIndex);
+        pthread_mutex_unlock(&drv->imagesMutex);
+
+        egl_destroyBackingImage(drv, victim);
+        nvStatsIncrement(drv, NV_STAT_BACKING_PRUNE_COUNT);
+    }
+}
+
 static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface) {
     if (surface->backingImage == NULL) {
         LOG("Cannot detach NULL BackingImage from Surface");
@@ -399,6 +562,9 @@ static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface)
                 LOG("Detaching BackingImage %p from Surface %p", img, surface);
                 nvStatsBackingImageSetActive(drv, img, false);
                 img->surface = NULL;
+                img->detachedSerial = ++drv->detachedBackingImageSerial;
+                drv->detachedBackingImageCount++;
+                drv->detachedBackingImageBytes += eglBackingImageMemorySize(img);
                 break;
             }
         END_FOR_EACH
@@ -407,6 +573,7 @@ static void egl_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface)
     }
 
     surface->backingImage = NULL;
+    eglPruneDetachedBackingImages(drv);
 }
 
 static void egl_destroyAllBackingImage(NVDriver *drv) {
@@ -446,6 +613,14 @@ static BackingImage* findFreeBackingImage(NVDriver *drv, NVSurface *surface) {
             img->height == surface->height && img->format == requiredFormat &&
             img->numPlanes == 2) {
             LOG("Using BackingImage %p for Surface %p", img, surface);
+            const uint64_t bytes = eglBackingImageMemorySize(img);
+            drv->detachedBackingImageBytes =
+                drv->detachedBackingImageBytes >= bytes
+                    ? drv->detachedBackingImageBytes - bytes : 0;
+            if (drv->detachedBackingImageCount > 0) {
+                drv->detachedBackingImageCount--;
+            }
+            img->detachedSerial = 0;
             egl_attachBackingImageToSurface(surface, img);
             nvStatsBackingImageSetActive(drv, img, true);
             nvStatsIncrement(drv, NV_STAT_BACKING_CACHE_HITS);
@@ -485,6 +660,7 @@ static BackingImage *egl_allocateBackingImageImpl(NVDriver *drv, const NVSurface
             eglframe.eglColorFormat = CU_EGL_COLOR_FORMAT_Y10V10U10_420_SEMIPLANAR;
         } else {
             LOG("Unknown bitdepth");
+            return NULL;
         }
         eglframe.cuFormat = CU_AD_FORMAT_UNSIGNED_INT16;
     }
@@ -643,6 +819,11 @@ static bool egl_realiseSurface(NVDriver *drv, NVSurface *surface) {
                 drv->useCorrectNV12Format = !drv->useCorrectNV12Format;
                 //re-export the frame in the correct format
                 img = egl_allocateBackingImage(drv, surface);
+                if (img == NULL) {
+                    LOG("Unable to allocate backing image for NV12/NV21 workaround");
+                    pthread_mutex_unlock(&surface->mutex);
+                    return false;
+                }
                 if (img->fourcc != DRM_FORMAT_NV12) {
                     LOG("Work around unsuccessful");
                 }
@@ -694,46 +875,82 @@ static bool egl_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRMPRI
 
     nvBackingImageStoreSurfaceColorMetadata(img, surface);
 
-    int bpp = img->fourcc == DRM_FORMAT_NV12 ? 1 : 2;
+    const uint64_t bpp = img->fourcc == DRM_FORMAT_NV12 ? 1U : 2U;
 
     //TODO only support 420 images (either NV12, P010 or P012)
+    if (img->numPlanes != 2 || img->numObjects == 0 || img->numObjects > 4) {
+        return false;
+    }
     desc->fourcc = img->fourcc;
     desc->width = img->width;
     desc->height = img->height;
     desc->num_layers = 2;
-    desc->num_objects = 2;
-
-    desc->objects[0].fd = dup(img->fds[0]);
-    if (desc->objects[0].fd < 0) {
-        desc->num_objects = 0;
-        return false;
+    desc->num_objects = 0;
+    uint64_t requiredObjectSize[4] = {0};
+    for (uint32_t plane = 0; plane < img->numPlanes; plane++) {
+        const uint32_t object = img->planeObjectIndex[plane];
+        const uint64_t rows = plane == 0
+            ? img->height : nvPlaneExtent(img->height, 1);
+        const uint64_t rowBytes = (uint64_t) img->width * bpp;
+        if (object >= img->numObjects || img->offsets[plane] < 0 ||
+            img->strides[plane] <= 0 || rowBytes > (uint64_t) img->strides[plane] ||
+            rows == 0 ||
+            rows - 1 > (UINT64_MAX - (uint64_t) img->offsets[plane] - rowBytes) /
+                       (uint64_t) img->strides[plane]) {
+            return false;
+        }
+        const uint64_t end = (uint64_t) img->offsets[plane] +
+            (rows - 1) * (uint64_t) img->strides[plane] + rowBytes;
+        if (end > requiredObjectSize[object]) {
+            requiredObjectSize[object] = end;
+        }
     }
-    desc->objects[0].size = img->width * img->height * bpp;
-    desc->objects[0].drm_format_modifier = img->mods[0];
 
-    desc->objects[1].fd = dup(img->fds[1]);
-    if (desc->objects[1].fd < 0) {
-        close(desc->objects[0].fd);
-        desc->objects[0].fd = -1;
-        desc->num_objects = 0;
-        return false;
+    for (uint32_t object = 0; object < img->numObjects; object++) {
+        uint64_t objectSize = img->objectSize[object];
+        if (objectSize == 0) {
+            struct stat objectStat;
+            if (fstat(img->fds[object], &objectStat) == 0 &&
+                objectStat.st_size > 0) {
+                objectSize = (uint64_t) objectStat.st_size;
+            }
+        }
+        if (objectSize == 0) {
+            objectSize = requiredObjectSize[object];
+        }
+        if (objectSize < requiredObjectSize[object] || objectSize > UINT32_MAX) {
+            goto fail;
+        }
+        desc->objects[object].fd = nvDupFdCloexec(img->fds[object]);
+        if (desc->objects[object].fd < 0) {
+            goto fail;
+        }
+        desc->objects[object].size = (uint32_t) objectSize;
+        desc->objects[object].drm_format_modifier = img->mods[object];
+        desc->num_objects++;
     }
-    desc->objects[1].size = img->width * nvPlaneExtent(img->height, 1) * bpp;
-    desc->objects[1].drm_format_modifier = img->mods[1];
 
     desc->layers[0].drm_format = img->fourcc == DRM_FORMAT_NV12 ? DRM_FORMAT_R8 : DRM_FORMAT_R16;
     desc->layers[0].num_planes = 1;
-    desc->layers[0].object_index[0] = 0;
+    desc->layers[0].object_index[0] = img->planeObjectIndex[0];
     desc->layers[0].offset[0] = img->offsets[0];
     desc->layers[0].pitch[0] = img->strides[0];
 
     desc->layers[1].drm_format = img->fourcc == DRM_FORMAT_NV12 ? DRM_FORMAT_RG88 : DRM_FORMAT_RG1616;
     desc->layers[1].num_planes = 1;
-    desc->layers[1].object_index[0] = 1;
+    desc->layers[1].object_index[0] = img->planeObjectIndex[1];
     desc->layers[1].offset[0] = img->offsets[1];
     desc->layers[1].pitch[0] = img->strides[1];
 
     return true;
+
+fail:
+    for (uint32_t object = 0; object < desc->num_objects; object++) {
+        close(desc->objects[object].fd);
+        desc->objects[object].fd = -1;
+    }
+    desc->num_objects = 0;
+    return false;
 }
 
 const NVBackend EGL_BACKEND = {

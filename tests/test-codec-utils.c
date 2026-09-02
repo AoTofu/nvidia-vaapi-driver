@@ -70,6 +70,30 @@ static void testPictureIndexSelection(void) {
     assert(nvdSelectPictureIndex(0, 33, 0, 0, 0) == -1);
 }
 
+static void testCuvidLimits(void) {
+    NVContext context = { 0 };
+    CUVIDPICPARAMS params = { 0 };
+
+    assert(nvAddCuvidSlices(&context, &params, UINT32_MAX));
+    assert(params.nNumSlices == UINT32_MAX);
+    assert(!nvAddCuvidSlices(&context, &params, 1));
+    assert(context.inputValidationFailed);
+
+    context.inputValidationFailed = false;
+    context.bitstreamBuffer.size = UINT32_MAX - 7U;
+    assert(nvCanAppendCuvidBitstream(&context, 7));
+    assert(!nvCanAppendCuvidBitstream(&context, 8));
+    assert(context.inputValidationFailed);
+
+    context.inputValidationFailed = false;
+    context.bitstreamBuffer.size = UINT32_MAX;
+    assert(nvCommitCuvidBitstreamLength(&context, &params));
+    assert(params.nBitstreamDataLen == UINT32_MAX);
+    context.bitstreamBuffer.size = (size_t) UINT32_MAX + 1U;
+    assert(!nvCommitCuvidBitstreamLength(&context, &params));
+    assert(context.inputValidationFailed);
+}
+
 int main(void) {
     assert(nvPlaneExtent(350, 1) == 175);
     assert(nvPlaneExtent(351, 1) == 176);
@@ -100,5 +124,6 @@ int main(void) {
     testVP8FrameHeaders();
     testBufferSchemas();
     testPictureIndexSelection();
+    testCuvidLimits();
     return 0;
 }

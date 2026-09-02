@@ -137,6 +137,15 @@ codec_utils_test = executable(
 )
 test('codec slice ranges', codec_utils_test, timeout: 30)
 
+libva_drm_deps = dependency('libva-drm', required: false)
+if libva_drm_deps.found()
+    executable(
+        'test-va-api-state',
+        'tests/test-va-api-state.c',
+        dependencies: libva_drm_deps,
+    )
+endif
+
 bash = find_program('bash')
 test(
     'install script',

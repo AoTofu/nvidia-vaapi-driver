@@ -61,14 +61,25 @@ static NVFormat nvFormatForSurface(const NVSurface *surface) {
     }
 }
 
-static void findGPUIndexFromFd(NVDriver *drv) {
-    //find the CUDA device id
-    uint8_t drmUuid[16];
-    get_device_uuid(&drv->driverContext, drmUuid);
-
+static bool findGPUIndexFromFd(NVDriver *drv) {
     int gpuCount = 0;
     if (CHECK_CUDA_RESULT(drv->cu->cuDeviceGetCount(&gpuCount))) {
-        return;
+        return false;
+    }
+    if (gpuCount <= 0) {
+        return false;
+    }
+
+    // Some recent RM versions reject the private SHA1 UUID query even though
+    // decode/export work. Only compare an initialized UUID; otherwise retain a
+    // valid explicit NVD_GPU selection or use CUDA device 0 with a clear log.
+    uint8_t drmUuid[16] = {0};
+    if (!get_device_uuid(&drv->driverContext, drmUuid)) {
+        if (drv->cudaGpuId < 0 || drv->cudaGpuId >= gpuCount) {
+            drv->cudaGpuId = 0;
+        }
+        LOG("DRM UUID query unavailable; using CUDA device %d", drv->cudaGpuId);
+        return true;
     }
 
     for (int i = 0; i < gpuCount; i++) {
@@ -76,13 +87,17 @@ static void findGPUIndexFromFd(NVDriver *drv) {
         if (!CHECK_CUDA_RESULT(drv->cu->cuDeviceGetUuid(&uuid, i))) {
             if (memcmp(drmUuid, uuid.bytes, 16) == 0) {
                 drv->cudaGpuId = i;
-                return;
+                return true;
             }
         }
     }
 
-    //default to index 0
-    drv->cudaGpuId = 0;
+    if (drv->cudaGpuId < 0 || drv->cudaGpuId >= gpuCount) {
+        drv->cudaGpuId = 0;
+    }
+    LOG("No CUDA UUID matches the DRM UUID; using CUDA device %d",
+        drv->cudaGpuId);
+    return true;
 }
 
 static bool import_to_cuda(NVDriver *drv, NVDriverImage *image, int bpc, int channels, NVCudaImage *cudaImage, CUarray *array) {
@@ -90,7 +105,7 @@ static bool import_to_cuda(NVDriver *drv, NVDriverImage *image, int bpc, int cha
         .type      = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
         .handle.fd = image->nvFd,
         .flags     = 0,
-        .size      = image->memorySize
+        .size      = image->allocationSize
     };
 
     //LOG("importing memory size: %dx%d = %x", image->width, image->height, image->memorySize);
@@ -129,6 +144,7 @@ static void debug(EGLenum error,const char *command,EGLint messageType,EGLLabelK
 }
 
 static bool direct_initExporter(NVDriver *drv) {
+    bool ownsDrmFd = false;
     //this is only needed to see errors in firefox
     static const EGLAttrib debugAttribs[] = {EGL_DEBUG_MSG_WARN_KHR, EGL_TRUE, EGL_DEBUG_MSG_INFO_KHR, EGL_TRUE, EGL_NONE};
     const PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR = (PFNEGLDEBUGMESSAGECONTROLKHRPROC) eglGetProcAddress("eglDebugMessageControlKHR");
@@ -178,6 +194,7 @@ static bool direct_initExporter(NVDriver *drv) {
         }
 
         drv->drmFd = fd;
+        ownsDrmFd = true;
         LOG("Found NVIDIA GPU %d at %s", nvdGpu, node);
     } else {
         if (!isNvidiaDrmFd(drv->drmFd, true) || !checkModesetParameterFromFd(drv->drmFd)) {
@@ -185,33 +202,50 @@ static bool direct_initExporter(NVDriver *drv) {
         }
 
         //dup it so we can close it later and not effect firefox
-        const int duplicatedFd = dup(drv->drmFd);
+        const int duplicatedFd = nvDupFdCloexec(drv->drmFd);
         if (duplicatedFd < 0) {
             LOG("Unable to duplicate DRM fd: %s", strerror(errno));
             return false;
         }
         drv->drmFd = duplicatedFd;
+        ownsDrmFd = true;
     }
 
-    const bool ret = init_nvdriver(&drv->driverContext, drv->drmFd);
+    if (!init_nvdriver(&drv->driverContext, drv->drmFd)) {
+        if (ownsDrmFd) {
+            close(drv->drmFd);
+            drv->drmFd = -1;
+        }
+        return false;
+    }
+
+    if (!findGPUIndexFromFd(drv)) {
+        free_nvdriver(&drv->driverContext);
+        drv->drmFd = -1;
+        return false;
+    }
 
     //TODO this isn't really correct as we don't know if the driver version actually supports importing them
     //but we don't have an easy way to find out.
     drv->supports16BitSurface = true;
     drv->supports444Surface = true;
-    findGPUIndexFromFd(drv);
-
-    return ret;
+    return true;
 }
 
 static void direct_releaseExporter(NVDriver *drv) {
     free_nvdriver(&drv->driverContext);
 }
 
-static void initBackingImageSync(BackingImage *img) {
-    pthread_mutex_init(&img->mutex, NULL);
-    pthread_cond_init(&img->cond, NULL);
+static bool initBackingImageSync(BackingImage *img) {
+    if (pthread_mutex_init(&img->mutex, NULL) != 0) {
+        return false;
+    }
+    if (pthread_cond_init(&img->cond, NULL) != 0) {
+        pthread_mutex_destroy(&img->mutex);
+        return false;
+    }
     img->syncInitialized = true;
+    return true;
 }
 
 static void cacheBackingImageFdStat(BackingImage *img, int index) {
@@ -560,7 +594,10 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv,
     if (backingImage == NULL) {
         return NULL;
     }
-    initBackingImageSync(backingImage);
+    if (!initBackingImageSync(backingImage)) {
+        free(backingImage);
+        return NULL;
+    }
 
     // Separate object per plane -> the multi-object export/destroy paths handle it.
     backingImage->isSingleBuffer = false;
@@ -591,7 +628,7 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv,
             .type      = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
             .handle.fd = memFd,
             .flags     = 0,
-            .size      = driverImages[i].memorySize
+            .size      = driverImages[i].allocationSize
         };
         if (CHECK_CUDA_RESULT(drv->cu->cuImportExternalMemory(&backingImage->cudaImages[i].extMem, &extMemDesc))) {
             close(memFd);
@@ -632,7 +669,8 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv,
         backingImage->strides[i] = driverImages[i].pitch;
         backingImage->mods[i] = driverImages[i].mods;
         backingImage->offsets[i] = 0;
-        backingImage->size[i] = driverImages[i].memorySize;
+        backingImage->size[i] = driverImages[i].allocationSize;
+        backingImage->objectSize[i] = driverImages[i].allocationSize;
     }
 
     backingImage->width = surface->width;
@@ -661,7 +699,10 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
     if (backingImage == NULL) {
         return NULL;
     }
-    initBackingImageSync(backingImage);
+    if (!initBackingImageSync(backingImage)) {
+        free(backingImage);
+        return NULL;
+    }
 
     backingImage->isSingleBuffer = true;
     for (int i = 0; i < 4; i++) {
@@ -688,11 +729,12 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
     }
     LOG_DEBUG("Allocate single Buffer: %d %d %d", memFd, memFd2, drmFd);
 
+    const uint32_t allocationSize = driverImages[0].allocationSize;
     const CUDA_EXTERNAL_MEMORY_HANDLE_DESC extMemDesc = {
         .type      = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
         .handle.fd = memFd,
         .flags     = 0,
-        .size      = backingImage->totalSize
+        .size      = allocationSize
     };
 
     LOG_DEBUG("Importing single memory to CUDA");
@@ -741,6 +783,8 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
     backingImage->width = surface->width;
     backingImage->height = surface->height;
     backingImage->fourcc = fmtInfo->fourcc;
+    backingImage->totalSize = allocationSize;
+    backingImage->objectSize[0] = allocationSize;
     backingImage->fds[0] = drmFd;
     drmFd = -1;
     cacheBackingImageFdStat(backingImage, 0);
@@ -792,7 +836,10 @@ static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *s
     if (backingImage == NULL) {
         return NULL;
     }
-    initBackingImageSync(backingImage);
+    if (!initBackingImageSync(backingImage)) {
+        free(backingImage);
+        return NULL;
+    }
     for (int i = 0; i < 4; i++) {
         backingImage->fds[i] = -1;
     }
@@ -824,7 +871,8 @@ static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *s
         cacheBackingImageFdStat(backingImage, (int) i);
         backingImage->strides[i] = driverImages[i].pitch;
         backingImage->mods[i] = driverImages[i].mods;
-        backingImage->size[i] = driverImages[i].memorySize;
+        backingImage->size[i] = driverImages[i].allocationSize;
+        backingImage->objectSize[i] = driverImages[i].allocationSize;
     }
 
     return backingImage;
@@ -873,10 +921,7 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
     if (img->surface != NULL) {
         img->surface->backingImage = NULL;
     }
-    if (img->borrowedBackingImage != NULL && atomic_load(&img->borrowedBackingImage->borrowCount) > 0) {
-        atomic_fetch_sub(&img->borrowedBackingImage->borrowCount, 1);
-        img->borrowedBackingImage = NULL;
-    }
+    nvReleaseBackingImageBorrow(img);
 
     for (uint32_t i = 0; i < NVD_MAX_IMPORTED_OBJECTS; i++) {
         if (img->externalMappings[i] != NULL) {
@@ -1226,7 +1271,7 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     if (img->isSingleBuffer) {
         nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
         desc->num_objects = 1;
-        desc->objects[0].fd = dup(img->fds[0]);
+        desc->objects[0].fd = nvDupFdCloexec(img->fds[0]);
         if (desc->objects[0].fd < 0) {
             desc->num_objects = 0;
             return false;
@@ -1246,7 +1291,7 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
         desc->num_objects = fmtInfo->numPlanes;
 
         for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-            desc->objects[i].fd = dup(img->fds[i]);
+            desc->objects[i].fd = nvDupFdCloexec(img->fds[i]);
             if (desc->objects[i].fd < 0) {
                 for (uint32_t j = 0; j < i; j++) {
                     close(desc->objects[j].fd);

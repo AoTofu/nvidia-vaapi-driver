@@ -26,8 +26,8 @@ static void copyMPEG4PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *
                                    buf->vop_fields.bits.vop_coding_type == 1 || //Predicted
                                    buf->vop_fields.bits.vop_coding_type == 3;   //S(GMC)-VOP MPEG-4
 
-    ppc->ForwardRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->forward_reference_picture);
-    ppc->BackwardRefIdx = pictureIdxFromSurfaceId(ctx->drv, buf->backward_reference_picture);
+    ppc->ForwardRefIdx = pictureIdxFromSurfaceId(ctx, buf->forward_reference_picture);
+    ppc->BackwardRefIdx = pictureIdxFromSurfaceId(ctx, buf->backward_reference_picture);
 
     ppc->video_object_layer_width = buf->vop_width;
     ppc->video_object_layer_height = buf->vop_height;
@@ -60,7 +60,7 @@ static void copyMPEG4SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *p
     ctx->lastSliceParams = buf->ptr;
     ctx->lastSliceParamsCount = buf->elements;
 
-    picParams->nNumSlices += buf->elements;
+    nvAddCuvidSlices(ctx, picParams, buf->elements);
 }
 
 static void copyMPEG4SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)
@@ -79,7 +79,8 @@ static void copyMPEG4SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pi
         }
         bytes += slice->slice_data_size;
     }
-    if (!reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
+    if (!nvCanAppendCuvidBitstream(ctx, bytes) ||
+        !reserveBufferElements(&ctx->sliceOffsets, ctx->lastSliceParamsCount,
                                sizeof(uint32_t)) ||
         !reserveAdditionalBuffer(&ctx->bitstreamBuffer, bytes)) {
         return;
@@ -91,8 +92,8 @@ static void copyMPEG4SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *pi
         uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
-        picParams->nBitstreamDataLen += sliceParams->slice_data_size;
     }
+    nvCommitCuvidBitstreamLength(ctx, picParams);
 }
 
 static void copyMPEG4IQMatrix(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams)

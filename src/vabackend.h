@@ -44,6 +44,8 @@ typedef struct
     size_t          elementSize;
     size_t          size;
     VABufferType    bufferType;
+    VAContextID     ownerContextId;
+    bool            imageOwned;
     void            *ptr;
     size_t          capacity;
     int8_t          poolClass;
@@ -57,6 +59,7 @@ struct _NVContext;
 struct _BackingImage;
 
 #define NVD_MAX_DECODE_SURFACES 32U
+#define NVD_MAX_AV1_TILES 4096U
 
 typedef struct
 {
@@ -67,6 +70,7 @@ typedef struct
     int                     bitDepth;
     int                     pictureIdx;
     struct _NVContext       *context;
+    VAContextID             contextId;
     int                     progressiveFrame;
     int                     topFieldFirst;
     int                     secondField;
@@ -80,6 +84,9 @@ typedef struct
     pthread_cond_t          cond;
     bool                    syncInitialized;
     bool                    decodeFailed;
+    uint64_t                submittedGeneration;
+    uint64_t                completedGeneration;
+    VAStatus                completionStatus;
 } NVSurface;
 
 typedef enum
@@ -164,6 +171,13 @@ typedef struct _BackingImage {
     bool        statsExternal;
 } BackingImage;
 
+typedef enum {
+    NVD_PICTURE_IDLE = 0,
+    NVD_PICTURE_BUILDING,
+    NVD_PICTURE_FAILED,
+    NVD_PICTURE_SUBMITTED,
+} NVDPictureState;
+
 struct _NVDriver;
 
 typedef struct {
@@ -186,6 +200,12 @@ typedef struct _NVDriver
     CUcontext               cudaContext;
     CUvideoctxlock          vidLock;
     NVDObjectTable          objects;
+    // Coarse lifetime barrier for VA objects. Ordinary entrypoints hold a
+    // read lock while using table-derived pointers; destroy entrypoints hold
+    // the write lock before unpublishing and freeing an object.
+    // Opaque here so users of this shared header do not need POSIX rwlock
+    // feature-test macros; vabackend.c owns the pthread_rwlock_t allocation.
+    void                    *objectLifetimeLock;
     pthread_mutex_t         objectCreationMutex;
     bool                    terminating;
     bool                    useCorrectNV12Format;
@@ -271,6 +291,7 @@ struct _NVCodec;
 typedef struct _NVContext
 {
     NVDriver            *drv;
+    VAContextID         id;
     VAProfile           profile;
     VAEntrypoint        entrypoint;
     uint32_t            width;
@@ -287,6 +308,7 @@ typedef struct _NVContext
     AppendableBuffer    sliceParamsBuffer;
     bool                av1SequenceEnableRestoration;
     uint32_t            av1TileOffsetsSeen;
+    uint64_t            av1TileSeen[NVD_MAX_AV1_TILES / 64U];
     uint32_t            av1TileMinOffset;
     uint32_t            av1TileMaxEnd;
     bool                av1BitstreamCompacted;
@@ -308,16 +330,23 @@ typedef struct _NVContext
     ResolveQueue        resolveQueue;
     pthread_mutex_t     surfaceCreationMutex;
     bool                surfaceCreationMutexInitialized;
+    pthread_mutex_t     pictureMutex;
+    bool                pictureMutexInitialized;
     int                 surfaceCount;
     uint32_t            clientRenderTargetCount;
     uint32_t            decodeSurfaceReferenceHint;
     uint32_t            hostBufferUnderuseFrames;
     bool                destroying;
     bool                inputValidationFailed;
+    NVDPictureState     pictureState;
+    VAStatus            pictureFailure;
 } NVContext;
 
 bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,
                           uint32_t offset, size_t size, const void **data);
+bool nvAddCuvidSlices(NVContext *ctx, CUVIDPICPARAMS *picParams, size_t count);
+bool nvCanAppendCuvidBitstream(NVContext *ctx, size_t additionalBytes);
+bool nvCommitCuvidBitstreamLength(NVContext *ctx, CUVIDPICPARAMS *picParams);
 size_t nvBuildVP8FrameHeader(uint8_t header[10], bool keyFrame,
                              uint8_t version, bool showFrame,
                              uint32_t firstPartitionSize,
@@ -388,7 +417,7 @@ typedef struct
 
 extern const NVFormatInfo formatsInfo[];
 
-int pictureIdxFromSurfaceId(NVDriver *ctx, VASurfaceID surf);
+int pictureIdxFromSurfaceId(NVContext *current, VASurfaceID surf);
 NVSurface* nvSurfaceFromSurfaceId(NVDriver *drv, VASurfaceID surf);
 const char *nvColorStandardName(VAProcColorStandardType colorStandard);
 VAProcColorStandardType nvColorStandardFromMatrixCoefficients(uint8_t matrixCoefficients);
