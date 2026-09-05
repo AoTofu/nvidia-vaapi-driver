@@ -106,6 +106,10 @@ void nvReleaseBackingImageBorrow(BackingImage *img) {
 }
 
 void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        LOG("Retaining imported backing image: GPU completion is unknown");
+        return;
+    }
     if (img == NULL) {
         return;
     }

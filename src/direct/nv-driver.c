@@ -309,8 +309,7 @@ bool get_device_uuid(const NVDriverContext *context, uint8_t uuid[16]) {
         .flags = NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID_FLAGS_FORMAT_BINARY |
                  NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID_FLAGS_TYPE_SHA1
     };
-    const int ret = nv_rm_control(context->nvctlFd, context->clientObject, context->clientObject, NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID, 0, sizeof(uuidParams), &uuidParams);
-    if (ret) {
+    if (!nv_rm_control(context->nvctlFd, context->clientObject, context->clientObject, NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID, 0, sizeof(uuidParams), &uuidParams)) {
         return false;
     }
 
@@ -681,9 +680,19 @@ static uint32_t calculate_log2_gobs_per_block_y(const uint32_t height) {
     return log2GobsPerBlockY;
 }
 
-uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriverImage images[], const uint32_t width, const uint32_t height,
+bool calculate_unified_image_layout(const NVDriverContext *context, NVDriverImage images[], const uint32_t width, const uint32_t height,
                                         const uint32_t bppc, const uint32_t numPlanes, const NVFormatPlane planes[],
-                                        const bool unifyBlockHeight) {
+                                        const bool unifyBlockHeight, uint32_t *totalSize) {
+     if (totalSize == NULL) return false;
+     *totalSize = 0;
+     if (context == NULL || images == NULL || planes == NULL ||
+         width == 0 || height == 0 || bppc == 0 || bppc > 2 ||
+         numPlanes == 0 || numPlanes > 3) return false;
+     for (uint32_t i = 0; i < numPlanes; i++) {
+         if (planes[i].ss.x > 1 || planes[i].ss.y > 1 ||
+             planes[i].channelCount == 0 || planes[i].channelCount > 4)
+             return false;
+     }
      const uint32_t log2GobsPerBlockX = 0;
      const uint32_t log2GobsPerBlockZ = 0;
 
@@ -712,15 +721,20 @@ uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriver
          }
      }
 
-     uint32_t offset = 0;
+     uint64_t offset = 0;
      for (uint32_t i = 0; i < numPlanes; i++) {
          const uint32_t log2GobsPerBlockY = unifyBlockHeight ? unifiedLog2Y : perPlaneLog2Y[i];
          const uint32_t planeWidth = nvPlaneExtent(width, planes[i].ss.x);
          const uint32_t planeHeight = nvPlaneExtent(height, planes[i].ss.y);
          const uint32_t bytesPerPixel = planes[i].channelCount * bppc;
 
-         const uint32_t widthInBytes = ROUND_UP(planeWidth * bytesPerPixel, GOB_WIDTH_IN_BYTES << log2GobsPerBlockX);
-         const uint32_t alignedHeight = ROUND_UP(planeHeight, GOB_HEIGHT_IN_BYTES << log2GobsPerBlockY);
+         const uint64_t widthInBytes = ROUND_UP((uint64_t) planeWidth * bytesPerPixel, GOB_WIDTH_IN_BYTES << log2GobsPerBlockX);
+         const uint64_t alignedHeight = ROUND_UP((uint64_t) planeHeight, GOB_HEIGHT_IN_BYTES << log2GobsPerBlockY);
+         // Bound each factor before multiplying, including the signed pitch
+         // and offset representation used by BackingImage.
+         if (widthInBytes > INT32_MAX || alignedHeight > UINT32_MAX ||
+             offset > INT32_MAX || widthInBytes * alignedHeight > UINT32_MAX)
+             return false;
 
          images[i].width = planeWidth;
          images[i].height = planeHeight;
@@ -738,9 +752,11 @@ uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriver
 
          offset += images[i].memorySize;
          offset = ROUND_UP(offset, SINGLE_BUFFER_PLANE_ALIGNMENT);
+         if (offset > UINT32_MAX) return false;
      }
 
-     return offset;
+     *totalSize = (uint32_t) offset;
+     return true;
 }
 
 // Imports an already-allocated block-linear buffer (memFd) into NVKMS and exports
@@ -874,6 +890,9 @@ bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, NVDriverIm
 }
 
  bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint8_t channels, uint8_t bitsPerChannel, uint32_t fourcc, NVDriverImage *image) {
+     if (context == NULL || image == NULL || width == 0 || height == 0 ||
+         channels == 0 || channels > 4 ||
+         (bitsPerChannel != 8 && bitsPerChannel != 16)) return false;
      uint32_t gobWidthInBytes = 64;
      uint32_t gobHeightInBytes = 8;
 
@@ -888,8 +907,12 @@ bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, NVDriverIm
      //LOG("Calculated GOB size: %dx%d (%dx%d)", gobWidthInBytes << log2GobsPerBlockX, gobHeightInBytes << log2GobsPerBlockY, log2GobsPerBlockX, log2GobsPerBlockY);
 
      //These two seem to be correct, but it was discovered by trial and error so I'm not 100% sure
-     uint32_t widthInBytes = ROUND_UP(width * bytesPerPixel, gobWidthInBytes << log2GobsPerBlockX);
-     uint32_t alignedHeight = ROUND_UP(height, gobHeightInBytes << log2GobsPerBlockY);
+     uint64_t widthInBytes64 = ROUND_UP((uint64_t) width * bytesPerPixel, gobWidthInBytes << log2GobsPerBlockX);
+     uint64_t alignedHeight64 = ROUND_UP((uint64_t) height, gobHeightInBytes << log2GobsPerBlockY);
+     if (widthInBytes64 > INT32_MAX || alignedHeight64 > UINT32_MAX ||
+         widthInBytes64 * alignedHeight64 > UINT32_MAX) return false;
+     uint32_t widthInBytes = (uint32_t) widthInBytes64;
+     uint32_t alignedHeight = (uint32_t) alignedHeight64;
 
      uint32_t imageSizeInBytes = widthInBytes * alignedHeight;
      const uint64_t allocationSize64 =

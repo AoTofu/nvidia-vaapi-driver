@@ -70,16 +70,11 @@ static bool findGPUIndexFromFd(NVDriver *drv) {
         return false;
     }
 
-    // Some recent RM versions reject the private SHA1 UUID query even though
-    // decode/export work. Only compare an initialized UUID; otherwise retain a
-    // valid explicit NVD_GPU selection or use CUDA device 0 with a clear log.
+    // Never accept a device whose identity has not been verified against DRM.
     uint8_t drmUuid[16] = {0};
     if (!get_device_uuid(&drv->driverContext, drmUuid)) {
-        if (drv->cudaGpuId < 0 || drv->cudaGpuId >= gpuCount) {
-            drv->cudaGpuId = 0;
-        }
-        LOG("DRM UUID query unavailable; using CUDA device %d", drv->cudaGpuId);
-        return true;
+        LOG("DRM UUID query unavailable; cannot verify CUDA/DRM device identity");
+        return false;
     }
 
     for (int i = 0; i < gpuCount; i++) {
@@ -92,12 +87,8 @@ static bool findGPUIndexFromFd(NVDriver *drv) {
         }
     }
 
-    if (drv->cudaGpuId < 0 || drv->cudaGpuId >= gpuCount) {
-        drv->cudaGpuId = 0;
-    }
-    LOG("No CUDA UUID matches the DRM UUID; using CUDA device %d",
-        drv->cudaGpuId);
-    return true;
+    LOG("No CUDA UUID matches the DRM UUID; refusing mismatched GPU");
+    return false;
 }
 
 static bool import_to_cuda(NVDriver *drv, NVDriverImage *image, int bpc, int channels, NVCudaImage *cudaImage, CUarray *array) {
@@ -360,10 +351,11 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
     }
 
     if (drv->securityClearBuffer != 0) {
-        if (CHECK_CUDA_RESULT(
-                drv->cu->cuStreamSynchronize(drv->securityClearStream)) ||
-            CHECK_CUDA_RESULT(drv->cu->cuMemFree(
-                drv->securityClearBuffer))) {
+        if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->securityClearStream))) {
+            atomic_store(&drv->cudaWorkUnsafe, true);
+            return false;
+        }
+        if (CHECK_CUDA_RESULT(drv->cu->cuMemFree(drv->securityClearBuffer))) {
             return false;
         }
         drv->securityClearBuffer = 0;
@@ -380,6 +372,7 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
 
 static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
                                       uint32_t plane) {
+    if (atomic_load(&drv->cudaWorkUnsafe)) return false;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     // The minimum supported ffnvcodec loader only exposes cuMemsetD8Async.
     // Multi-byte neutral patterns (P010/P016 and ARGB) therefore continue to
@@ -436,9 +429,11 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
             nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_GPU_BYTES, bytes);
         }
     }
-    if (!failed) {
-        failed = CHECK_CUDA_RESULT(
-            drv->cu->cuStreamSynchronize(drv->securityClearStream));
+    if (drv->securityClearStream != NULL) {
+        if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->securityClearStream))) {
+            atomic_store(&drv->cudaWorkUnsafe, true);
+            failed = true;
+        }
     }
     pthread_mutex_unlock(&drv->securityClearMutex);
     return !failed;
@@ -449,6 +444,7 @@ static bool clearBackingImage(NVDriver *drv, BackingImage *img) {
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         if (!clearBackingImagePlaneGpu(drv, img, i)) {
+            if (atomic_load(&drv->cudaWorkUnsafe)) return false;
             nvStatsIncrement(drv, NV_STAT_SECURITY_CLEAR_HOST_FALLBACKS);
             if (img->format != NV_FORMAT_ARGB && fmtInfo->bppc == 1) {
                 LOG("GPU backing-image clear failed; falling back to host staging");
@@ -612,9 +608,12 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv,
     // offset zero in its own object. Generic clients use natural per-plane block
     // heights; Chromium/ANGLE uses the largest block height for every plane so
     // every object advertises one shared modifier.
-    calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
+    uint32_t layoutSize;
+    if (!calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
                                    fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane,
-                                   sharedModifier);
+                                   sharedModifier, &layoutSize)) goto fail;
+    backingImage->numObjects = fmtInfo->numPlanes;
+    backingImage->numPlanes = fmtInfo->numPlanes;
     LOG_DEBUG("Allocating per-plane BackingImage: %p %ux%u shared_modifier=%d",
               backingImage, surface->width, surface->height, sharedModifier);
 
@@ -671,6 +670,7 @@ static BackingImage *direct_allocateBackingImage_perPlane(NVDriver *drv,
         backingImage->offsets[i] = 0;
         backingImage->size[i] = driverImages[i].allocationSize;
         backingImage->objectSize[i] = driverImages[i].allocationSize;
+        backingImage->planeObjectIndex[i] = i;
     }
 
     backingImage->width = surface->width;
@@ -715,14 +715,18 @@ static BackingImage *direct_allocateBackingImage_single(NVDriver *drv, NVSurface
 
     // Pass unifyBlockHeight=true: all planes are packed into one shared buffer under a
     // single DRM modifier, so they must agree on one (largest) block height.
-    backingImage->totalSize = calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
-                                                             fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane, true);
-    LOG_DEBUG("Allocating single BackingImage: %p %ux%u = %llu bytes", backingImage, surface->width, surface->height,
-              (unsigned long long) backingImage->totalSize);
-
+    uint32_t layoutSize;
     int memFd = -1;
     int memFd2 = -1;
     int drmFd = -1;
+    if (!calculate_unified_image_layout(&drv->driverContext, driverImages, surface->width, surface->height,
+                                       fmtInfo->bppc, fmtInfo->numPlanes, fmtInfo->plane, true, &layoutSize)) goto fail;
+    backingImage->totalSize = layoutSize;
+    backingImage->numObjects = 1;
+    backingImage->numPlanes = fmtInfo->numPlanes;
+    LOG_DEBUG("Allocating single BackingImage: %p %ux%u = %llu bytes", backingImage, surface->width, surface->height,
+              (unsigned long long) backingImage->totalSize);
+
     if (backingImage->totalSize > UINT32_MAX ||
         !alloc_buffer(&drv->driverContext, (uint32_t) backingImage->totalSize, driverImages, &memFd, &memFd2, &drmFd)) {
         goto fail;
@@ -816,6 +820,7 @@ fail:
 }
 
 static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *surface) {
+    if (atomic_load(&drv->cudaWorkUnsafe)) return NULL;
     if (!isRgbSurfaceFourcc((uint32_t) surface->fourcc)) {
         const NVDExportLayout layout = nvdGetExportLayout();
         if (layout == NVD_EXPORT_LAYOUT_PACKED) {
@@ -848,6 +853,9 @@ static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *s
 
     const NVFormatInfo *fmtInfo = &formatsInfo[backingImage->format];
     const NVFormatPlane *p = fmtInfo->plane;
+    backingImage->fourcc = surface->fourcc;
+    backingImage->numObjects = fmtInfo->numPlanes;
+    backingImage->numPlanes = fmtInfo->numPlanes;
 
     LOG_DEBUG("Allocating BackingImages: %p %dx%d", backingImage, surface->width, surface->height);
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
@@ -868,6 +876,7 @@ static BackingImage *direct_allocateBackingImageImpl(NVDriver *drv, NVSurface *s
     backingImage->height = surface->height;
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         backingImage->fds[i] = driverImages[i].drmFd;
+        backingImage->planeObjectIndex[i] = i;
         cacheBackingImageFdStat(backingImage, (int) i);
         backingImage->strides[i] = driverImages[i].pitch;
         backingImage->mods[i] = driverImages[i].mods;
@@ -912,6 +921,10 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
 }
 
 static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        LOG("Retaining backing image %p: GPU completion is unknown", img);
+        return;
+    }
     if (img->isExternalBuffer) {
         nvDestroyImportedBackingImage(drv, img);
         return;
@@ -949,7 +962,7 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
     if (!img->borrowedCudaResources) {
         nvDestroyBackingImageVideoProcObjects(drv, img);
         for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-            if (img->arrays[i] != NULL) {
+            if (img->arrays[i] != NULL && img->cudaImages[i].mipmapArray == NULL) {
                 CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(img->arrays[i]));
             }
 
@@ -1079,6 +1092,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
     // context stream, finish that work before reading the mapped frame.
     if (hostDestination && stream != NULL &&
         CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream))) {
+        atomic_store(&drv->cudaWorkUnsafe, true);
         nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
         return false;
     }
@@ -1137,16 +1151,15 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         !nvSyncBackingImageHostAccess(img, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE)) {
         failed = true;
     }
-    if (!hostDestination && !failed) {
-        if (completeEvent != NULL) {
+    if (!hostDestination) {
+        if (!failed && completeEvent != NULL) {
             failed = CHECK_CUDA_RESULT(drv->cu->cuEventRecord(completeEvent, stream));
         }
-        if (!failed) {
-            // The exported external-memory array is consumed outside CUDA.
-            // A completed event alone was not consistently sufficient on the
-            // release-build hardware matrix; synchronize the owning stream
-            // before NVDEC unmap and publication.
-            failed = CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream));
+        // Drain even after copy/event submission fails: earlier work may
+        // still read the mapped NVDEC frame or write the exported array.
+        if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream))) {
+            atomic_store(&drv->cudaWorkUnsafe, true);
+            failed = true;
         }
     }
     if (failed) {
@@ -1217,6 +1230,7 @@ static BackingImage *resolveSyncImage(BackingImage *img) {
 
 static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
                                  uint32_t pitch, CUstream stream, CUevent completeEvent) {
+    if (atomic_load(&drv->cudaWorkUnsafe)) return false;
     if (!direct_realiseSurface(drv, surface)) {
         return false;
     }
@@ -1239,13 +1253,8 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
         // The resolve worker clears an asynchronous image only after NVDEC
         // unmap. Publishing the backing image here permits an exporter to race
         // that final ownership transition even though the CUDA copy completed.
-        if ((completeEvent == NULL || !copied) &&
-            syncImg != NULL && syncImg->syncInitialized) {
-            pthread_mutex_lock(&syncImg->mutex);
-            syncImg->resolving = false;
-            pthread_cond_broadcast(&syncImg->cond);
-            pthread_mutex_unlock(&syncImg->mutex);
-        }
+        // The worker publishes success or failure only after unmap (or after
+        // quarantining the context when completion could not be established).
         if (!copied) {
             return false;
         }
@@ -1256,59 +1265,65 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
     return true;
 }
 
+static uint32_t rgbDrmFormat(uint32_t fourcc) {
+    // VA names describe byte order; DRM names describe little-endian words.
+    switch (fourcc) {
+    case VA_FOURCC_ARGB: return DRM_FORMAT_BGRA8888;
+    case VA_FOURCC_XRGB: return DRM_FORMAT_BGRX8888;
+    case VA_FOURCC_ABGR: return DRM_FORMAT_RGBA8888;
+    case VA_FOURCC_XBGR: return DRM_FORMAT_RGBX8888;
+    case VA_FOURCC_RGBA: return DRM_FORMAT_ABGR8888;
+    case VA_FOURCC_RGBX: return DRM_FORMAT_XBGR8888;
+    case VA_FOURCC_BGRA: return DRM_FORMAT_ARGB8888;
+    case VA_FOURCC_BGRX: return DRM_FORMAT_XRGB8888;
+    default: return 0;
+    }
+}
+
 static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc) {
     const BackingImage *img = surface->backingImage;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
 
     nvBackingImageStoreSurfaceColorMetadata(surface->backingImage, surface);
 
-    desc->fourcc = fmtInfo->fourcc;
+    memset(desc, 0, sizeof(*desc));
+    if (atomic_load(&drv->cudaWorkUnsafe) || img->numObjects == 0 ||
+        img->numObjects > 4 || img->numPlanes != fmtInfo->numPlanes) return false;
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        if (img->objectSize[i] == 0 || img->objectSize[i] > UINT32_MAX) return false;
+    }
+    for (uint32_t i = 0; i < img->numPlanes; i++) {
+        if (img->planeObjectIndex[i] >= img->numObjects ||
+            img->offsets[i] < 0 || img->strides[i] <= 0) return false;
+    }
+    desc->fourcc = img->fourcc;
     desc->width = surface->width;
     desc->height = surface->height;
 
     desc->num_layers = fmtInfo->numPlanes;
     nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS);
-    if (img->isSingleBuffer) {
-        nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
-        desc->num_objects = 1;
-        desc->objects[0].fd = nvDupFdCloexec(img->fds[0]);
-        if (desc->objects[0].fd < 0) {
+    nvStatsIncrement(drv, img->numObjects == 1 ? NV_STAT_EXPORT_DESCRIPTORS_SINGLE : NV_STAT_EXPORT_DESCRIPTORS_MULTI);
+    desc->num_objects = img->numObjects;
+    for (uint32_t i = 0; i < img->numObjects; i++) {
+        desc->objects[i].fd = nvDupFdCloexec(img->fds[i]);
+        if (desc->objects[i].fd < 0) {
+            for (uint32_t j = 0; j < i; j++) {
+                close(desc->objects[j].fd);
+                desc->objects[j].fd = -1;
+            }
             desc->num_objects = 0;
             return false;
         }
-        desc->objects[0].size = img->totalSize;
-        desc->objects[0].drm_format_modifier = img->mods[0];
-
-        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-            desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
-            desc->layers[i].num_planes = 1;
-            desc->layers[i].object_index[0] = 0;
-            desc->layers[i].offset[0] = img->offsets[i];
-            desc->layers[i].pitch[0] = img->strides[i];
-        }
-    } else {
-        nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_MULTI);
-        desc->num_objects = fmtInfo->numPlanes;
-
-        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-            desc->objects[i].fd = nvDupFdCloexec(img->fds[i]);
-            if (desc->objects[i].fd < 0) {
-                for (uint32_t j = 0; j < i; j++) {
-                    close(desc->objects[j].fd);
-                    desc->objects[j].fd = -1;
-                }
-                desc->num_objects = 0;
-                return false;
-            }
-            desc->objects[i].size = img->size[i];
-            desc->objects[i].drm_format_modifier = img->mods[i];
-
-            desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
-            desc->layers[i].num_planes = 1;
-            desc->layers[i].object_index[0] = i;
-            desc->layers[i].offset[0] = img->offsets[i];
-            desc->layers[i].pitch[0] = img->strides[i];
-        }
+        desc->objects[i].size = (uint32_t) img->objectSize[i];
+        desc->objects[i].drm_format_modifier = img->mods[i];
+    }
+    for (uint32_t i = 0; i < img->numPlanes; i++) {
+        desc->layers[i].drm_format = img->format == NV_FORMAT_ARGB
+            ? rgbDrmFormat(img->fourcc) : fmtInfo->plane[i].fourcc;
+        desc->layers[i].num_planes = 1;
+        desc->layers[i].object_index[0] = img->planeObjectIndex[i];
+        desc->layers[i].offset[0] = img->offsets[i];
+        desc->layers[i].pitch[0] = img->strides[i];
     }
 
     return true;

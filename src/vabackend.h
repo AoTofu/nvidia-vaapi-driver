@@ -198,6 +198,9 @@ typedef struct _NVDriver
     CudaFunctions           *cu;
     CuvidFunctions          *cv;
     CUcontext               cudaContext;
+    // A failed completion check leaves GPU ownership unknown. Retain resources
+    // until process exit and reject further work instead of recycling them.
+    atomic_bool             cudaWorkUnsafe;
     CUvideoctxlock          vidLock;
     NVDObjectTable          objects;
     // Coarse lifetime barrier for VA objects. Ordinary entrypoints hold a

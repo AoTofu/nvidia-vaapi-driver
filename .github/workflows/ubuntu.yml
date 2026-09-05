@@ -1,23 +1,32 @@
 name: ubuntu
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   ci:
     strategy:
+      fail-fast: false
       matrix:
-        compiler: [clang-15, gcc]
-        os: [ubuntu-22.04]
+        compiler: [clang-18, gcc]
+        os: [ubuntu-24.04]
+        vp9: [enabled, disabled]
+        sanitizer: [none, 'address,undefined']
     runs-on: ${{ matrix.os }}
     env:
       CC: ${{ matrix.compiler }}
       DISTRO: ${{ matrix.os }}
     steps:
     - name: 'Checkout'
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: 'Install toolchain'
-      if: ${{ (matrix.compiler == 'clang-15') }}
-      run: .github/workflows/install-clang.sh 15
+      if: ${{ (matrix.compiler == 'clang-18') }}
+      run: .github/workflows/install-clang.sh 18
     - name: 'Install prerequisites'
       run: |
         sudo apt-get update
@@ -25,9 +34,16 @@ jobs:
           libdrm-dev \
           libva-dev \
           libegl-dev \
+          libgstreamer-plugins-bad1.0-dev \
           meson
     - name: 'Configure'
-      run: meson setup ./builddir --prefix=/usr --buildtype=release -D werror=true
+      run: |
+        extra=()
+        if [[ "$CC" == clang-* && '${{ matrix.sanitizer }}' != none ]]; then
+          # Clang resolves shared-library sanitizer symbols in the host process.
+          extra+=(-Db_lundef=false)
+        fi
+        meson setup ./builddir --prefix=/usr --buildtype=debugoptimized -Dwerror=true -Dvp9=${{ matrix.vp9 }} -Db_sanitize=${{ matrix.sanitizer }} "${extra[@]}"
     - name: 'Build'
       run: meson compile -C ./builddir
     - name: 'Test'

@@ -351,6 +351,18 @@ static void init() {
     char *nvdLogVerbose = getenv("NVD_LOG_VERBOSE");
     LOG_DEBUG_ENABLED = nvdLogVerbose != NULL && strcmp(nvdLogVerbose, "0") != 0;
     EXPORT_LAYOUT = selectExportLayout();
+    const char *requestedLayout = getenv("NVD_EXPORT_LAYOUT");
+    const char *legacyLayout = getenv("NVD_SINGLE_BUFFER");
+    LOG("Export layout=%s requested=%s legacy=%s chromium=%d",
+        EXPORT_LAYOUT == NVD_EXPORT_LAYOUT_PACKED ? "packed" :
+        EXPORT_LAYOUT == NVD_EXPORT_LAYOUT_PER_PLANE_SHARED_MODIFIER ?
+            "per-plane-shared-modifier" : "per-plane-natural",
+        requestedLayout != NULL ? requestedLayout : "auto (unset)",
+        legacyLayout != NULL ? legacyLayout : "unset",
+        cmdlineHasGpuProcess() || processLooksChromium());
+    Dl_info loadedDriver = {0};
+    if (dladdr((void *) &init, &loadedDriver) != 0)
+        LOG("Loaded driver: %s", loadedDriver.dli_fname);
     char *nvdStats = getenv("NVD_STATS");
     if (nvdStats != NULL && strcmp(nvdStats, "0") != 0) {
         char *nvdStatsLog = getenv("NVD_STATS_LOG");
@@ -551,8 +563,9 @@ static uint64_t defaultMaxDetachedBackingImageBytes(int cudaGpuId) {
 
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line) {
     if (CUDA_SUCCESS != err) {
-        const char *errStr = NULL;
-        cu->cuGetErrorString(err, &errStr);
+        const char *errStr = "unavailable";
+        if (cu != NULL && cu->cuGetErrorString != NULL)
+            cu->cuGetErrorString(err, &errStr);
         logger(file, function, line, "CUDA ERROR '%s' (%d)\n", errStr, err);
         return true;
     }
@@ -716,6 +729,7 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
         }
         nvCtx->resolveThreadStarted = false;
     }
+    if (atomic_load(&drv->cudaWorkUnsafe)) return false;
     if (nvCtx->decoder != NULL) {
         if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
             return false;
@@ -1237,7 +1251,8 @@ static void* resolveSurfaces(void *param) {
         CUdeviceptr deviceMemory = (CUdeviceptr) NULL;
         unsigned int pitch = 0;
         bool mapped = false;
-        bool failed = job->decodeStatus != VA_STATUS_SUCCESS;
+        bool failed = job->decodeStatus != VA_STATUS_SUCCESS ||
+                      atomic_load(&drv->cudaWorkUnsafe);
 
         CUVIDPROCPARAMS procParams = {
             .progressive_frame = job->progressiveFrame,
@@ -1261,7 +1276,12 @@ static void* resolveSurfaces(void *param) {
                                              ctx->resolveCompleteEvent)) {
                 failed = true;
             }
-            if (CHECK_CUDA_RESULT(
+            // A failed export may have returned before copying (allocation,
+            // host access, etc.). Drain NVDEC's output stream on that path too.
+            if (failed && CHECK_CUDA_RESULT(cu->cuStreamSynchronize(ctx->resolveStream))) {
+                atomic_store(&drv->cudaWorkUnsafe, true);
+            }
+            if (!atomic_load(&drv->cudaWorkUnsafe) && CHECK_CUDA_RESULT(
                     cv->cuvidUnmapVideoFrame(job->decoder, deviceMemory))) {
                 failed = true;
             }
@@ -1271,7 +1291,7 @@ static void* resolveSurfaces(void *param) {
         const bool currentGeneration =
             surface->submittedGeneration == job->generation;
         if (currentGeneration) {
-            surface->decodeFailed = failed;
+            surface->decodeFailed = failed || atomic_load(&drv->cudaWorkUnsafe);
         }
         pthread_mutex_unlock(&surface->mutex);
         if (currentGeneration) {
@@ -1280,6 +1300,14 @@ static void* resolveSurfaces(void *param) {
         free(job);
         job = NULL;
     }
+    if (CHECK_CUDA_RESULT(cu->cuStreamSynchronize(ctx->resolveStream))) {
+        atomic_store(&drv->cudaWorkUnsafe, true);
+    }
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        LOG("Retaining decoder and resolve stream: GPU completion is unknown");
+        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+        return NULL;
+    }
     //release the decoder here to prevent multiple threads attempting it
     if (ctx->decoder != NULL) {
         CUresult result = cv->cuvidDestroyDecoder(ctx->decoder);
@@ -1287,9 +1315,6 @@ static void* resolveSurfaces(void *param) {
         if (result != CUDA_SUCCESS) {
             LOG("cuvidDestroyDecoder failed: %d", result);
         }
-    }
-    if (ctx->resolveStream != NULL) {
-        CHECK_CUDA_RESULT(cu->cuStreamSynchronize(ctx->resolveStream));
     }
     if (ctx->resolveCompleteEvent != NULL) {
         CHECK_CUDA_RESULT(cu->cuEventDestroy(ctx->resolveCompleteEvent));
@@ -2080,7 +2105,6 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
             img->strides[i] = existing->strides[i];
             img->offsets[i] = existing->offsets[i];
             img->size[i] = existing->size[i];
-            img->mods[i] = existing->mods[i];
         }
         img->totalSize = existing->totalSize != 0 ? existing->totalSize : existing->size[0];
         img->borrowedCudaResources = true;
@@ -2298,6 +2322,10 @@ static VAStatus nvCreateSurfaces2(
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
     uint32_t surfaceFourcc = importSurface ? imported.pixelFormat : 0;
+    if (!importSurface && format == VA_RT_FORMAT_RGB32 && imported.pixelFormat != 0) {
+        if (!isRgbFourcc(imported.pixelFormat)) return VA_STATUS_ERROR_INVALID_PARAMETER;
+        surfaceFourcc = imported.pixelFormat;
+    }
 
     cudaVideoSurfaceFormat nvFormat;
     cudaVideoChromaFormat chromaFormat;
@@ -4484,6 +4512,7 @@ static VAStatus nvBeginPictureImpl(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    if (atomic_load(&drv->cudaWorkUnsafe)) return VA_STATUS_ERROR_OPERATION_FAILED;
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
     NVSurface *surface = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, render_target);
 
@@ -4649,6 +4678,10 @@ static VAStatus nvRenderPictureImpl(
 
     if (nvCtx == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        cancelCurrentPictureResolve(nvCtx);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     if (num_buffers < 0 || (num_buffers > 0 && buffers == NULL)) {
         cancelCurrentPictureResolve(nvCtx);
@@ -4880,6 +4913,12 @@ static VAStatus nvEndPictureImpl(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        NVContext *failedCtx = getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
+        if (failedCtx != NULL && failedCtx->renderTarget != NULL)
+            failSurfaceResolve(failedCtx->renderTarget, VA_STATUS_ERROR_OPERATION_FAILED);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
     if (nvCtx != NULL && nvCtx->entrypoint == VAEntrypointVideoProc) {
@@ -6065,11 +6104,17 @@ static VAStatus nvTerminate( VADriverContextP ctx )
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    drv->backend->destroyAllBackingImage(drv);
-
-    if (drv->securityClearStream != NULL) {
-        CHECK_CUDA_RESULT(cu->cuStreamSynchronize(drv->securityClearStream));
+    if ((drv->securityClearStream != NULL &&
+         CHECK_CUDA_RESULT(cu->cuStreamSynchronize(drv->securityClearStream))) ||
+        (drv->videoProcStream != NULL &&
+         CHECK_CUDA_RESULT(cu->cuStreamSynchronize(drv->videoProcStream)))) {
+        atomic_store(&drv->cudaWorkUnsafe, true);
     }
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    drv->backend->destroyAllBackingImage(drv);
     if (drv->securityClearBuffer != 0) {
         CHECK_CUDA_RESULT(cu->cuMemFree(drv->securityClearBuffer));
         drv->securityClearBuffer = 0;

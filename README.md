@@ -176,12 +176,12 @@ If you're using the Snap version of Firefox, it will be unable to access the hos
 
 ## Chrome
 
-This fork defaults Chromium-family GPU processes to one dma-buf object per plane with a shared DRM modifier, matching current Chromium/ANGLE while keeping every plane at offset zero. Generic clients retain natural per-plane modifiers. A packed single-buffer fallback remains available with `NVD_EXPORT_LAYOUT=packed` for older importers.
+The installer explicitly selects `NVD_EXPORT_LAYOUT=packed` for Chrome to work around split frames during repeated seeking on tested NVIDIA Wayland configurations. The library's unset/`auto` policy still selects shared-modifier per-plane objects for Chromium-family processes and natural per-plane modifiers for other clients. Close all existing Chrome processes before relaunching, or use a separate `--user-data-dir`, so the new environment reaches the GPU process. With `NVD_LOG=1`, startup logs identify the loaded driver path and selected layout.
 
 Start the browser with flags similar to:
 
 ```sh
-LIBVA_DRIVER_NAME=nvidia google-chrome \
+LIBVA_DRIVER_NAME=nvidia NVD_BACKEND=direct NVD_EXPORT_LAYOUT=packed google-chrome \
   --enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs \
   --ignore-gpu-blocklist \
   --use-gl=angle --use-angle=gl
@@ -189,7 +189,7 @@ LIBVA_DRIVER_NAME=nvidia google-chrome \
 
 On Wayland, also try `--ozone-platform=wayland` or `--ozone-platform-hint=auto`.
 
-The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or `chromium-browser` and generate the same command with the direct backend and automatic export-layout policy enabled:
+The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or `chromium-browser` and generate the same command with the direct backend and packed export layout enabled:
 
 ```sh
 # Print a copy-and-paste command without building or installing.
@@ -199,7 +199,7 @@ The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or
 ./install.sh --launch-chrome --chrome-wayland -- https://example.com/
 ```
 
-Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=auto`. Normal installation creates current-user desktop overrides with the same settings; it does not change system desktop files or global browser policy. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
+Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=packed`. Normal installation creates current-user desktop overrides with the same settings; it does not change system desktop files or global browser policy. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
 
 Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 

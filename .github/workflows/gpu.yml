@@ -1,0 +1,25 @@
+name: GPU state checks
+
+# GPU runners are provisioned separately; no automatic untrusted PR execution.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  gpu:
+    runs-on: [self-hosted, linux, x64, nvidia]
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        layout: [packed, per-plane-shared-modifier, per-plane-natural]
+      max-parallel: 1
+    env:
+      NVD_BACKEND: direct
+      NVD_EXPORT_LAYOUT: ${{ matrix.layout }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Configure
+        run: meson setup build-gpu -Dgpu_tests=true -Dvp9=enabled -Dwerror=true
+      - name: Build
+        run: meson compile -C build-gpu
+      - name: GPU state test
+        run: meson test -C build-gpu --suite gpu --print-errorlogs

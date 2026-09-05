@@ -11,6 +11,7 @@
 
 #include <va/va.h>
 #include <va/va_drm.h>
+#include <va/va_drmcommon.h>
 
 static void requireStatus(const char *operation, VAStatus actual, VAStatus expected) {
     if (actual != expected) {
@@ -24,6 +25,61 @@ static void requireFailure(const char *operation, VAStatus status) {
     if (status == VA_STATUS_SUCCESS) {
         fprintf(stderr, "%s unexpectedly succeeded\n", operation);
         exit(EXIT_FAILURE);
+    }
+}
+
+static void testExportRoundtrip(VADisplay display) {
+    const uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010,
+        VA_FOURCC_ARGB, VA_FOURCC_XRGB, VA_FOURCC_ABGR, VA_FOURCC_XBGR,
+        VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_BGRA, VA_FOURCC_BGRX};
+    for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+        VASurfaceAttrib pixel = {.type = VASurfaceAttribPixelFormat,
+            .flags = VA_SURFACE_ATTRIB_SETTABLE,
+            .value = {.type = VAGenericValueTypeInteger, .value.i = (int) formats[f]}};
+        unsigned rt = f == 0 ? VA_RT_FORMAT_YUV420 : f == 1 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_RGB32;
+        VASurfaceID surface, imported;
+        requireStatus("create export surface", vaCreateSurfaces(display, rt, 128, 128, &surface, 1, &pixel, 1), VA_STATUS_SUCCESS);
+        VADRMPRIMESurfaceDescriptor first = {0}, second = {0};
+        requireStatus("export allocated surface", vaExportSurfaceHandle(display, surface,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &first), VA_STATUS_SUCCESS);
+        if (first.fourcc != formats[f]) {
+            fprintf(stderr, "export changed pixel format: requested=%08x actual=%08x\n", formats[f], first.fourcc);
+            exit(EXIT_FAILURE);
+        }
+        if (first.num_objects == 2) {
+            // Reverse object order without changing which storage each plane uses.
+            VADRMPRIMESurfaceDescriptor swapped = first;
+            first.objects[0] = swapped.objects[1];
+            first.objects[1] = swapped.objects[0];
+            for (unsigned l = 0; l < first.num_layers; l++)
+                first.layers[l].object_index[0] = 1 - first.layers[l].object_index[0];
+        }
+        VASurfaceAttrib attrs[] = {pixel,
+            {.type = VASurfaceAttribMemoryType, .flags = VA_SURFACE_ATTRIB_SETTABLE,
+             .value = {.type = VAGenericValueTypeInteger, .value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2}},
+            {.type = VASurfaceAttribExternalBufferDescriptor, .flags = VA_SURFACE_ATTRIB_SETTABLE,
+             .value = {.type = VAGenericValueTypePointer, .value.p = &first}}};
+        requireStatus("import exported surface", vaCreateSurfaces(display, rt, 128, 128, &imported, 1, attrs, 3), VA_STATUS_SUCCESS);
+        requireStatus("re-export imported surface", vaExportSurfaceHandle(display, imported,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &second), VA_STATUS_SUCCESS);
+        if (first.fourcc != second.fourcc || first.num_objects != second.num_objects || first.num_layers != second.num_layers)
+            exit(EXIT_FAILURE);
+        for (unsigned i = 0; i < first.num_objects; i++) {
+            if (first.objects[i].size != second.objects[i].size ||
+                first.objects[i].drm_format_modifier != second.objects[i].drm_format_modifier)
+                exit(EXIT_FAILURE);
+            close(first.objects[i].fd);
+            close(second.objects[i].fd);
+        }
+        for (unsigned l = 0; l < first.num_layers; l++) {
+            if (first.layers[l].drm_format != second.layers[l].drm_format ||
+                first.layers[l].object_index[0] != second.layers[l].object_index[0] ||
+                first.layers[l].offset[0] != second.layers[l].offset[0] ||
+                first.layers[l].pitch[0] != second.layers[l].pitch[0])
+                exit(EXIT_FAILURE);
+        }
+        requireStatus("destroy re-import", vaDestroySurfaces(display, &imported, 1), VA_STATUS_SUCCESS);
+        requireStatus("destroy export source", vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
     }
 }
 
@@ -57,6 +113,11 @@ static void *queryConfigUntilDestroyed(void *opaque) {
 }
 
 int main(int argc, char **argv) {
+    const char *enabled = getenv("NVD_RUN_GPU_TESTS");
+    if (enabled == NULL || enabled[0] != '1') {
+        fprintf(stderr, "SKIP: configure with -Dgpu_tests=true on an NVIDIA GPU host\n");
+        return 77;
+    }
     const char *device = argc > 1 ? argv[1] : "/dev/dri/renderD128";
     int fd = open(device, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -69,6 +130,7 @@ int main(int argc, char **argv) {
     int minor = 0;
     requireStatus("vaInitialize", vaInitialize(display, &major, &minor),
                   VA_STATUS_SUCCESS);
+    testExportRoundtrip(display);
 
     VAEntrypoint unsupportedEntrypoints[4] = {0};
     int unsupportedEntrypointCount = 4;
