@@ -40,7 +40,7 @@ static int copies, syncs, events, copyFailure, eventFailure, syncFailure;
 static CUresult CUDAAPI mockCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
     copies++;
     assert(syncs == 0);
-    return copies == copyFailure ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+    return copies == copyFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 }
 static CUresult CUDAAPI mockSync(CUstream stream) {
     syncs++;
@@ -49,7 +49,7 @@ static CUresult CUDAAPI mockSync(CUstream stream) {
 static CUresult CUDAAPI mockEvent(CUevent event, CUstream stream) {
     events++;
     assert(copies == 2 && syncs == 0);
-    return eventFailure ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+    return eventFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 }
 static CUresult CUDAAPI mockMemset(CUdeviceptr ptr, unsigned char value, size_t size, CUstream stream) {
     return CUDA_SUCCESS;
