@@ -1,10 +1,17 @@
 name: ubuntu
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   ci:
     strategy:
+      fail-fast: false
       matrix:
         compiler: [clang-18, gcc]
         os: [ubuntu-24.04]
@@ -30,7 +37,13 @@ jobs:
           libgstreamer-plugins-bad1.0-dev \
           meson
     - name: 'Configure'
-      run: meson setup ./builddir --prefix=/usr --buildtype=debugoptimized -Dwerror=true -Dvp9=${{ matrix.vp9 }} -Db_sanitize=${{ matrix.sanitizer }}
+      run: |
+        extra=()
+        if [[ "$CC" == clang-* && '${{ matrix.sanitizer }}' != none ]]; then
+          # Clang resolves shared-library sanitizer symbols in the host process.
+          extra+=(-Db_lundef=false)
+        fi
+        meson setup ./builddir --prefix=/usr --buildtype=debugoptimized -Dwerror=true -Dvp9=${{ matrix.vp9 }} -Db_sanitize=${{ matrix.sanitizer }} "${extra[@]}"
     - name: 'Build'
       run: meson compile -C ./builddir
     - name: 'Test'
