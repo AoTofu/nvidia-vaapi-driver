@@ -115,12 +115,19 @@ static VAProcColorStandardType vp9ColorStandard(GstVp9ColorSpace colorSpace) {
 static void parseExtraInfo(NVContext *ctx, void *buf, uint32_t size, CUVIDPICPARAMS *picParams) {
     VP9Context *vp9 = getVP9Context(ctx);
     if (vp9 == NULL || vp9->parser == NULL) {
+        ctx->inputValidationFailed = true;
         return;
     }
 
     //parse all the extra information that VA-API doesn't support, but NVDEC requires
     GstVp9FrameHdr hdr;
     GstVp9ParserResult res = gst_vp9_parser_parse_frame_header(vp9->parser, &hdr, buf, size);
+    if (res != GST_VP9_PARSER_OK) {
+        LOG("VP9 header parse failed: result=%d context=%p surface=%p bytes=%u",
+            res, ctx, ctx->renderTarget, size);
+        ctx->inputValidationFailed = true;
+        return;
+    }
 
     if (res == GST_VP9_PARSER_OK) {
         for (int i = 0; i < 8; i++) {

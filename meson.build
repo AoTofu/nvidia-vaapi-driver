@@ -24,7 +24,7 @@ deps = [
 libva_deps = dependency('libva', version: '>= 1.8.0').partial_dependency(compile_args: true)
 deps += [libva_deps]
 
-gst_codecs_deps = dependency('gstreamer-codecparsers-1.0', required: false)
+gst_codecs_deps = dependency('gstreamer-codecparsers-1.0', required: get_option('vp9'))
 
 if cc.get_argument_syntax() == 'gcc'
     add_project_arguments(
@@ -80,6 +80,19 @@ endif
 
 nvidia_incdir = include_directories('nvidia-include')
 nvidia_install_dir = libva_deps.get_variable(pkgconfig: 'driverdir')
+
+audit_sources = []
+foreach source : sources
+    if source != 'src/direct/direct-export-buf.c' and source != 'src/vp9.c' and source != 'src/vabackend.c'
+        audit_sources += [source]
+    endif
+endforeach
+direct_audit_test = executable('test-direct-audit',
+    ['tests/test-direct-audit.c'] + audit_sources,
+    dependencies: deps, include_directories: nvidia_incdir,
+    c_args: ['-UNDEBUG', '-DNVD_TEST_VP9=' + (gst_codecs_deps.found() ? '1' : '0')],
+    link_args: ['-Wl,--wrap=ioctl', '-Wl,--wrap=dlopen'])
+test('direct audit regressions', direct_audit_test, timeout: 30)
 
 shared_library(
     'nvidia_drv_video',
@@ -139,11 +152,17 @@ test('codec slice ranges', codec_utils_test, timeout: 30)
 
 libva_drm_deps = dependency('libva-drm', required: false)
 if libva_drm_deps.found()
-    executable(
+    gpu_state_test = executable(
         'test-va-api-state',
         'tests/test-va-api-state.c',
         dependencies: libva_drm_deps,
     )
+    test('GPU VA-API state', gpu_state_test, suite: 'gpu', timeout: 180,
+         env: ['NVD_RUN_GPU_TESTS=' + (get_option('gpu_tests') ? '1' : '0'),
+               'LIBVA_DRIVER_NAME=nvidia',
+               'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
+elif get_option('gpu_tests')
+    error('GPU tests require libva-drm')
 endif
 
 bash = find_program('bash')

@@ -1,0 +1,2 @@
+option('vp9', type: 'feature', value: 'auto', description: 'GStreamer VP9 header parsing')
+option('gpu_tests', type: 'boolean', value: false, description: 'Enable VA-API GPU state tests')
