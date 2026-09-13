@@ -203,6 +203,33 @@ Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) fo
 
 Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
+### Recovering a launcher after a Chrome update
+
+Normal integration preserves custom launch commands. If a separate Chrome
+binary hotpatcher becomes incompatible after a browser update, this also
+preserves the failing wrapper. This driver's hardware **decode** support does
+not require the H.264 **encode** hotpatch from `chrome-vaapi-hotpatch`.
+
+To replace that wrapper with the installed browser's launch command:
+
+```sh
+./install.sh --chrome-integration-only --restore-chrome-launcher google-chrome.desktop
+```
+
+Recovery uses the matching desktop file from `XDG_DATA_DIRS`, backs up the
+existing user entry (even when already managed), and reapplies the NVIDIA
+decode settings. It restores all actions, including incognito, from that
+template. Custom commands, flags and other launcher customizations are replaced;
+browser profiles and other desktop entries are untouched. A missing template
+or backup failure leaves the current entry unchanged. Flatpak templates are
+unsupported. Restore the printed backup file to roll back.
+
+Distribution updates can also replace a manually installed driver at the
+package-owned path. To use a previously built driver without reinstalling it,
+prefix the recovery command with `NVD_DRIVER_DIR=/absolute/path/to/build`.
+Keep that directory available: Chrome will load `nvidia_drv_video.so` from it.
+This changes only the selected browser launcher, not the system-wide driver.
+
 ## MPV
 
 Currently this only works with a recent MPV version (at least 0.36.0).

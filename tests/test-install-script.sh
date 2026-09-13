@@ -189,3 +189,102 @@ if grep -Fq '# Managed by AoTofu nvidia-vaapi-driver install.sh' "$FAIL_DESKTOP_
     echo "Chrome launcher was marked managed after its backup failed" >&2
     exit 1
 fi
+
+# Recovery must replace an already-managed failing wrapper, not merge it again.
+SYSTEM_DATA="$TMP_DIR/system-data"
+SYSTEM_DESKTOP="$SYSTEM_DATA/applications/google-chrome.desktop"
+mkdir -p "$SYSTEM_DATA/applications"
+cat >"$SYSTEM_DESKTOP" <<'EOF'
+[Desktop Entry]
+Name=Google Chrome
+Exec=/usr/bin/google-chrome-stable %U
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/usr/bin/google-chrome-stable
+
+[Desktop Action new-private-window]
+Name=New Incognito Window
+Exec=/usr/bin/google-chrome-stable --incognito
+EOF
+SYSTEM_HASH="$(sha256sum "$SYSTEM_DESKTOP" | awk '{print $1}')"
+cp "$DESKTOP_FILE" "$TMP_DIR/broken-managed.desktop"
+cp "$DESKTOP_FILE" "$APPLICATION_DIR/chromium.desktop"
+
+if XDG_DATA_HOME="$USER_DATA" XDG_DATA_DIRS="$USER_DATA:$SYSTEM_DATA" \
+    PATH="$FAIL_BIN:$PATH" "$ROOT_DIR/install.sh" --chrome-integration-only \
+    --restore-chrome-launcher google-chrome.desktop >/dev/null 2>&1; then
+    echo "Recovery ignored a managed-launcher backup failure" >&2
+    exit 1
+fi
+cmp "$DESKTOP_FILE" "$TMP_DIR/broken-managed.desktop"
+
+RECOVERY_DRIVER_DIR="$TMP_DIR/custom-driver"
+XDG_DATA_HOME="$USER_DATA" XDG_DATA_DIRS="$USER_DATA:$SYSTEM_DATA" \
+    NVD_DRIVER_DIR="$RECOVERY_DRIVER_DIR" "$ROOT_DIR/install.sh" \
+    --chrome-integration-only --restore-chrome-launcher google-chrome.desktop \
+    >"$TMP_DIR/recovery-output"
+
+RECOVERY_BACKUP="$(sed -n 's/^Backed up existing Chrome launcher to //p' "$TMP_DIR/recovery-output")"
+cmp "$RECOVERY_BACKUP" "$TMP_DIR/broken-managed.desktop"
+cmp "$APPLICATION_DIR/chromium.desktop" "$TMP_DIR/broken-managed.desktop"
+if grep -Eq 'chrome-hotpatch|AcceleratedVideoEncoder' "$DESKTOP_FILE"; then
+    echo "Recovery preserved the failing encode wrapper or its flags" >&2
+    exit 1
+fi
+if [ "$(grep -c '^Exec=.* /usr/bin/google-chrome-stable' "$DESKTOP_FILE")" -ne 3 ]; then
+    echo "Recovery did not restore every desktop action" >&2
+    exit 1
+fi
+grep -F "LIBVA_DRIVERS_PATH=$RECOVERY_DRIVER_DIR" "$DESKTOP_FILE"
+grep -F 'NVD_EXPORT_LAYOUT=packed' "$DESKTOP_FILE"
+grep -F 'VaapiOnNvidiaGPUs' "$DESKTOP_FILE"
+grep -F -- '--incognito' "$DESKTOP_FILE"
+grep -F -- '%U' "$DESKTOP_FILE"
+if [ "$SYSTEM_HASH" != "$(sha256sum "$SYSTEM_DESKTOP" | awk '{print $1}')" ]; then
+    echo "Recovery modified the system template" >&2
+    exit 1
+fi
+
+# Another recovery must create its own backup, even within the same second.
+cp "$DESKTOP_FILE" "$TMP_DIR/recovered.desktop"
+XDG_DATA_HOME="$USER_DATA" XDG_DATA_DIRS="$SYSTEM_DATA" \
+    NVD_DRIVER_DIR="$RECOVERY_DRIVER_DIR" "$ROOT_DIR/install.sh" \
+    --chrome-integration-only --restore-chrome-launcher google-chrome.desktop \
+    >"$TMP_DIR/recovery-repeat-output"
+REPEAT_BACKUP="$(sed -n 's/^Backed up existing Chrome launcher to //p' "$TMP_DIR/recovery-repeat-output")"
+test "$REPEAT_BACKUP" != "$RECOVERY_BACKUP"
+cmp "$RECOVERY_BACKUP" "$TMP_DIR/broken-managed.desktop"
+cmp "$REPEAT_BACKUP" "$TMP_DIR/recovered.desktop"
+cmp "$DESKTOP_FILE" "$TMP_DIR/recovered.desktop"
+
+# Never mistake the user override for a system template.
+if XDG_DATA_HOME="$USER_DATA" XDG_DATA_DIRS="$USER_DATA" \
+    "$ROOT_DIR/install.sh" --chrome-integration-only \
+    --restore-chrome-launcher google-chrome.desktop >/dev/null 2>&1; then
+    echo "Recovery accepted an absent system template" >&2
+    exit 1
+fi
+cmp "$DESKTOP_FILE" "$TMP_DIR/recovered.desktop"
+
+if XDG_DATA_HOME="$USER_DATA" "$ROOT_DIR/install.sh" \
+    --restore-chrome-launcher google-chrome.desktop >/dev/null 2>&1; then
+    echo "Recovery was accepted without integration-only mode" >&2
+    exit 1
+fi
+if XDG_DATA_HOME="$USER_DATA" "$ROOT_DIR/install.sh" \
+    --chrome-integration-only --restore-chrome-launcher ../outside.desktop >/dev/null 2>&1; then
+    echo "Recovery accepted an unsupported desktop filename" >&2
+    exit 1
+fi
+if "$ROOT_DIR/install.sh" --chrome-integration-only --restore-chrome-launcher >/dev/null 2>&1; then
+    echo "Recovery accepted a missing desktop filename" >&2
+    exit 1
+fi
+if XDG_DATA_HOME="$FLATPAK_USER_DATA" XDG_DATA_DIRS="$FLATPAK_SYSTEM_DATA" \
+    "$ROOT_DIR/install.sh" --chrome-integration-only \
+    --restore-chrome-launcher com.google.Chrome.desktop >/dev/null 2>&1; then
+    echo "Recovery accepted a Flatpak template" >&2
+    exit 1
+fi
+test ! -e "$FLATPAK_TARGET"
