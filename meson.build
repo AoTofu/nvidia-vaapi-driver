@@ -94,7 +94,7 @@ direct_audit_test = executable('test-direct-audit',
     link_args: ['-Wl,--wrap=ioctl', '-Wl,--wrap=dlopen'])
 test('direct audit regressions', direct_audit_test, timeout: 30)
 
-shared_library(
+driver = shared_library(
     'nvidia_drv_video',
     name_prefix: '',
     sources: sources,
@@ -158,6 +158,7 @@ if libva_drm_deps.found()
         dependencies: libva_drm_deps,
     )
     test('GPU VA-API state', gpu_state_test, suite: 'gpu', timeout: 180,
+         depends: driver,
          env: ['NVD_RUN_GPU_TESTS=' + (get_option('gpu_tests') ? '1' : '0'),
                'LIBVA_DRIVER_NAME=nvidia',
                'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
