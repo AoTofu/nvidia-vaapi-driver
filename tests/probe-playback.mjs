@@ -1,10 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
+import {createHash} from 'node:crypto';
 // Node >=22; headed Chrome with an isolated profile. This is a diagnostic probe,
 // not a pass/fail test: a site can reject a request independently of decoding.
 // Usage: node tests/probe-playback.mjs DRIVER_DIR URL_OR_FILE RUN_DIR [SECONDS] [RATE]
 // NVD_PROBE_SOFTWARE=1 disables accelerated decoding for a control run.
+// NVD_PROBE_LABS is a JSON array of chrome://flags settings; NVD_PROBE_QUALITY
+// requests a YouTube quality such as hd1080. Neither changes the user's profile.
 import {pathToFileURL} from 'node:url';
 const [driverDir,input,runDir,seconds='480',rate='2']=process.argv.slice(2);
 if(!driverDir||!input||!runDir)throw Error('Expected DRIVER_DIR URL_OR_FILE RUN_DIR [SECONDS] [RATE]');
@@ -14,7 +17,23 @@ if(fs.existsSync(path.join(runDir,'profile')))throw Error('Use a fresh RUN_DIR f
 const url=/^https?:/.test(input)?input:pathToFileURL(path.resolve(input)).href;
 fs.mkdirSync(runDir,{recursive:true});
 const profile=path.resolve(runDir,'profile'),events=path.resolve(runDir,'events.jsonl');
+const labs=JSON.parse(process.env.NVD_PROBE_LABS??'[]');
+if(!Array.isArray(labs)||labs.some(x=>typeof x!=='string'))throw Error('Invalid NVD_PROBE_LABS');
+const requestedQuality=process.env.NVD_PROBE_QUALITY??null;
+fs.mkdirSync(profile);
+fs.writeFileSync(path.join(profile,'Local State'),JSON.stringify({browser:{enabled_labs_experiments:labs}}));
 const append=(data)=>fs.appendFileSync(events,JSON.stringify({at:new Date().toISOString(),...data})+'\n');
+const mapped=new Map();
+function recordMappings() {
+ for(const pid of fs.readdirSync('/proc').filter(x=>/^\d+$/.test(x))) {
+  try {
+   if(!fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').includes(profile))continue;
+   const paths=[...new Set(fs.readFileSync(`/proc/${pid}/maps`,'utf8').split('\n')
+     .filter(x=>x.includes('nvidia_drv_video.so')).map(x=>x.slice(x.indexOf('/'))))];
+   if(paths.length)mapped.set(pid,{pid,paths});
+  }catch{}
+ }
+}
 const env={...process.env,LIBVA_DRIVER_NAME:'nvidia',LIBVA_DRIVERS_PATH:path.resolve(driverDir),NVD_BACKEND:'direct',NVD_EXPORT_LAYOUT:'packed',NVD_LOG:path.resolve(runDir,'driver.log'),NVD_LOG_VERBOSE:'1'};
 const args=[`--user-data-dir=${profile}`,'--remote-debugging-port=0','--no-first-run','--no-default-browser-check','--autoplay-policy=no-user-gesture-required','--enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs','--ignore-gpu-blocklist','--use-gl=angle','--use-angle=gl','--ozone-platform=wayland','about:blank'];
 if(process.env.NVD_PROBE_SOFTWARE==='1')args.push('--disable-accelerated-video-decode');
@@ -41,9 +60,15 @@ try {
  const end=Date.now()+Number(seconds)*1000;
 
  for(let tick=0;Date.now()<end;tick++) {
+  recordMappings();
   const r=await send('Runtime.evaluate',{expression:`(()=>{
     const p=document.querySelector('#movie_player'),v=document.querySelector('video');
     if(!v)return {title:document.title,text:document.body?.innerText.slice(0,1000)};
+    const requestedQuality=${JSON.stringify(requestedQuality)};
+    if(requestedQuality&&!window.nvdQualitySet&&p?.getAvailableQualityLevels?.().includes(requestedQuality)){
+      p.setPlaybackQualityRange(requestedQuality,requestedQuality);
+      p.setPlaybackQuality?.(requestedQuality);window.nvdQualitySet=true;
+    }
     if(!window.nvdStarted&&v.readyState>=2){v.currentTime=0;v.playbackRate=${Number(rate)};v.muted=true;v.play();window.nvdStarted=true;}
     const s=p?.getVideoStats?.();const response=p?.getPlayerResponse?.();
     return {title:document.title,videoId:response?.videoDetails?.videoId,time:v.currentTime,duration:v.duration,rate:v.playbackRate,paused:v.paused,ready:v.readyState,ended:v.ended,error:v.error?.message,
@@ -62,6 +87,8 @@ finally{ws?.close();chrome.kill('SIGTERM');fs.closeSync(log)}
 const records=fs.readFileSync(events,'utf8').trim().split('\n').map(JSON.parse);
 const samples=records.filter(r=>r.sample).map(r=>r.sample);
 const summary={url,driverDir:path.resolve(driverDir),softwareControl:process.env.NVD_PROBE_SOFTWARE==='1',
+  labs,requestedQuality,args,mapped:[...mapped.values()],
+  driverSha256:createHash('sha256').update(fs.readFileSync(path.join(driverDir,'nvidia_drv_video.so'))).digest('hex'),
   ended:samples.some(s=>s.ended),maxTime:Math.max(0,...samples.map(s=>s.time??0)),
   mediaErrors:records.filter(r=>r.method==='Media.playerErrorsRaised'),
   siteErrors:[...new Set(samples.map(s=>s.stats?.debug_error).filter(Boolean))],
