@@ -24,6 +24,18 @@ EOF
 chmod +x "$FAKE_CHROME"
 export CAPTURE_FILE
 
+# Keep integration tests from rebuilding the real desktop session's cache.
+CACHE_BIN="$TMP_DIR/cache-bin"
+mkdir -p "$CACHE_BIN"
+export CACHE_CAPTURE="$TMP_DIR/cache-capture"
+cat >"$CACHE_BIN/kbuildsycoca6" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CACHE_CAPTURE"
+exit "${CACHE_BUILD_STATUS:-0}"
+EOF
+chmod +x "$CACHE_BIN/kbuildsycoca6"
+export PATH="$CACHE_BIN:$PATH"
+
 for DANGEROUS_BUILD_DIR in / "$HOME" "$ROOT_DIR"; do
     if BUILD_DIR="$DANGEROUS_BUILD_DIR" \
         "$ROOT_DIR/install.sh" --clean --no-test --no-chrome-integration \
@@ -103,6 +115,14 @@ EOF
 
 XDG_DATA_HOME="$USER_DATA" XDG_DATA_DIRS="$TMP_DIR/no-system-data" \
     "$ROOT_DIR/install.sh" --chrome-integration-only >/dev/null
+
+grep -Fx -- '--noincremental' "$CACHE_CAPTURE"
+if CACHE_BUILD_STATUS=1 XDG_DATA_HOME="$USER_DATA" XDG_DATA_DIRS="$TMP_DIR/no-system-data" \
+    "$ROOT_DIR/install.sh" --chrome-integration-only >"$TMP_DIR/cache-failure" 2>&1; then
+    echo "Chrome integration ignored a KDE cache rebuild failure" >&2
+    exit 1
+fi
+grep -F 'cache could not be refreshed' "$TMP_DIR/cache-failure"
 
 grep -Fx '# Managed by AoTofu nvidia-vaapi-driver install.sh' "$DESKTOP_FILE"
 grep -F '/opt/chrome-hotpatch' "$DESKTOP_FILE"

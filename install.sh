@@ -447,6 +447,19 @@ install_chrome_integration() {
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$target_dir" >/dev/null 2>&1 || true
     fi
+    # update-desktop-database updates MIME associations, not KDE's cached Exec
+    # commands. Refresh those before claiming that a restart uses the new path.
+    local cache_builder
+    for cache_builder in kbuildsycoca6 kbuildsycoca5; do
+        if command -v "$cache_builder" >/dev/null 2>&1; then
+            if ! "$cache_builder" --noincremental >/dev/null; then
+                echo "Chrome launchers were updated, but KDE's application cache could not be refreshed." >&2
+                echo "Run $cache_builder --noincremental in your desktop session before restarting Chrome." >&2
+                return 1
+            fi
+            break
+        fi
+    done
     echo "Chrome integration installed. Fully restart Chrome to use the new environment."
 }
 
