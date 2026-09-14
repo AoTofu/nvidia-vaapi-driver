@@ -6058,6 +6058,12 @@ static VAStatus nvExportSurfaceHandle(
     //LOG("Exporting surface: %d (%p)", surface->pictureIdx, surface);
 
     waitSurfaceResolved(surface);
+    pthread_mutex_lock(&surface->mutex);
+    const VAStatus completionStatus = surface->completionStatus;
+    pthread_mutex_unlock(&surface->mutex);
+    if (completionStatus != VA_STATUS_SUCCESS) {
+        return completionStatus;
+    }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 

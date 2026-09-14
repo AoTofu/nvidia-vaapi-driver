@@ -420,6 +420,23 @@ static void testSharedSurfaceSubmission(void) {
             assert(ctx->pictureState == NVD_PICTURE_IDLE);
             sem_destroy(&submit.returned);
         }
+        // A failed resolve must not publish an old or partially copied frame.
+        // A subsequent successful generation can be exported normally.
+        VADRMPRIMESurfaceDescriptor failedDescriptor = {0};
+        assert(nvExportSurfaceHandle(&driver, surfaceObject->id,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+            &failedDescriptor) == VA_STATUS_ERROR_DECODING_ERROR);
+        assert(failedDescriptor.num_objects == 0);
+        assert(surface->exported == (kind == 1));
+        setSurfaceResolving(surface, true);
+        setSurfaceResolving(surface, false);
+        assert(nvExportSurfaceHandle(&driver, surfaceObject->id,
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+            &failedDescriptor) == VA_STATUS_SUCCESS);
+        assert(surface->exported);
+        closeDescriptor(&failedDescriptor);
         free(ctx->bitstreamBuffer.buf);
         resolveQueueDestroy(&ctx->resolveQueue);
         pthread_mutex_destroy(&ctx->pictureMutex);
