@@ -178,6 +178,14 @@ If you're using the Snap version of Firefox, it will be unable to access the hos
 
 The installer explicitly selects `NVD_EXPORT_LAYOUT=packed` for Chrome to work around split frames during repeated seeking on tested NVIDIA Wayland configurations. The library's unset/`auto` policy still selects shared-modifier per-plane objects for Chromium-family processes and natural per-plane modifiers for other clients. Close all existing Chrome processes before relaunching, or use a separate `--user-data-dir`, so the new environment reaches the GPU process. With `NVD_LOG=1`, startup logs identify the loaded driver path and selected layout.
 
+For buffers exported before decoding or imported from the client, the driver
+finishes the frame copy before returning from `vaEndPicture`. Chrome can reuse
+those buffers without another `vaSyncSurface` or export call, and CUDA writes
+do not publish an implicit DMA-BUF fence. Waiting only during export can show
+stale or partially written frames after seeking. Private decode surfaces keep
+their asynchronous resolve path. Failed resolves are reported to the client
+instead of exporting the preceding image as a successful frame.
+
 Start the browser with flags similar to:
 
 ```sh
@@ -249,6 +257,39 @@ This backend uses headers files from the NVIDIA [open-gpu-kernel-modules](https:
 project. The `extract_headers.sh` script, along with the `headers.in` file list which files we need, and will copy them from a checked out version of the NVIDIA project to the `nvidia-include` directory. This is done to prevent everyone needing to checkout that project.
 
 # Testing
+
+Run the CPU regressions and opt-in GPU state checks with:
+
+```sh
+meson setup build-test --buildtype=debugoptimized -Dgpu_tests=true
+meson test -C build-test --print-errorlogs
+```
+
+The Chrome seek regression uses Node 22+, ffmpeg and a running Wayland session.
+The fixture generator validates every encoded frame in software and writes a
+hash-bound JSON manifest with its frame rate and marker positions. Use `.mp4`
+for `--codec h264`, or `.webm` for `vp9` / `av1`. Existing files are not replaced.
+
+```sh
+python3 tests/generate-seek-video.py /tmp/seek-4k60.webm --width 3840 --height 2160 --fps 60
+NVD_BENCH_MODE=burst NVD_BENCH_REQUIRE_CORRECT=1 \
+  node tests/bench-seek.mjs build-test /tmp/seek-4k60.webm /tmp/seek-result.json 150
+```
+
+`NVD_BENCH_MODE` selects paused random seeks (default `paused`), random seeks
+during playback (`playing`), actual CDP arrow-key input (`arrows`), or four
+arrow presses spaced 10 ms apart (`burst`). Arrow keys seek by five seconds
+and wrap at the fixture ends. Each run warms up with ten seeks/bursts, then
+checks the requested count. Markers repeat down the image to detect interior
+splits as well as top/bottom mismatches. `NVD_BENCH_REQUIRE_CORRECT=1` fails on
+an incorrect frame, missing keyboard events, software fallback or the wrong
+loaded driver. `NVD_BENCH_SOFTWARE=1` selects a software control run.
+
+Results include individual frame IDs, callback times, decoder identity and
+the mapped driver path/hash. Latency measures the frame callback after the
+first seek/key request; it includes the whole key burst. These synthetic
+fixtures and canvas readbacks do not measure physical display tearing or
+exercise a streaming site's adaptive quality switches.
 
 To verify that the driver is being used to decode video, you can use nvidia-settings or nvidia-smi.
 
