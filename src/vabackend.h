@@ -84,6 +84,9 @@ typedef struct
     pthread_cond_t          cond;
     bool                    syncInitialized;
     bool                    decodeFailed;
+    // Once exported, clients may read this allocation without another VA call.
+    // Protected by mutex and retained across decode generations/contexts.
+    bool                    exported;
     uint64_t                submittedGeneration;
     uint64_t                completedGeneration;
     VAStatus                completionStatus;

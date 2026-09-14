@@ -5056,6 +5056,21 @@ static VAStatus nvEndPictureImpl(
     }
 
     nvCtx->pictureState = NVD_PICTURE_SUBMITTED;
+    // CUDA writes do not attach an implicit DMA-BUF fence. A client can export
+    // a surface before its first decode, or import an already shared buffer,
+    // then reuse that allocation without calling SyncSurface/Export again.
+    // Finish the copy and NVDEC unmap before handing those frames back to the
+    // client. Private surfaces retain the asynchronous resolve queue.
+    pthread_mutex_lock(&surface->mutex);
+    const bool shared = surface->exported ||
+        (surface->backingImage != NULL && surface->backingImage->isExternalBuffer);
+    pthread_mutex_unlock(&surface->mutex);
+    if (shared) {
+        waitSurfaceResolved(surface);
+        pthread_mutex_lock(&surface->mutex);
+        status = surface->completionStatus;
+        pthread_mutex_unlock(&surface->mutex);
+    }
     return status;
 }
 
@@ -6078,6 +6093,10 @@ static VAStatus nvExportSurfaceHandle(
     if (!descriptorFilled) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+
+    pthread_mutex_lock(&surface->mutex);
+    surface->exported = true;
+    pthread_mutex_unlock(&surface->mutex);
 
     return VA_STATUS_SUCCESS;
 }

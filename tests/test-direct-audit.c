@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <semaphore.h>
 #include <nvidia.h>
 // Include the backend to exercise its actual internal copy/export paths.
 #include "../src/direct/direct-export-buf.c"
@@ -313,6 +314,129 @@ static void testWorkerFailures(void) {
     cv = NULL;
 }
 
+typedef struct {
+    VADriverContextP driver;
+    VAContextID context;
+    VAStatus status;
+    sem_t returned;
+} SubmitTest;
+
+static CUresult CUDAAPI mockDecode(CUvideodecoder decoder, CUVIDPICPARAMS *picture) {
+    return CUDA_SUCCESS;
+}
+
+static void *submitTestPicture(void *opaque) {
+    SubmitTest *submit = opaque;
+    submit->status = nvEndPicture(submit->driver, submit->context);
+    assert(sem_post(&submit->returned) == 0);
+    return NULL;
+}
+
+static void testSharedSurfaceSubmission(void) {
+    CudaFunctions cuda = {.cuCtxPushCurrent = mockPush, .cuCtxPopCurrent = mockPop};
+    CuvidFunctions cuvid = {.cuvidDecodePicture = mockDecode};
+    cu = &cuda;
+    cv = &cuvid;
+    pushFailure = 0;
+    // Exercise the public EndPicture/Export entrypoints. Keep the worker's job
+    // pending so completion cannot accidentally depend on a fast GPU/copy.
+    for (unsigned kind = 0; kind < 3; kind++) {
+        pthread_rwlock_t lifetime;
+        assert(pthread_rwlock_init(&lifetime, NULL) == 0);
+        NVDriver drv = {.cu = &cuda, .backend = &DIRECT_BACKEND,
+                        .objectLifetimeLock = &lifetime};
+        nvdObjectTableInit(&drv.objects);
+        assert(pthread_mutex_init(&drv.objectCreationMutex, NULL) == 0);
+        struct VADriverContext driver = {.pDriverData = &drv};
+        Object contextObject = allocateObject(&drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
+        Object surfaceObject = allocateObject(&drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
+        assert(contextObject != NULL && surfaceObject != NULL);
+        NVContext *ctx = contextObject->obj;
+        NVSurface *surface = surfaceObject->obj;
+        ctx->drv = &drv;
+        ctx->id = contextObject->id;
+        ctx->decoder = (CUvideodecoder)1;
+        assert(pthread_mutex_init(&ctx->pictureMutex, NULL) == 0);
+        assert(pthread_mutex_init(&ctx->surfaceCreationMutex, NULL) == 0);
+        assert(resolveQueueInit(&ctx->resolveQueue));
+        assert(pthread_mutex_init(&surface->mutex, NULL) == 0);
+        assert(pthread_cond_init(&surface->cond, NULL) == 0);
+        FILE *fd = tmpfile();
+        assert(fd != NULL);
+        BackingImage img = {.format = NV_FORMAT_NV12, .fourcc = VA_FOURCC_NV12,
+            .numObjects = 1, .numPlanes = 2, .fds = {fileno(fd)},
+            .objectSize = {24576}, .offsets = {0, 16384}, .strides = {128, 128},
+            .isExternalBuffer = kind == 2};
+        surface->width = surface->height = 128;
+        surface->backingImage = &img;
+        if (kind == 1) {
+            // Export once, before decoding, then keep the handle across frames.
+            VADRMPRIMESurfaceDescriptor desc;
+            assert(nvExportSurfaceHandle(&driver, surfaceObject->id,
+                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                &desc) == VA_STATUS_SUCCESS);
+            assert(surface->exported);
+            closeDescriptor(&desc);
+        }
+        for (unsigned frame = 0; frame < 2; frame++) {
+            ctx->renderTarget = ctx->displayTarget = surface;
+            ctx->pictureState = NVD_PICTURE_BUILDING;
+            const uint8_t byte = 0;
+            assert(appendBuffer(&ctx->bitstreamBuffer, &byte, 1));
+            setSurfaceResolving(surface, true);
+            SubmitTest submit = {.driver = &driver, .context = contextObject->id};
+            assert(sem_init(&submit.returned, 0, 0) == 0);
+            pthread_t thread;
+            assert(pthread_create(&thread, NULL, submitTestPicture, &submit) == 0);
+            ResolveJob *job = NULL;
+            assert(resolveQueuePop(&ctx->resolveQueue, (void **)&job));
+            assert(job->surface == surface && job->generation == frame + 1);
+            if (kind == 0) {
+                // A private surface must still submit asynchronously.
+                assert(pthread_join(thread, NULL) == 0);
+                assert(submit.status == VA_STATUS_SUCCESS && surface->resolving);
+            } else {
+                struct timespec deadline;
+                assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+                deadline.tv_nsec += 50000000;
+                if (deadline.tv_nsec >= 1000000000) {
+                    deadline.tv_sec++;
+                    deadline.tv_nsec -= 1000000000;
+                }
+                int result;
+                do { result = sem_timedwait(&submit.returned, &deadline); }
+                while (result != 0 && errno == EINTR);
+                assert(result == -1 && errno == ETIMEDOUT);
+            }
+            if (frame == 0) setSurfaceResolving(surface, false);
+            else failSurfaceResolve(surface, VA_STATUS_ERROR_DECODING_ERROR);
+            free(job);
+            if (kind != 0) {
+                assert(pthread_join(thread, NULL) == 0);
+                assert(submit.status == (frame == 0 ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_DECODING_ERROR));
+                assert(!surface->resolving);
+            }
+            assert(ctx->pictureState == NVD_PICTURE_IDLE);
+            sem_destroy(&submit.returned);
+        }
+        free(ctx->bitstreamBuffer.buf);
+        resolveQueueDestroy(&ctx->resolveQueue);
+        pthread_mutex_destroy(&ctx->pictureMutex);
+        pthread_mutex_destroy(&ctx->surfaceCreationMutex);
+        pthread_cond_destroy(&surface->cond);
+        pthread_mutex_destroy(&surface->mutex);
+        deleteObject(&drv, surfaceObject->id);
+        deleteObject(&drv, contextObject->id);
+        nvdObjectTableDestroy(&drv.objects);
+        pthread_mutex_destroy(&drv.objectCreationMutex);
+        pthread_rwlock_destroy(&lifetime);
+        fclose(fd);
+    }
+    cu = NULL;
+    cv = NULL;
+}
+
 int main(void) {
     testUuid();
     testGpuIdentity();
@@ -320,6 +444,7 @@ int main(void) {
     testDescriptor();
     testCopyFailures();
     testWorkerFailures();
+    testSharedSurfaceSubmission();
 #if NVD_TEST_VP9
     testVp9();
 #endif
