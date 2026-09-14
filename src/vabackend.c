@@ -2092,7 +2092,20 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
     }
 
     BackingImage *existing = retainBackingImageByFd(drv, imported->objects[0].fd, format, width, height);
+    LOG_DEBUG("Import lookup %ux%u legacy=%d fd=%d objects=%u modifier=%llx backing=%p",
+        width, height, imported->legacyPrime, imported->objects[0].fd,
+        img->numObjects, (unsigned long long) img->mods[0], existing);
+    // Legacy PRIME has no modifier field. Chromium uses it to reimport our
+    // packed images after a decoder reset. Recover the modifier only from a
+    // matching driver-owned DMA-BUF; still validate every plane's identity,
+    // offset and pitch below. PRIME_2's explicit modifier remains authoritative.
+    if (existing != NULL && imported->legacyPrime && existing->numObjects == 1) {
+        img->mods[0] = existing->mods[0];
+    }
     if (existing != NULL && !backingImageMatchesImportedLayout(existing, img)) {
+        LOG_DEBUG("Import layout mismatch: existing objects=%u modifier=%llx offsets=%d,%d pitches=%d,%d; imported offsets=%d,%d pitches=%d,%d",
+            existing->numObjects, (unsigned long long) existing->mods[0], existing->offsets[0], existing->offsets[1],
+            existing->strides[0], existing->strides[1], img->offsets[0], img->offsets[1], img->strides[0], img->strides[1]);
         atomic_fetch_sub(&existing->borrowCount, 1);
         existing = NULL;
     }
