@@ -29,6 +29,7 @@ static void requireFailure(const char *operation, VAStatus status) {
 }
 
 static void testExportRoundtrip(VADisplay display) {
+    const bool evict = getenv("NVD_TEST_EVICT_EXPORTS") != NULL;
     const uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010,
         VA_FOURCC_ARGB, VA_FOURCC_XRGB, VA_FOURCC_ABGR, VA_FOURCC_XBGR,
         VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_BGRA, VA_FOURCC_BGRX};
@@ -45,6 +46,13 @@ static void testExportRoundtrip(VADisplay display) {
         if (first.fourcc != formats[f]) {
             fprintf(stderr, "export changed pixel format: requested=%08x actual=%08x\n", formats[f], first.fourcc);
             exit(EXIT_FAILURE);
+        }
+        if (evict) {
+            // With a zero detached-cache limit, only the client's DMA-BUF FD
+            // survives. Chromium does this across decoder reinitialization.
+            requireStatus("destroy exported owner before reimport",
+                vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
+            surface = VA_INVALID_SURFACE;
         }
         if (first.num_objects == 2) {
             // Reverse object order without changing which storage each plane uses.
@@ -110,7 +118,8 @@ static void testExportRoundtrip(VADisplay display) {
                 exit(EXIT_FAILURE);
         }
         requireStatus("destroy re-import", vaDestroySurfaces(display, &imported, 1), VA_STATUS_SUCCESS);
-        requireStatus("destroy export source", vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
+        if (surface != VA_INVALID_SURFACE)
+            requireStatus("destroy export source", vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
     }
 }
 

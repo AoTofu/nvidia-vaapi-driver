@@ -194,6 +194,7 @@ typedef struct {
     bool (*fillExportDescriptor)(struct _NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc);
     void (*destroyAllBackingImage)(struct _NVDriver *drv);
     bool (*pruneToMemoryBudget)(struct _NVDriver *drv, uint64_t extraGpuBytes);
+    bool (*importBackingImage)(struct _NVDriver *drv, BackingImage *img, bool legacyPrime);
 } NVBackend;
 
 typedef struct _NVDriver

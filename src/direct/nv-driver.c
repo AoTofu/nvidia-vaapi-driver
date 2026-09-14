@@ -36,6 +36,37 @@
 
 static const NvHandle NULL_OBJECT;
 
+// CUDA's opaque-FD import accepts an RM memory FD, not a DRM PRIME FD.
+// Use a separate DRM file description so closing our temporary GEM handle
+// cannot invalidate a handle belonging to the client on context->drmFd.
+int export_dmabuf_memory(const NVDriverContext *context, int dmaFd) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", context->drmFd);
+    int drmFd = open(path, O_RDWR | O_CLOEXEC);
+    if (drmFd < 0) return -1;
+
+    int memoryFd = -1;
+    struct drm_prime_handle prime = { .fd = dmaFd };
+    if (ioctl(drmFd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime) != 0) goto out;
+    memoryFd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+    if (memoryFd < 0) goto out;
+    struct NvKmsKapiPrivExportMemoryParams params = { .memFd = memoryFd };
+    struct drm_nvidia_gem_export_nvkms_memory_params export = {
+        .handle = prime.handle,
+        .nvkms_params_ptr = (uintptr_t) &params,
+        .nvkms_params_size = sizeof(params),
+    };
+    if (ioctl(drmFd, DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY, &export) != 0) {
+        LOG_DEBUG("Unable to export native DMA-BUF memory: %s", strerror(errno));
+        close(memoryFd);
+        memoryFd = -1;
+    }
+out:
+    // Closing this private DRM file releases all of its GEM handles.
+    close(drmFd);
+    return memoryFd;
+}
+
 static int nv_alloc_object_with_status(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
                                        NvHandle* hObjectNew, const NvV32 hClass, const uint32_t paramSize, void* params) {
     NVOS64_PARAMETERS alloc = {

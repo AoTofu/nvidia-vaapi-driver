@@ -167,6 +167,12 @@ if libva_drm_deps.found()
          env: ['NVD_RUN_GPU_TESTS=' + (get_option('gpu_tests') ? '1' : '0'),
                'LIBVA_DRIVER_NAME=nvidia', 'NVD_EXPORT_LAYOUT=packed',
                'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
+    test('GPU PRIME reimport after eviction', gpu_state_test, suite: 'gpu', timeout: 180,
+         depends: driver,
+         env: ['NVD_RUN_GPU_TESTS=' + (get_option('gpu_tests') ? '1' : '0'),
+               'LIBVA_DRIVER_NAME=nvidia', 'NVD_EXPORT_LAYOUT=packed',
+               'NVD_MAX_DETACHED_BACKING_IMAGES=0', 'NVD_TEST_EVICT_EXPORTS=1',
+               'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
 elif get_option('gpu_tests')
     error('GPU tests require libva-drm')
 endif

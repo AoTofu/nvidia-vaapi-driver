@@ -2127,6 +2127,11 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
         return img;
     }
 
+    if (drv->backend->importBackingImage != NULL &&
+        drv->backend->importBackingImage(drv, img, imported->legacyPrime)) {
+        return img;
+    }
+
     if (importExternalBuffersToCuda(drv, img)) {
         return img;
     }
