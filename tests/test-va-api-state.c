@@ -29,6 +29,7 @@ static void requireFailure(const char *operation, VAStatus status) {
 }
 
 static void testExportRoundtrip(VADisplay display) {
+    const bool evict = getenv("NVD_TEST_EVICT_EXPORTS") != NULL;
     const uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010,
         VA_FOURCC_ARGB, VA_FOURCC_XRGB, VA_FOURCC_ABGR, VA_FOURCC_XBGR,
         VA_FOURCC_RGBA, VA_FOURCC_RGBX, VA_FOURCC_BGRA, VA_FOURCC_BGRX};
@@ -46,6 +47,13 @@ static void testExportRoundtrip(VADisplay display) {
             fprintf(stderr, "export changed pixel format: requested=%08x actual=%08x\n", formats[f], first.fourcc);
             exit(EXIT_FAILURE);
         }
+        if (evict) {
+            // With a zero detached-cache limit, only the client's DMA-BUF FD
+            // survives. Chromium does this across decoder reinitialization.
+            requireStatus("destroy exported owner before reimport",
+                vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
+            surface = VA_INVALID_SURFACE;
+        }
         if (first.num_objects == 2) {
             // Reverse object order without changing which storage each plane uses.
             VADRMPRIMESurfaceDescriptor swapped = first;
@@ -59,6 +67,37 @@ static void testExportRoundtrip(VADisplay display) {
              .value = {.type = VAGenericValueTypeInteger, .value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2}},
             {.type = VASurfaceAttribExternalBufferDescriptor, .flags = VA_SURFACE_ATTRIB_SETTABLE,
              .value = {.type = VAGenericValueTypePointer, .value.p = &first}}};
+        if (first.num_objects == 1) {
+            // Chromium reimports cached frame-pool buffers with legacy PRIME
+            // after a decoder reset. That descriptor cannot carry modifiers.
+            uintptr_t buffer = (uintptr_t) first.objects[0].fd;
+            VASurfaceAttribExternalBuffers legacy = {.pixel_format = first.fourcc,
+                .width = first.width, .height = first.height,
+                .data_size = first.objects[0].size, .num_planes = first.num_layers,
+                .buffers = &buffer, .num_buffers = 1};
+            for (unsigned l = 0; l < first.num_layers; l++) {
+                legacy.pitches[l] = first.layers[l].pitch[0];
+                legacy.offsets[l] = first.layers[l].offset[0];
+            }
+            attrs[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+            attrs[2].value.value.p = &legacy;
+            requireStatus("legacy import of driver-owned buffer",
+                vaCreateSurfaces(display, rt, 128, 128, &imported, 1, attrs, 3), VA_STATUS_SUCCESS);
+            requireStatus("legacy re-export", vaExportSurfaceHandle(display, imported,
+                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &second), VA_STATUS_SUCCESS);
+            if (second.objects[0].drm_format_modifier != first.objects[0].drm_format_modifier)
+                exit(EXIT_FAILURE);
+            for (unsigned i = 0; i < second.num_objects; i++) close(second.objects[i].fd);
+            requireStatus("destroy legacy import", vaDestroySurfaces(display, &imported, 1), VA_STATUS_SUCCESS);
+            attrs[1].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+            attrs[2].value.value.p = &first;
+            // Explicit PRIME_2 modifiers must still agree with the allocation.
+            first.objects[0].drm_format_modifier ^= 1;
+            requireFailure("reject mismatched explicit modifier",
+                vaCreateSurfaces(display, rt, 128, 128, &imported, 1, attrs, 3));
+            first.objects[0].drm_format_modifier ^= 1;
+        }
         requireStatus("import exported surface", vaCreateSurfaces(display, rt, 128, 128, &imported, 1, attrs, 3), VA_STATUS_SUCCESS);
         requireStatus("re-export imported surface", vaExportSurfaceHandle(display, imported,
             VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &second), VA_STATUS_SUCCESS);
@@ -79,7 +118,8 @@ static void testExportRoundtrip(VADisplay display) {
                 exit(EXIT_FAILURE);
         }
         requireStatus("destroy re-import", vaDestroySurfaces(display, &imported, 1), VA_STATUS_SUCCESS);
-        requireStatus("destroy export source", vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
+        if (surface != VA_INVALID_SURFACE)
+            requireStatus("destroy export source", vaDestroySurfaces(display, &surface, 1), VA_STATUS_SUCCESS);
     }
 }
 

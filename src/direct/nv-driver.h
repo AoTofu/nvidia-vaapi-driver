@@ -51,6 +51,7 @@ typedef struct {
 bool init_nvdriver(NVDriverContext *context, int drmFd);
 bool free_nvdriver(NVDriverContext *context);
 bool get_device_uuid(const NVDriverContext *context, uint8_t uuid[16]);
+int export_dmabuf_memory(const NVDriverContext *context, int dmaFd);
 bool alloc_memory(const NVDriverContext *context, uint32_t size, int *fd);
 bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint8_t channels, uint8_t bytesPerChannel, uint32_t fourcc, NVDriverImage *image);
 bool calculate_unified_image_layout(const NVDriverContext *context, NVDriverImage images[], uint32_t width, uint32_t height,

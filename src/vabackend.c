@@ -2092,7 +2092,20 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
     }
 
     BackingImage *existing = retainBackingImageByFd(drv, imported->objects[0].fd, format, width, height);
+    LOG_DEBUG("Import lookup %ux%u legacy=%d fd=%d objects=%u modifier=%llx backing=%p",
+        width, height, imported->legacyPrime, imported->objects[0].fd,
+        img->numObjects, (unsigned long long) img->mods[0], existing);
+    // Legacy PRIME has no modifier field. Chromium uses it to reimport our
+    // packed images after a decoder reset. Recover the modifier only from a
+    // matching driver-owned DMA-BUF; still validate every plane's identity,
+    // offset and pitch below. PRIME_2's explicit modifier remains authoritative.
+    if (existing != NULL && imported->legacyPrime && existing->numObjects == 1) {
+        img->mods[0] = existing->mods[0];
+    }
     if (existing != NULL && !backingImageMatchesImportedLayout(existing, img)) {
+        LOG_DEBUG("Import layout mismatch: existing objects=%u modifier=%llx offsets=%d,%d pitches=%d,%d; imported offsets=%d,%d pitches=%d,%d",
+            existing->numObjects, (unsigned long long) existing->mods[0], existing->offsets[0], existing->offsets[1],
+            existing->strides[0], existing->strides[1], img->offsets[0], img->offsets[1], img->strides[0], img->strides[1]);
         atomic_fetch_sub(&existing->borrowCount, 1);
         existing = NULL;
     }
@@ -2111,6 +2124,11 @@ static BackingImage *createImportedBackingImageImpl(NVDriver *drv, const Importe
         img->borrowedBackingImage = existing;
         LOG_DEBUG("Imported surface reused backing image color metadata: imported=%p backing=%p color_standard=%s(%d) full_range=%d",
             img, existing, nvColorStandardName(img->colorStandard), img->colorStandard, img->colorRangeFull);
+        return img;
+    }
+
+    if (drv->backend->importBackingImage != NULL &&
+        drv->backend->importBackingImage(drv, img, imported->legacyPrime)) {
         return img;
     }
 
@@ -5056,6 +5074,21 @@ static VAStatus nvEndPictureImpl(
     }
 
     nvCtx->pictureState = NVD_PICTURE_SUBMITTED;
+    // CUDA writes do not attach an implicit DMA-BUF fence. A client can export
+    // a surface before its first decode, or import an already shared buffer,
+    // then reuse that allocation without calling SyncSurface/Export again.
+    // Finish the copy and NVDEC unmap before handing those frames back to the
+    // client. Private surfaces retain the asynchronous resolve queue.
+    pthread_mutex_lock(&surface->mutex);
+    const bool shared = surface->exported ||
+        (surface->backingImage != NULL && surface->backingImage->isExternalBuffer);
+    pthread_mutex_unlock(&surface->mutex);
+    if (shared) {
+        waitSurfaceResolved(surface);
+        pthread_mutex_lock(&surface->mutex);
+        status = surface->completionStatus;
+        pthread_mutex_unlock(&surface->mutex);
+    }
     return status;
 }
 
@@ -6043,6 +6076,12 @@ static VAStatus nvExportSurfaceHandle(
     //LOG("Exporting surface: %d (%p)", surface->pictureIdx, surface);
 
     waitSurfaceResolved(surface);
+    pthread_mutex_lock(&surface->mutex);
+    const VAStatus completionStatus = surface->completionStatus;
+    pthread_mutex_unlock(&surface->mutex);
+    if (completionStatus != VA_STATUS_SUCCESS) {
+        return completionStatus;
+    }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
@@ -6078,6 +6117,10 @@ static VAStatus nvExportSurfaceHandle(
     if (!descriptorFilled) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+
+    pthread_mutex_lock(&surface->mutex);
+    surface->exported = true;
+    pthread_mutex_unlock(&surface->mutex);
 
     return VA_STATUS_SUCCESS;
 }

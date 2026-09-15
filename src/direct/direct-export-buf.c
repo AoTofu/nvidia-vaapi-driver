@@ -1329,6 +1329,64 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     return true;
 }
 
+static bool direct_importBackingImage(NVDriver *drv, BackingImage *img, bool legacyPrime) {
+    const NVFormatInfo *fmt = &formatsInfo[img->format];
+    NVDriverImage planes[3] = {0};
+    uint32_t size = 0;
+    if (img->numObjects != 1 ||
+        !calculate_unified_image_layout(&drv->driverContext, planes,
+            img->width, img->height, fmt->bppc, fmt->numPlanes, fmt->plane, true, &size) ||
+        img->objectSize[0] != size ||
+        (!legacyPrime && img->mods[0] != planes[0].mods)) return false;
+    // Legacy PRIME cannot describe tiling. Accept only the exact packed layout
+    // used by this backend, and require the kernel to identify native NVKMS
+    // storage below. Never reinterpret an explicit PRIME_2 modifier.
+    for (uint32_t i = 0; i < fmt->numPlanes; i++) {
+        if (img->planeObjectIndex[i] != 0 || img->offsets[i] != (int) planes[i].offset ||
+            img->strides[i] != (int) planes[i].pitch) return false;
+    }
+    int fd = export_dmabuf_memory(&drv->driverContext, img->fds[0]);
+    if (fd < 0) return false;
+    CUDA_EXTERNAL_MEMORY_HANDLE_DESC memory = {
+        .type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+        .handle.fd = fd, .size = size,
+    };
+    if (CHECK_CUDA_RESULT(drv->cu->cuImportExternalMemory(&img->extMem, &memory))) {
+        close(fd);
+        return false;
+    }
+    // Ownership of fd passes to CUDA on success.
+    for (uint32_t i = 0; i < fmt->numPlanes; i++) {
+        CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC desc = {
+            .offset = planes[i].offset, .numLevels = 1,
+            .arrayDesc = {
+                .Width = planes[i].width,
+                .Height = planes[i].memorySize / planes[i].pitch,
+                .Format = fmt->bppc == 1 ? CU_AD_FORMAT_UNSIGNED_INT8 : CU_AD_FORMAT_UNSIGNED_INT16,
+                .NumChannels = fmt->plane[i].channelCount,
+                .Flags = CUDA_ARRAY3D_SURFACE_LDST,
+            },
+        };
+        if (CHECK_CUDA_RESULT(drv->cu->cuExternalMemoryGetMappedMipmappedArray(
+                &img->cudaImages[i].mipmapArray, img->extMem, &desc)) ||
+            CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayGetLevel(
+                &img->arrays[i], img->cudaImages[i].mipmapArray, 0))) goto fail;
+    }
+    img->mods[0] = planes[0].mods;
+    LOG_DEBUG("Reimported native packed DMA-BUF %ux%u after backing cache miss", img->width, img->height);
+    return true;
+fail:
+    for (uint32_t i = 0; i < fmt->numPlanes; i++) {
+        if (img->cudaImages[i].mipmapArray != NULL)
+            CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayDestroy(img->cudaImages[i].mipmapArray));
+        img->cudaImages[i].mipmapArray = NULL;
+        img->arrays[i] = NULL;
+    }
+    CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->extMem));
+    img->extMem = NULL;
+    return false;
+}
+
 const NVBackend DIRECT_BACKEND = {
     .name = "direct",
     .initExporter = direct_initExporter,
@@ -1338,5 +1396,6 @@ const NVBackend DIRECT_BACKEND = {
     .realiseSurface = direct_realiseSurface,
     .fillExportDescriptor = direct_fillExportDescriptor,
     .destroyAllBackingImage = direct_destroyAllBackingImage,
-    .pruneToMemoryBudget = direct_pruneToMemoryBudget
+    .pruneToMemoryBudget = direct_pruneToMemoryBudget,
+    .importBackingImage = direct_importBackingImage,
 };

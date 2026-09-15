@@ -84,6 +84,9 @@ typedef struct
     pthread_cond_t          cond;
     bool                    syncInitialized;
     bool                    decodeFailed;
+    // Once exported, clients may read this allocation without another VA call.
+    // Protected by mutex and retained across decode generations/contexts.
+    bool                    exported;
     uint64_t                submittedGeneration;
     uint64_t                completedGeneration;
     VAStatus                completionStatus;
@@ -191,6 +194,7 @@ typedef struct {
     bool (*fillExportDescriptor)(struct _NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc);
     void (*destroyAllBackingImage)(struct _NVDriver *drv);
     bool (*pruneToMemoryBudget)(struct _NVDriver *drv, uint64_t extraGpuBytes);
+    bool (*importBackingImage)(struct _NVDriver *drv, BackingImage *img, bool legacyPrime);
 } NVBackend;
 
 typedef struct _NVDriver

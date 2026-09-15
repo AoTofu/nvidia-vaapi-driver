@@ -13,6 +13,7 @@ PRINT_CHROME_COMMAND=0
 CHROME_WAYLAND=0
 CHROME_INTEGRATION=1
 CHROME_INTEGRATION_ONLY=0
+RESTORE_CHROME_LAUNCHER=""
 CHROME_BIN="${CHROME_BIN:-}"
 CHROME_ARGS=()
 CHROME_ENV=()
@@ -40,6 +41,11 @@ Options:
                     Do not update the current user's Chrome desktop launcher.
   --chrome-integration-only
                     Update Chrome desktop launchers without building or installing.
+  --restore-chrome-launcher NAME
+                    Restore one desktop entry (e.g. google-chrome.desktop) from
+                    its system template, then apply VA-API settings. Backs up
+                    the existing entry, including managed entries. Requires
+                    --chrome-integration-only; discards custom launcher commands.
   --                Pass all remaining arguments to Chrome.
   -h, --help        Show this help.
 
@@ -338,9 +344,10 @@ patch_chrome_desktop_file() {
     target_dir="$(dirname -- "$target")"
     mkdir -p "$target_dir"
     if [ -e "$target" ] &&
-       ! grep -Fq '# Managed by AoTofu nvidia-vaapi-driver install.sh' "$target"; then
+       { [ -n "$RESTORE_CHROME_LAUNCHER" ] ||
+         ! grep -Fq '# Managed by AoTofu nvidia-vaapi-driver install.sh' "$target"; }; then
         stamp="$(date +%Y%m%d-%H%M%S)"
-        backup="$target.nvidia-vaapi-backup-$stamp"
+        backup="$(mktemp "$target.nvidia-vaapi-backup-$stamp-XXXXXX")"
         cp -a "$target" "$backup"
         echo "Backed up existing Chrome launcher to $backup"
     fi
@@ -379,25 +386,53 @@ install_chrome_integration() {
     target_dir="$user_data_home/applications"
     data_dirs="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
+    if [ -n "$RESTORE_CHROME_LAUNCHER" ]; then
+        local supported=0
+        for candidate in "${candidates[@]}"; do
+            if [ "$candidate" = "$RESTORE_CHROME_LAUNCHER" ]; then
+                supported=1
+                break
+            fi
+        done
+        if [ "$supported" -eq 0 ]; then
+            echo "Unsupported Chrome desktop entry: $RESTORE_CHROME_LAUNCHER" >&2
+            return 1
+        fi
+        candidates=("$RESTORE_CHROME_LAUNCHER")
+    fi
+
     for candidate in "${candidates[@]}"; do
         target="$target_dir/$candidate"
         source=""
-        if [ -f "$target" ]; then
+        if [ -f "$target" ] && [ -z "$RESTORE_CHROME_LAUNCHER" ]; then
             source="$target"
         else
             IFS=':' read -r -a chrome_data_dirs <<<"$data_dirs"
             for data_dir in "${chrome_data_dirs[@]}"; do
                 if [ -f "$data_dir/applications/$candidate" ]; then
+                    # XDG_DATA_DIRS may also contain the user's data directory.
+                    # Recovery must never use the broken override as a template.
+                    if [ -n "$RESTORE_CHROME_LAUNCHER" ] &&
+                       [ "$data_dir/applications/$candidate" -ef "$target" ]; then
+                        continue
+                    fi
                     source="$data_dir/applications/$candidate"
                     break
                 fi
             done
         fi
         if [ -z "$source" ]; then
+            if [ -n "$RESTORE_CHROME_LAUNCHER" ]; then
+                echo "No system template found for $candidate; launcher left unchanged." >&2
+                return 1
+            fi
             continue
         fi
         if is_flatpak_chrome_desktop_file "$source"; then
             echo "Skipping Flatpak Chrome launcher $source; sandboxed launchers are not supported."
+            if [ -n "$RESTORE_CHROME_LAUNCHER" ]; then
+                return 1
+            fi
             continue
         fi
         patch_chrome_desktop_file "$source" "$target"
@@ -412,6 +447,19 @@ install_chrome_integration() {
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$target_dir" >/dev/null 2>&1 || true
     fi
+    # update-desktop-database updates MIME associations, not KDE's cached Exec
+    # commands. Refresh those before claiming that a restart uses the new path.
+    local cache_builder
+    for cache_builder in kbuildsycoca6 kbuildsycoca5; do
+        if command -v "$cache_builder" >/dev/null 2>&1; then
+            if ! "$cache_builder" --noincremental >/dev/null; then
+                echo "Chrome launchers were updated, but KDE's application cache could not be refreshed." >&2
+                echo "Run $cache_builder --noincremental in your desktop session before restarting Chrome." >&2
+                return 1
+            fi
+            break
+        fi
+    done
     echo "Chrome integration installed. Fully restart Chrome to use the new environment."
 }
 
@@ -465,6 +513,14 @@ while [ "$#" -gt 0 ]; do
         --chrome-integration-only)
             CHROME_INTEGRATION_ONLY=1
             ;;
+        --restore-chrome-launcher)
+            shift
+            if [ "$#" -eq 0 ] || [ -z "$1" ]; then
+                echo "--restore-chrome-launcher requires a desktop filename" >&2
+                exit 2
+            fi
+            RESTORE_CHROME_LAUNCHER="$1"
+            ;;
         --)
             shift
             CHROME_ARGS=("$@")
@@ -482,6 +538,12 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+if [ -n "$RESTORE_CHROME_LAUNCHER" ] &&
+   { [ "$CHROME_INTEGRATION_ONLY" -ne 1 ] || [ "$CHROME_INTEGRATION" -ne 1 ]; }; then
+    echo "--restore-chrome-launcher requires --chrome-integration-only and enabled integration" >&2
+    exit 2
+fi
 
 if [ "$LAUNCH_CHROME" -eq 1 ] && [ "$PRINT_CHROME_COMMAND" -eq 1 ]; then
     echo "--launch-chrome and --print-chrome-command cannot be used together" >&2

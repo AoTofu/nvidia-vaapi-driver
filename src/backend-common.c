@@ -120,6 +120,14 @@ void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
 
     nvDestroyBackingImageVideoProcObjects(drv, img);
 
+    if (!img->borrowedCudaResources && img->extMem != NULL) {
+        for (uint32_t i = 0; i < 3; i++) {
+            if (img->cudaImages[i].mipmapArray != NULL)
+                CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayDestroy(img->cudaImages[i].mipmapArray));
+        }
+        CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->extMem));
+    }
+
     for (uint32_t i = 0; i < NVD_MAX_IMPORTED_OBJECTS; i++) {
         if (img->externalMappings[i] != NULL) {
             munmap(img->externalMappings[i], (size_t) img->externalMappingSize[i]);
