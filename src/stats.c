@@ -102,7 +102,8 @@ void nvStatsContextLog(NVContext *ctx) {
 void nvStatsContextHostBuffers(NVContext *ctx) {
     if (ctx == NULL || ctx->drv == NULL || !ctx->drv->statsEnabled) return;
     const uint64_t bytes = (uint64_t) ctx->bitstreamBuffer.allocated +
-        ctx->sliceOffsets.allocated + ctx->sliceParamsBuffer.allocated;
+        ctx->sliceOffsets.allocated + ctx->sliceParamsBuffer.allocated +
+        ctx->av1TileIntervals.storage.allocated;
     if (bytes >= ctx->statsHostBufferBytes)
         nvStatsAdd(ctx->drv, NV_STAT_CONTEXT_HOST_BUFFER_BYTES, bytes - ctx->statsHostBufferBytes);
     else

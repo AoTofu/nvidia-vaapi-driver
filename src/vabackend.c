@@ -755,6 +755,7 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
     nvCtx->codecData = NULL;
 
     nvStatsContextLog(nvCtx);
+    nvdIntervalIndexDestroy(&nvCtx->av1TileIntervals);
     freeAppendableBuffer(&nvCtx->sliceOffsets);
     freeAppendableBuffer(&nvCtx->bitstreamBuffer);
     freeAppendableBuffer(&nvCtx->sliceParamsBuffer);
@@ -4976,6 +4977,14 @@ static VAStatus nvEndPictureImpl(
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
+    // Every AV1 coordinate and interval must have been accepted before decode.
+    if (nvCtx->cudaCodec == cudaVideoCodec_AV1 &&
+        !nvCtx->bitstreamBuffer.failed && !nvCtx->sliceOffsets.failed &&
+        !nvCtx->sliceParamsBuffer.failed &&
+        (nvCtx->pPicParams.nNumSlices == 0 ||
+         nvCtx->av1TileOffsetsSeen != nvCtx->pPicParams.nNumSlices)) {
+        nvCtx->inputValidationFailed = true;
+    }
     if (nvCtx->inputValidationFailed) {
         nvCtx->bitstreamBuffer.size = 0;
         nvCtx->sliceOffsets.size = 0;

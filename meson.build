@@ -51,6 +51,7 @@ endif
 sources = [
     'src/appendable-buffer.c',
     'src/av1.c',
+    'src/av1-interval-index.c',
     'src/backend-common.c',
     'src/codec-utils.c',
     'src/decode-surfaces.c',
@@ -105,6 +106,10 @@ driver = shared_library(
     gnu_symbol_visibility: 'hidden',
 )
 
+bench_av1_tiles = executable('bench-av1-tiles', ['tests/bench-av1-tiles.c'] + sources,
+    dependencies: deps, include_directories: nvidia_incdir,
+    c_args: ['-DNVD_BENCH_INDEX=1'])
+
 resolve_queue_test = executable(
     'test-resolve-queue',
     ['tests/test-resolve-queue.c', 'src/resolve-queue.c'],
@@ -112,6 +117,11 @@ resolve_queue_test = executable(
     dependencies: dependency('threads'),
 )
 test('resolve queue', resolve_queue_test, timeout: 30)
+
+av1_interval_test = executable('test-av1-interval-index',
+    ['tests/test-av1-interval-index.c', 'src/av1-interval-index.c', 'src/appendable-buffer.c'],
+    include_directories: include_directories('src'), c_args: ['-UNDEBUG'])
+test('AV1 interval index', av1_interval_test, timeout: 30)
 
 core_buffers_test = executable(
     'test-core-buffers',

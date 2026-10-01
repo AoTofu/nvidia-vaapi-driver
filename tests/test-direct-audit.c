@@ -321,7 +321,9 @@ typedef struct {
     sem_t returned;
 } SubmitTest;
 
+static unsigned decodeCalls;
 static CUresult CUDAAPI mockDecode(CUvideodecoder decoder, CUVIDPICPARAMS *picture) {
+    decodeCalls++;
     return CUDA_SUCCESS;
 }
 
@@ -437,6 +439,15 @@ static void testSharedSurfaceSubmission(void) {
             &failedDescriptor) == VA_STATUS_SUCCESS);
         assert(surface->exported);
         closeDescriptor(&failedDescriptor);
+        ctx->renderTarget = ctx->displayTarget = surface;
+        ctx->cudaCodec = cudaVideoCodec_AV1;
+        ctx->pPicParams.nNumSlices = 4;
+        ctx->av1TileOffsetsSeen = 3;
+        ctx->pictureState = NVD_PICTURE_BUILDING;
+        const unsigned decodedBefore = decodeCalls;
+        setSurfaceResolving(surface, true);
+        assert(nvEndPicture(&driver, ctx->id) == VA_STATUS_ERROR_INVALID_PARAMETER);
+        assert(decodeCalls == decodedBefore && !surface->resolving);
         free(ctx->bitstreamBuffer.buf);
         resolveQueueDestroy(&ctx->resolveQueue);
         pthread_mutex_destroy(&ctx->pictureMutex);
@@ -542,6 +553,62 @@ static void testSecurityClearPatterns(void) {
     free(scratch); // mock-only allocation; no actual GPU work was submitted.
 }
 
+extern const NVCodec av1Codec;
+static void testAV1SubmissionOrder(void) {
+    const unsigned order[] = {3,0,2,1};
+    for (unsigned paramsFirst = 0; paramsFirst < 2; paramsFirst++) {
+        NVDriver drv = {0};
+        NVContext ctx = {.drv=&drv, .av1TileMinOffset=UINT32_MAX};
+        CUVIDPICPARAMS pic = {.nNumSlices=4};
+        pic.CodecSpecific.av1.num_tile_cols = pic.CodecSpecific.av1.num_tile_rows = 2;
+        uint8_t bytes[32] = {0};
+        NVBuffer data = {.ptr=bytes, .size=sizeof(bytes)};
+        VASliceParameterBufferAV1 tiles[4];
+        for (unsigned i = 0; i < 4; i++) tiles[i] = (VASliceParameterBufferAV1){
+            .tile_row=order[i]/2, .tile_column=order[i]%2,
+            .slice_data_offset=order[i]*4, .slice_data_size=4};
+        NVBuffer params = {.ptr=tiles, .elements=4};
+        if (paramsFirst) {
+            av1Codec.handlers[VASliceParameterBufferType](&ctx,&params,&pic);
+            av1Codec.handlers[VASliceDataBufferType](&ctx,&data,&pic);
+        } else {
+            av1Codec.handlers[VASliceDataBufferType](&ctx,&data,&pic);
+            // Split across RenderPicture-style calls and keep NVDEC tile order.
+            for (unsigned i = 0; i < 4; i++) {
+                params.ptr=&tiles[i]; params.elements=1;
+                av1Codec.handlers[VASliceParameterBufferType](&ctx,&params,&pic);
+                assert(ctx.av1TileOffsetsSeen == i+1);
+            }
+        }
+        assert(!ctx.inputValidationFailed && !ctx.sliceOffsets.failed);
+        uint32_t *offsets=ctx.sliceOffsets.buf;
+        for (unsigned i = 0; i < 4; i++) assert(offsets[i*2] == i*4 && offsets[i*2+1] == i*4+4);
+        params.ptr=&tiles[0]; params.elements=1;
+        av1Codec.handlers[VASliceParameterBufferType](&ctx,&params,&pic);
+        assert(ctx.inputValidationFailed); // Duplicate coordinate remains immediate.
+        freeAppendableBuffer(&ctx.sliceOffsets);
+        freeAppendableBuffer(&ctx.bitstreamBuffer);
+        nvdIntervalIndexDestroy(&ctx.av1TileIntervals);
+    }
+    // A distinct tile overlapping an already registered range still fails
+    // before the full tile set arrives, even in arbitrary submission order.
+    NVDriver drv = {0};
+    NVContext ctx = {.drv=&drv,.av1TileMinOffset=UINT32_MAX};
+    CUVIDPICPARAMS pic = {.nNumSlices=4};
+    pic.CodecSpecific.av1.num_tile_cols = pic.CodecSpecific.av1.num_tile_rows = 2;
+    uint8_t bytes[32] = {0}; NVBuffer data = {.ptr=bytes,.size=sizeof(bytes)};
+    av1Codec.handlers[VASliceDataBufferType](&ctx,&data,&pic);
+    VASliceParameterBufferAV1 tile = {.tile_row=1,.tile_column=1,.slice_data_offset=8,.slice_data_size=8};
+    NVBuffer param = {.ptr=&tile,.elements=1};
+    av1Codec.handlers[VASliceParameterBufferType](&ctx,&param,&pic);
+    tile.tile_row=0; tile.tile_column=0; tile.slice_data_offset=4;
+    av1Codec.handlers[VASliceParameterBufferType](&ctx,&param,&pic);
+    assert(ctx.inputValidationFailed && ctx.av1TileOffsetsSeen == 1);
+    freeAppendableBuffer(&ctx.sliceOffsets);
+    freeAppendableBuffer(&ctx.bitstreamBuffer);
+    nvdIntervalIndexDestroy(&ctx.av1TileIntervals);
+}
+
 static void testStatsAccounting(void) {
     NVDriver drv = {.statsEnabled = true};
     BackingImage owner = {.totalSize = 4096};
@@ -620,6 +687,7 @@ static void testTimingHistograms(void) {
 
 int main(void) {
     testSecurityClearPatterns();
+    testAV1SubmissionOrder();
     testStatsAccounting();
     testTimingHistograms();
     testUuid();

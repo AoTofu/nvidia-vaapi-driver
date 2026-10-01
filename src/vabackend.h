@@ -17,6 +17,7 @@
 #include "list.h"
 #include "resolve-queue.h"
 #include "appendable-buffer.h"
+#include "av1-interval-index.h"
 #include "direct/nv-driver.h"
 #include "common.h"
 #include "stats.h"
@@ -60,7 +61,7 @@ struct _NVContext;
 struct _BackingImage;
 
 #define NVD_MAX_DECODE_SURFACES 32U
-#define NVD_MAX_AV1_TILES 4096U
+#define NVD_MAX_AV1_TILES NVD_INTERVAL_INDEX_CAPACITY
 
 typedef struct
 {
@@ -321,6 +322,7 @@ typedef struct _NVContext
     AppendableBuffer    sliceParamsBuffer;
     bool                av1SequenceEnableRestoration;
     uint32_t            av1TileOffsetsSeen;
+    NVDIntervalIndex    av1TileIntervals;
     uint64_t            av1TileSeen[NVD_MAX_AV1_TILES / 64U];
     uint32_t            av1TileMinOffset;
     uint32_t            av1TileMaxEnd;
