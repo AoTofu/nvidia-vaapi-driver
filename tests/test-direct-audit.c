@@ -501,7 +501,10 @@ static CUresult CUDAAPI mockClearCopy(const CUDA_MEMCPY2D *copy, CUstream stream
     }
     return clearCopyCalls == clearCopyFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 }
-static CUresult CUDAAPI mockClearHostCopy(const CUDA_MEMCPY2D *copy) { return mockClearCopy(copy, NULL); }
+static CUresult CUDAAPI mockClearHostCopy(const CUDA_MEMCPY2D *copy) {
+    if (clearFillCalls) assert(clearSyncCalls > 0);
+    return mockClearCopy(copy, NULL);
+}
 static CUresult CUDAAPI mockClearSync(CUstream stream) {
     clearSyncCalls++;
     return clearSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
@@ -548,10 +551,10 @@ static void testSecurityClearPatterns(void) {
     assert(clearBackingImage(&drv, &img));
     assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 0);
     drv.cuMemsetD16Async = mockClear16;
-    for (unsigned scenario = 0; scenario < 3; scenario++) {
+    for (unsigned scenario = 0; scenario < 5; scenario++) {
         clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
-        clearFillFailure = scenario == 0 ? 1 : 0;
-        clearCopyFailure = scenario == 1 ? 1 : 0;
+        clearFillFailure = scenario == 0 ? 1 : scenario == 3 ? 2 : 0;
+        clearCopyFailure = scenario == 1 ? 1 : scenario == 4 ? 2 : 0;
         clearSyncFailure = scenario == 2;
         atomic_store(&drv.cudaWorkUnsafe, false);
         assert(clearBackingImage(&drv, &img) == (scenario != 2));
@@ -561,6 +564,7 @@ static void testSecurityClearPatterns(void) {
     clearFillFailure = clearCopyFailure = 0;
     clearSyncFailure = false;
     // The backing allocation and scratch remain owned after an unknown completion.
+    atomic_store(&drv.cudaWorkUnsafe, true);
     assert(!clearBackingImage(&drv, &img));
     atomic_store(&drv.cudaWorkUnsafe, false);
     pthread_t threads[3];

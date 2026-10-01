@@ -52,7 +52,7 @@ void nvStatsRecordContext(NVContext *ctx, NVTimingStage stage,
 }
 
 static void logHistogram(FILE *out, const NVTimingHistogram *histogram,
-                          const char *scope, unsigned contextId,
+                          const NVDriver *drv, const char *scope, unsigned contextId,
                           const char *sharing, NVTimingStage stage) {
     uint64_t bins[NV_TIMING_BUCKETS], count = 0;
     for (unsigned i = 0; i < NV_TIMING_BUCKETS; i++) {
@@ -74,8 +74,8 @@ static void logHistogram(FILE *out, const NVTimingHistogram *histogram,
             }
         }
     }
-    fprintf(out, "Timing[%s]: context=%u sharing=%s stage=%s count=%llu p50_upper_ns=%llu p95_upper_ns=%llu p99_upper_ns=%llu bins=",
-            scope, contextId, sharing, timingNames[stage],
+    fprintf(out, "Timing[%s]: pid=%d driver=%p context=%u sharing=%s stage=%s count=%llu p50_upper_ns=%llu p95_upper_ns=%llu p99_upper_ns=%llu bins=",
+            scope, getpid(), (const void *) drv, contextId, sharing, timingNames[stage],
             (unsigned long long) count, (unsigned long long) upper[0],
             (unsigned long long) upper[1], (unsigned long long) upper[2]);
     for (unsigned i = 0; i < NV_TIMING_BUCKETS; i++)
@@ -88,12 +88,12 @@ void nvStatsContextLog(NVContext *ctx) {
     FILE *out = nvStatsOutput();
     if (out == NULL) return;
     flockfile(out);
-    fprintf(out, "ContextStats: context=%u codec=%d format=%d width=%u height=%u queue_high_water=%zu queue_capacity=%u\n",
-            ctx->id, ctx->cudaCodec, ctx->decoderSurfaceFormat,
+    fprintf(out, "ContextStats: pid=%d driver=%p context=%u codec=%d format=%d bit_depth=%d width=%u height=%u queue_high_water=%zu queue_capacity=%u\n",
+            getpid(), (void *) ctx->drv, ctx->id, ctx->cudaCodec, ctx->decoderSurfaceFormat, ctx->decoderBitDepth,
             ctx->width, ctx->height, ctx->resolveQueue.highWater, RESOLVE_QUEUE_CAPACITY);
     for (unsigned sharing = 0; sharing < 2; sharing++)
         for (unsigned stage = 0; stage < NV_TIMING_CONTEXT_COUNT; stage++)
-            logHistogram(out, &ctx->timings[sharing][stage], "context_final", ctx->id,
+            logHistogram(out, &ctx->timings[sharing][stage], ctx->drv, "context_final", ctx->id,
                           sharing ? "shared" : "private", stage);
     funlockfile(out);
     nvStatsLog(ctx->drv, "context_retired");
@@ -324,8 +324,8 @@ void nvStatsLog(NVDriver *drv, const char *reason) {
         (unsigned long long) drv->maxDetachedBackingImageBytes, drv->maxDetachedBackingImages,
         (unsigned long long) drv->memoryBudgetBytes);
 #undef S
-    fprintf(out, "MemoryStats[%s]: logical_view_bytes=%llu unique_owned_backing_bytes=%llu unique_owned_backing_bytes_peak=%llu borrowed_view_bytes=%llu external_import_view_bytes=%llu security_clear_scratch_bytes=%llu security_clear_host_bytes=%llu buffer_live_requested_bytes=%llu buffer_live_capacity_bytes=%llu buffer_pool_retained_bytes=%llu context_host_buffer_bytes=%llu owned_gpu_bytes=%llu owned_gpu_bytes_peak=%llu owned_host_bytes=%llu owned_host_bytes_peak=%llu reclaimable_cache_budget_bytes=%llu security_clear_syncs=%llu nvdec_internal_bytes=unknown cuda_internal_bytes=unknown\n",
-        reason,
+    fprintf(out, "MemoryStats[%s]: pid=%d driver=%p logical_view_bytes=%llu unique_owned_backing_bytes=%llu unique_owned_backing_bytes_peak=%llu borrowed_view_bytes=%llu external_import_view_bytes=%llu security_clear_scratch_bytes=%llu security_clear_host_bytes=%llu buffer_live_requested_bytes=%llu buffer_live_capacity_bytes=%llu buffer_pool_retained_bytes=%llu context_host_buffer_bytes=%llu owned_gpu_bytes=%llu owned_gpu_bytes_peak=%llu owned_host_bytes=%llu owned_host_bytes_peak=%llu reclaimable_cache_budget_bytes=%llu security_clear_syncs=%llu nvdec_internal_bytes=unknown cuda_internal_bytes=unknown\n",
+        reason, getpid(), (void *) drv,
         (unsigned long long) (statLoad(drv, NV_STAT_ACTIVE_BACKING_BYTES) + statLoad(drv, NV_STAT_DETACHED_BACKING_BYTES)),
         (unsigned long long) statLoad(drv, NV_STAT_UNIQUE_OWNED_BACKING_BYTES),
         (unsigned long long) statLoad(drv, NV_STAT_UNIQUE_OWNED_BACKING_BYTES_PEAK),
@@ -344,7 +344,7 @@ void nvStatsLog(NVDriver *drv, const char *reason) {
         (unsigned long long) drv->memoryBudgetBytes,
         (unsigned long long) statLoad(drv, NV_STAT_SECURITY_CLEAR_SYNCS));
     for (unsigned stage = 0; stage < NV_TIMING_COUNT; stage++)
-        logHistogram(out, &drv->timings[stage], reason, VA_INVALID_ID, "all", stage);
+        logHistogram(out, &drv->timings[stage], drv, reason, VA_INVALID_ID, "all", stage);
     fflush(out);
     funlockfile(out);
 }

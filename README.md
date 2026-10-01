@@ -265,7 +265,7 @@ bin is unbounded (`UINT64_MAX` for a percentile in that bin). `p50_upper_ns`,
 `p95_upper_ns`, and `p99_upper_ns` are bucket upper bounds; inspect `bins` and
 sample counts before comparing them. Records are cumulative approximate
 snapshots under concurrency, not independent frame samples. Context records
-identify the context, decoder format, and shared/private status at submission;
+identify the process, driver instance, context, decoder format/bit depth, and shared/private status at submission;
 late exports do not retroactively reclassify a job. No per-frame trace is stored.
 
 Decode submission, queue residence, map, export (including allocation/copy),
@@ -282,7 +282,7 @@ which can affect results; use `final` for diagnostics and leave all statistics
 disabled for the performance comparison.
 
 `MemoryStats` separates logical backing views, unique driver-owned backing
-allocations, borrowed views, and external import views. External imports are
+allocations, borrowed views, and external import views. External import views exclude borrowed wrappers and are
 not a deduplicated physical-memory gauge. Owned GPU bytes also include VPP and
 security-clear scratch. Host bytes include live VA-buffer capacities, retained
 pool blocks, VPP scratch, temporary clear staging, and context appendable-buffer
@@ -297,6 +297,32 @@ it is not a hard cap on total VRAM. Quarantined resources remain owned.
 `NVD_BENCH_DIAGNOSTIC=1` explicitly enables final statistics in `bench-seek.mjs`
 and records their path and measurement mode in the JSON. Use separate diagnostic
 runs; the default benchmark still removes logging/statistics from child Chrome.
+
+The direct backend generates 16-bit YUV clear patterns with optional
+[`cuMemsetD16Async`](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__MEM.html)
+from the already loaded CUDA library; no newer ffnvcodec loader is required.
+Missing functions or submission failures retain host staging after a successful
+drain. Failed completion checks quarantine resources. Multi-plane GPU clears
+reserve the largest scratch chunk first, issue every plane on one protected
+stream, and finish once per image (`security_clear_syncs` also counts scratch
+resize drains). Clear scratch can retain up to 8 MiB for supported surface sizes.
+RGB allocation follows its existing `alloc_image` initialization and does not
+use this YUV clear path.
+
+AV1 tile intervals use a lazy, reusable AVL index bounded by 4096 nodes. It
+preserves immediate overlap errors, coordinate checks, empty/range validation,
+and NVDEC tile ordering. The index stores original bitstream coordinates;
+compaction changes only the decoder offset view after all tiles are registered.
+EndPicture requires a complete tile set before calling NVDEC. The index adds a
+small host allocation (256 bytes for small tile sets, approximately 73 KiB at
+4096 tiles with the current growth policy); this is counted in context buffers.
+The 4096-node cap is an internal validation bound, not a claim about playable
+4096-tile videos. Benchmark validation in isolation with
+`build-perf/bench-av1-tiles TILE_COUNT FRAME_COUNT`. GPU clear benchmarks use
+`build-perf/test-security-clear --bench p010 60 3840 2160 [THREADS]` with
+`NVD_RUN_GPU_TESTS=1`, the selected `LIBVA_DRIVERS_PATH`, and an explicit layout.
+Their JSON reports fresh-allocation/export time and checks every visible pixel;
+this is not steady-state video latency or an energy measurement.
 
 # Testing
 

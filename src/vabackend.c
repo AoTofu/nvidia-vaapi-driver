@@ -5041,11 +5041,14 @@ static VAStatus nvEndPictureImpl(
         setSurfaceResolving(nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget, false);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
-    NVSurface *submittedSurface = nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget;
-    pthread_mutex_lock(&submittedSurface->mutex);
-    const bool submittedShared = submittedSurface->exported ||
-        (submittedSurface->backingImage != NULL && submittedSurface->backingImage->isExternalBuffer);
-    pthread_mutex_unlock(&submittedSurface->mutex);
+    bool submittedShared = false;
+    if (drv->statsEnabled) {
+        NVSurface *submittedSurface = nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget;
+        pthread_mutex_lock(&submittedSurface->mutex);
+        submittedShared = submittedSurface->exported ||
+            (submittedSurface->backingImage != NULL && submittedSurface->backingImage->isExternalBuffer);
+        pthread_mutex_unlock(&submittedSurface->mutex);
+    }
     const uint64_t submitStart = nvStatsTimestamp(drv);
     CUresult result = cv->cuvidDecodePicture(nvCtx->decoder, picParams);
     nvStatsRecordContext(nvCtx, NV_TIMING_DECODE_SUBMIT, submittedShared, submitStart);

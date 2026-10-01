@@ -11,3 +11,6 @@ va-api-nvidia.files
 va-api-nvidia.includes
 meson.build.user
 .idea
+
+# Local reproducible performance runs, binaries, and archived baseline source
+/perf-results/
