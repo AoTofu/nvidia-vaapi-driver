@@ -57,7 +57,14 @@ static void verify(VADisplay dpy, VASurfaceID surface, ClearFormat fmt, unsigned
                     memcpy(&sample, row + x * 2, 2);
                     ok = sample == (p ? 0x8000 : 0x1000);
                 } else ok = row[x] == (p ? 128 : 16);
-                if (!ok) { fprintf(stderr, "actual=%02x,%02x,%02x,%02x offset=%u pitch=%u\n",row[x*fmt.bytes],row[x*fmt.bytes+1],row[x*fmt.bytes+2],row[x*fmt.bytes+3],image.offsets[p],image.pitches[p]); fprintf(stderr, "Clear mismatch: fourcc=%08x %ux%u plane=%u x=%u y=%u\n", fmt.fourcc,w,h,p,x,y); exit(1); }
+                if (!ok) {
+                    fprintf(stderr, "actual=");
+                    for (unsigned b = 0; b < fmt.bytes; b++)
+                        fprintf(stderr, "%s%02x", b ? "," : "", row[x * fmt.bytes + b]);
+                    fprintf(stderr, " offset=%u pitch=%u\n", image.offsets[p], image.pitches[p]);
+                    fprintf(stderr, "Clear mismatch: fourcc=%08x %ux%u plane=%u x=%u y=%u\n", fmt.fourcc,w,h,p,x,y);
+                    exit(1);
+                }
             }
         }
     }
