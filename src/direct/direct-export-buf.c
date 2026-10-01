@@ -19,6 +19,7 @@
 #include <drm.h>
 #include <drm_fourcc.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 #ifndef CUDA_ARRAY3D_SURFACE_LDST
 #define CUDA_ARRAY3D_SURFACE_LDST 0x02
@@ -382,13 +383,9 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
                                       uint32_t plane) {
     if (atomic_load(&drv->cudaWorkUnsafe)) return false;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
-    // The minimum supported ffnvcodec loader only exposes cuMemsetD8Async.
-    // Multi-byte neutral patterns (P010/P016 and ARGB) therefore continue to
-    // use the host staging fallback instead of depending on newer loader
-    // members that may be absent at build time.
-    if (img->format == NV_FORMAT_ARGB || fmtInfo->bppc != 1) {
-        return false;
-    }
+    // Actual RGB allocation uses alloc_image's existing initialization and
+    // does not call this clear helper. Keep its host fallback contract intact.
+    if (img->format == NV_FORMAT_ARGB) return false;
     const NVFormatPlane *p = &fmtInfo->plane[plane];
     const uint32_t width = nvPlaneExtent(img->width, p->ss.x);
     const uint32_t height = nvPlaneExtent(img->height, p->ss.y);
@@ -409,11 +406,37 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
     const size_t chunkBytes = widthInBytes * chunkRows;
 
     pthread_mutex_lock(&drv->securityClearMutex);
+    // Optional symbols from the already loaded CUDA library keep the minimum
+    // ffnvcodec dependency unchanged. A missing symbol uses host staging.
+    if (!drv->securityClearFunctionsLoaded) {
+        if (drv->cu->lib != NULL) {
+            drv->cuMemsetD16Async = (NVCuMemsetD16Async *) dlsym(drv->cu->lib, "cuMemsetD16Async");
+        }
+        drv->securityClearFunctionsLoaded = true;
+    }
+    const size_t elementBytes = fmtInfo->bppc;
+    if ((elementBytes == 2 && drv->cuMemsetD16Async == NULL) ||
+        (elementBytes != 1 && elementBytes != 2) ||
+        chunkBytes % elementBytes != 0) {
+        pthread_mutex_unlock(&drv->securityClearMutex);
+        return false;
+    }
     bool failed = !ensureSecurityClearResourcesLocked(drv, chunkBytes);
     if (!failed) {
-        failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD8Async(
-            drv->securityClearBuffer, plane == 0 ? 16 : 128,
-            chunkBytes, drv->securityClearStream));
+        // N is an element count for D16, and the destination must have
+        // the corresponding alignment. Match the existing host clear bytes
+        // for each supported YUV NVFormat exactly.
+        if (drv->securityClearBuffer % elementBytes != 0) {
+            failed = true;
+        } else if (elementBytes == 2) {
+            failed = CHECK_CUDA_RESULT(drv->cuMemsetD16Async(
+                drv->securityClearBuffer, plane == 0 ? 0x1000 : 0x8000,
+                chunkBytes / 2, drv->securityClearStream));
+        } else {
+            failed = CHECK_CUDA_RESULT(drv->cu->cuMemsetD8Async(
+                drv->securityClearBuffer, plane == 0 ? 16 : 128,
+                chunkBytes, drv->securityClearStream));
+        }
     }
 
     for (uint32_t y = 0; !failed && y < height; y += chunkRows) {

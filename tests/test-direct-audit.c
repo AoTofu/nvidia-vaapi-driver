@@ -455,6 +455,93 @@ static void testSharedSurfaceSubmission(void) {
 }
 
 
+
+static unsigned clearFillCalls, clearCopyCalls, clearSyncCalls;
+static unsigned clearFillFailure, clearCopyFailure;
+static bool clearSyncFailure;
+static NVFormat clearFormat;
+static size_t clearElementCount;
+static CUresult CUDAAPI mockClear16(CUdeviceptr ptr, unsigned short value, size_t count, CUstream stream) {
+    clearFillCalls++;
+    clearElementCount = count;
+    for (size_t i = 0; i < count; i++) ((uint16_t *)(uintptr_t)ptr)[i] = value;
+    return clearFillCalls == clearFillFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI mockClear8(CUdeviceptr ptr, unsigned char value, size_t count, CUstream stream) {
+    clearFillCalls++;
+    clearElementCount = count;
+    memset((void *)(uintptr_t)ptr, value, count);
+    return clearFillCalls == clearFillFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI mockClearCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
+    clearCopyCalls++;
+    unsigned plane = (uintptr_t)copy->dstArray - 1;
+    const uint8_t *bytes = copy->srcMemoryType == CU_MEMORYTYPE_HOST ? copy->srcHost : (void *)(uintptr_t)copy->srcDevice;
+    const unsigned unit = clearFormat == NV_FORMAT_ARGB ? 4 : formatsInfo[clearFormat].bppc;
+    assert(copy->WidthInBytes % unit == 0);
+    if (copy->srcMemoryType == CU_MEMORYTYPE_DEVICE) assert(clearElementCount * unit >= copy->WidthInBytes * copy->Height);
+    for (size_t y = 0; y < copy->Height; y++) {
+        const uint8_t *row = bytes + y * copy->srcPitch;
+        for (size_t x = 0; x < copy->WidthInBytes; x += unit) {
+            if (unit == 4) { const uint8_t expected[] = {0,0,0,255}; assert(memcmp(row+x,expected,4)==0); }
+            else if (unit == 2) { uint16_t value; memcpy(&value,row+x,2); assert(value == (plane ? 0x8000 : 0x1000)); }
+            else assert(row[x] == (plane ? 128 : 16));
+        }
+    }
+    return clearCopyCalls == clearCopyFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI mockClearHostCopy(const CUDA_MEMCPY2D *copy) { return mockClearCopy(copy, NULL); }
+static CUresult CUDAAPI mockClearSync(CUstream stream) {
+    clearSyncCalls++;
+    return clearSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static void testSecurityClearPatterns(void) {
+    void *scratch;
+    assert(posix_memalign(&scratch, 16, 8 * 1024 * 1024) == 0);
+    CudaFunctions cuda = {.cuMemcpy2DAsync = mockClearCopy, .cuMemcpy2D = mockClearHostCopy,
+        .cuStreamSynchronize = mockClearSync, .cuMemsetD8Async = mockClear8};
+    NVDriver drv = {.cu = &cuda, .statsEnabled = true, .securityClearStream = (CUstream)1,
+        .securityClearBuffer = (uintptr_t)scratch, .securityClearBufferSize = 8 * 1024 * 1024,
+        .cuMemsetD16Async = mockClear16,
+        .securityClearFunctionsLoaded = true};
+    assert(pthread_mutex_init(&drv.securityClearMutex, NULL) == 0);
+    for (unsigned f = NV_FORMAT_NV12; f < NV_FORMAT_ARGB; f++) {
+        clearFormat = f;
+        if (formatsInfo[f].numPlanes == 0) continue;
+        BackingImage img = {.format = f, .width = 63, .height = 65,
+                            .arrays = {(CUarray)1,(CUarray)2,(CUarray)3}};
+        clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+        assert(clearBackingImage(&drv, &img));
+        assert(clearFillCalls == formatsInfo[f].numPlanes);
+        assert(clearSyncCalls == formatsInfo[f].numPlanes);
+        assert(atomic_load(&drv.stats[NV_STAT_SECURITY_CLEAR_HOST_FALLBACKS]) == 0);
+    }
+    clearFormat = NV_FORMAT_P010;
+    BackingImage img = {.format = NV_FORMAT_P010, .width = 63, .height = 65,
+                        .arrays = {(CUarray)1,(CUarray)2}};
+    drv.cuMemsetD16Async = NULL;
+    clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+    assert(clearBackingImage(&drv, &img));
+    assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 0);
+    drv.cuMemsetD16Async = mockClear16;
+    for (unsigned scenario = 0; scenario < 3; scenario++) {
+        clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+        clearFillFailure = scenario == 0 ? 1 : 0;
+        clearCopyFailure = scenario == 1 ? 1 : 0;
+        clearSyncFailure = scenario == 2;
+        atomic_store(&drv.cudaWorkUnsafe, false);
+        assert(clearBackingImage(&drv, &img) == (scenario != 2));
+        assert(clearSyncCalls > 0);
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 2));
+    }
+    clearFillFailure = clearCopyFailure = 0;
+    clearSyncFailure = false;
+    // The backing allocation and scratch remain owned after an unknown completion.
+    assert(!clearBackingImage(&drv, &img));
+    pthread_mutex_destroy(&drv.securityClearMutex);
+    free(scratch); // mock-only allocation; no actual GPU work was submitted.
+}
+
 static void testStatsAccounting(void) {
     NVDriver drv = {.statsEnabled = true};
     BackingImage owner = {.totalSize = 4096};
@@ -532,6 +619,7 @@ static void testTimingHistograms(void) {
 }
 
 int main(void) {
+    testSecurityClearPatterns();
     testStatsAccounting();
     testTimingHistograms();
     testUuid();

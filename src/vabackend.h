@@ -123,6 +123,8 @@ typedef uint64_t NVCUsurfObject;
 typedef CUresult CUDAAPI NVCuSurfObjectCreate(NVCUsurfObject *surfaceObject,
                                               const CUDA_RESOURCE_DESC *resourceDesc);
 typedef CUresult CUDAAPI NVCuSurfObjectDestroy(NVCUsurfObject surfaceObject);
+typedef CUresult CUDAAPI NVCuMemsetD16Async(CUdeviceptr dst, unsigned short value,
+                                           size_t count, CUstream stream);
 
 typedef struct _BackingImage {
     NVSurface   *surface;
@@ -230,6 +232,8 @@ typedef struct _NVDriver
     CUstream                securityClearStream;
     CUdeviceptr             securityClearBuffer;
     size_t                  securityClearBufferSize;
+    NVCuMemsetD16Async       *cuMemsetD16Async;
+    bool                    securityClearFunctionsLoaded;
     NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
     uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
     uint64_t                bufferPoolBytes;
