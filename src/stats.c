@@ -324,7 +324,7 @@ void nvStatsLog(NVDriver *drv, const char *reason) {
         (unsigned long long) drv->maxDetachedBackingImageBytes, drv->maxDetachedBackingImages,
         (unsigned long long) drv->memoryBudgetBytes);
 #undef S
-    fprintf(out, "MemoryStats[%s]: logical_view_bytes=%llu unique_owned_backing_bytes=%llu unique_owned_backing_bytes_peak=%llu borrowed_view_bytes=%llu external_import_view_bytes=%llu security_clear_scratch_bytes=%llu security_clear_host_bytes=%llu buffer_live_requested_bytes=%llu buffer_live_capacity_bytes=%llu buffer_pool_retained_bytes=%llu context_host_buffer_bytes=%llu owned_gpu_bytes=%llu owned_gpu_bytes_peak=%llu owned_host_bytes=%llu owned_host_bytes_peak=%llu reclaimable_cache_budget_bytes=%llu nvdec_internal_bytes=unknown cuda_internal_bytes=unknown\n",
+    fprintf(out, "MemoryStats[%s]: logical_view_bytes=%llu unique_owned_backing_bytes=%llu unique_owned_backing_bytes_peak=%llu borrowed_view_bytes=%llu external_import_view_bytes=%llu security_clear_scratch_bytes=%llu security_clear_host_bytes=%llu buffer_live_requested_bytes=%llu buffer_live_capacity_bytes=%llu buffer_pool_retained_bytes=%llu context_host_buffer_bytes=%llu owned_gpu_bytes=%llu owned_gpu_bytes_peak=%llu owned_host_bytes=%llu owned_host_bytes_peak=%llu reclaimable_cache_budget_bytes=%llu security_clear_syncs=%llu nvdec_internal_bytes=unknown cuda_internal_bytes=unknown\n",
         reason,
         (unsigned long long) (statLoad(drv, NV_STAT_ACTIVE_BACKING_BYTES) + statLoad(drv, NV_STAT_DETACHED_BACKING_BYTES)),
         (unsigned long long) statLoad(drv, NV_STAT_UNIQUE_OWNED_BACKING_BYTES),
@@ -341,7 +341,8 @@ void nvStatsLog(NVDriver *drv, const char *reason) {
         (unsigned long long) statLoad(drv, NV_STAT_OWNED_GPU_BYTES_PEAK),
         (unsigned long long) statLoad(drv, NV_STAT_TRACKED_HOST_BYTES),
         (unsigned long long) statLoad(drv, NV_STAT_TRACKED_HOST_BYTES_PEAK),
-        (unsigned long long) drv->memoryBudgetBytes);
+        (unsigned long long) drv->memoryBudgetBytes,
+        (unsigned long long) statLoad(drv, NV_STAT_SECURITY_CLEAR_SYNCS));
     for (unsigned stage = 0; stage < NV_TIMING_COUNT; stage++)
         logHistogram(out, &drv->timings[stage], reason, VA_INVALID_ID, "all", stage);
     fflush(out);

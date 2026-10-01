@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,14 +71,48 @@ static void createAndCheck(VADisplay dpy, ClearFormat fmt, unsigned w, unsigned 
     VASurfaceID surface;
     check(vaCreateSurfaces(dpy, fmt.rt, w, h, &surface, 1, &attr, 1));
     VADRMPRIMESurfaceDescriptor desc;
-    uint64_t start = ns(CLOCK_MONOTONIC), cpuStart = ns(CLOCK_PROCESS_CPUTIME_ID);
+    uint64_t start = ns(CLOCK_MONOTONIC), cpuStart = ns(CLOCK_THREAD_CPUTIME_ID);
     check(vaExportSurfaceHandle(dpy, surface, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
         VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc));
-    *cpu = ns(CLOCK_PROCESS_CPUTIME_ID) - cpuStart;
+    *cpu = ns(CLOCK_THREAD_CPUTIME_ID) - cpuStart;
     *wall = ns(CLOCK_MONOTONIC) - start;
     verify(dpy, surface, fmt, w, h);
     for (unsigned i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
     check(vaDestroySurfaces(dpy, &surface, 1));
+}
+
+typedef struct {
+    VADisplay dpy;
+    ClearFormat format;
+    unsigned count, width, height;
+    uint64_t *wall, *cpu;
+} ClearBenchWorker;
+static void *benchWorker(void *opaque) {
+    ClearBenchWorker *worker = opaque;
+    for (unsigned i = 0; i < worker->count + 5; i++) {
+        uint64_t wall, cpu;
+        createAndCheck(worker->dpy,worker->format,worker->width,worker->height,&wall,&cpu);
+        if (i >= 5) { worker->wall[i-5] = wall; worker->cpu[i-5] = cpu; }
+    }
+    return NULL;
+}
+static void runWorkers(VADisplay dpy, ClearFormat fmt, unsigned count, unsigned w, unsigned h,
+                        unsigned threads, const char *name, int mixed) {
+    pthread_t ids[4];
+    ClearBenchWorker workers[4];
+    for (unsigned t = 0; t < threads; t++) {
+        workers[t] = (ClearBenchWorker){.dpy=dpy,.format=mixed ? clearFormats[t%4] : fmt,
+            .count=count,.width=w,.height=h,.wall=calloc(count,sizeof(uint64_t)),.cpu=calloc(count,sizeof(uint64_t))};
+        if (!workers[t].wall || !workers[t].cpu || pthread_create(&ids[t],NULL,benchWorker,&workers[t])) exit(1);
+    }
+    for (unsigned t = 0; t < threads; t++) if (pthread_join(ids[t],NULL)) exit(1);
+    if (name) {
+        printf("{\"workload\":\"cold-clear-%s\",\"width\":%u,\"height\":%u,\"threads\":%u,\"correct_images\":%u,\"warmup_per_thread\":5,\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\",\"samples\":[",name,w,h,threads,count*threads);
+        for (unsigned t = 0; t < threads; t++) for (unsigned i = 0; i < count; i++)
+            printf("%s{\"worker\":%u,\"export_wall_ns\":%llu,\"export_cpu_ns\":%llu}",t || i ? "," : "",t,(unsigned long long)workers[t].wall[i],(unsigned long long)workers[t].cpu[i]);
+        puts("]}");
+    }
+    for (unsigned t = 0; t < threads; t++) { free(workers[t].wall); free(workers[t].cpu); }
 }
 int main(int argc, char **argv) {
     const char *enabled = getenv("NVD_RUN_GPU_TESTS");
@@ -88,17 +123,13 @@ int main(int argc, char **argv) {
     int major, minor;
     check(vaInitialize(dpy, &major, &minor));
     if (argc > 1) {
-        if (argc != 6 || strcmp(argv[1], "--bench")) return 1;
+        if ((argc != 6 && argc != 7) || strcmp(argv[1], "--bench")) return 1;
         unsigned f = !strcmp(argv[2], "nv12") ? 0 : !strcmp(argv[2], "p010") ? 1 : !strcmp(argv[2], "argb") ? 4 : 99;
         unsigned count = strtoul(argv[3], NULL, 10), w = strtoul(argv[4], NULL, 10), h = strtoul(argv[5], NULL, 10);
         if (f == 99 || count < 1 || count > 1000 || w < 2 || h < 2 || w > 8192 || h > 8192) return 1;
-        printf("{\"workload\":\"cold-clear-%s\",\"width\":%u,\"height\":%u,\"correct_images\":%u,\"warmup\":5,\"samples\":[", argv[2],w,h,count);
-        for (unsigned i = 0; i < count + 5; i++) {
-            uint64_t wall, cpu;
-            createAndCheck(dpy, clearFormats[f], w, h, &wall, &cpu);
-            if (i >= 5) printf("%s{\"export_wall_ns\":%llu,\"export_cpu_ns\":%llu}", i > 5 ? "," : "", (unsigned long long)wall,(unsigned long long)cpu);
-        }
-        puts("]}");
+        unsigned threads = argc == 7 ? strtoul(argv[6],NULL,10) : 1;
+        if (threads < 1 || threads > 4) return 1;
+        runWorkers(dpy,clearFormats[f],count,w,h,threads,argv[2],0);
     } else {
         const unsigned dimensions[][2] = {{63,65}, {128,128}, {3840,2160}};
         for (unsigned f = 0; f < sizeof(clearFormats)/sizeof(clearFormats[0]); f++)
@@ -106,7 +137,8 @@ int main(int argc, char **argv) {
                 uint64_t wall, cpu;
                 createAndCheck(dpy, clearFormats[f], dimensions[d][0], dimensions[d][1], &wall, &cpu);
             }
-        puts("36 fresh images retain the existing clear pattern, including odd dimensions and multi-chunk 4K clears");
+        runWorkers(dpy,clearFormats[0],4,128,128,4,NULL,1);
+        puts("36 fresh images plus mixed parallel clears retain the existing pattern, including odd dimensions and multi-chunk 4K clears");
     }
     check(vaTerminate(dpy));
     close(fd);

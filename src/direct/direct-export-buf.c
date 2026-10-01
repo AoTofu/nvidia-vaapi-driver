@@ -356,6 +356,7 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
     }
 
     if (drv->securityClearBuffer != 0) {
+        nvStatsIncrement(drv, NV_STAT_SECURITY_CLEAR_SYNCS);
         if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->securityClearStream))) {
             atomic_store(&drv->cudaWorkUnsafe, true);
             return false;
@@ -379,7 +380,18 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
     return true;
 }
 
-static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
+static void loadSecurityClearFunctionsLocked(NVDriver *drv) {
+    // Optional symbols from the already loaded CUDA library keep the minimum
+    // ffnvcodec dependency unchanged. A missing symbol uses host staging.
+    if (!drv->securityClearFunctionsLoaded) {
+        if (drv->cu->lib != NULL) {
+            drv->cuMemsetD16Async = (NVCuMemsetD16Async *) dlsym(drv->cu->lib, "cuMemsetD16Async");
+        }
+        drv->securityClearFunctionsLoaded = true;
+    }
+}
+
+static bool clearBackingImagePlaneGpuLocked(NVDriver *drv, BackingImage *img,
                                       uint32_t plane) {
     if (atomic_load(&drv->cudaWorkUnsafe)) return false;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
@@ -405,20 +417,10 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
     }
     const size_t chunkBytes = widthInBytes * chunkRows;
 
-    pthread_mutex_lock(&drv->securityClearMutex);
-    // Optional symbols from the already loaded CUDA library keep the minimum
-    // ffnvcodec dependency unchanged. A missing symbol uses host staging.
-    if (!drv->securityClearFunctionsLoaded) {
-        if (drv->cu->lib != NULL) {
-            drv->cuMemsetD16Async = (NVCuMemsetD16Async *) dlsym(drv->cu->lib, "cuMemsetD16Async");
-        }
-        drv->securityClearFunctionsLoaded = true;
-    }
     const size_t elementBytes = fmtInfo->bppc;
     if ((elementBytes == 2 && drv->cuMemsetD16Async == NULL) ||
         (elementBytes != 1 && elementBytes != 2) ||
         chunkBytes % elementBytes != 0) {
-        pthread_mutex_unlock(&drv->securityClearMutex);
         return false;
     }
     bool failed = !ensureSecurityClearResourcesLocked(drv, chunkBytes);
@@ -460,7 +462,41 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
             nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_GPU_BYTES, bytes);
         }
     }
+    return !failed;
+}
+
+static bool clearBackingImageGpu(NVDriver *drv, BackingImage *img) {
+    if (atomic_load(&drv->cudaWorkUnsafe) || img->format == NV_FORMAT_ARGB) return false;
+    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+    pthread_mutex_lock(&drv->securityClearMutex);
+    loadSecurityClearFunctionsLocked(drv);
+    if ((fmtInfo->bppc == 2 && drv->cuMemsetD16Async == NULL) ||
+        (fmtInfo->bppc != 1 && fmtInfo->bppc != 2)) {
+        pthread_mutex_unlock(&drv->securityClearMutex);
+        return false;
+    }
+    // Reserve the maximum chunk before issuing anything: a later plane must
+    // never grow/free scratch that an earlier plane is still reading.
+    size_t requiredBytes = 0;
+    for (uint32_t plane = 0; plane < fmtInfo->numPlanes; plane++) {
+        const NVFormatPlane *p = &fmtInfo->plane[plane];
+        const size_t widthBytes = (size_t) nvPlaneExtent(img->width, p->ss.x) *
+            fmtInfo->bppc * p->channelCount;
+        const uint32_t height = nvPlaneExtent(img->height, p->ss.y);
+        if (widthBytes == 0 || height == 0) continue;
+        size_t rows = (8 * 1024 * 1024) / widthBytes;
+        if (rows == 0) rows = 1;
+        if (rows > height) rows = height;
+        size_t bytes = rows * widthBytes;
+        if (bytes > requiredBytes) requiredBytes = bytes;
+    }
+    bool failed = requiredBytes != 0 && !ensureSecurityClearResourcesLocked(drv, requiredBytes);
+    for (uint32_t plane = 0; !failed && plane < fmtInfo->numPlanes; plane++)
+        failed = !clearBackingImagePlaneGpuLocked(drv, img, plane);
+    // Fill/copy for every plane uses one stream and one protected scratch
+    // buffer. Drain once, including after any partial submission failure.
     if (drv->securityClearStream != NULL) {
+        nvStatsIncrement(drv, NV_STAT_SECURITY_CLEAR_SYNCS);
         if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->securityClearStream))) {
             atomic_store(&drv->cudaWorkUnsafe, true);
             failed = true;
@@ -473,8 +509,8 @@ static bool clearBackingImagePlaneGpu(NVDriver *drv, BackingImage *img,
 static bool clearBackingImage(NVDriver *drv, BackingImage *img) {
     const uint64_t start = nvStatsTimestamp(drv);
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (!clearBackingImagePlaneGpu(drv, img, i)) {
+    if (!clearBackingImageGpu(drv, img)) {
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
             if (atomic_load(&drv->cudaWorkUnsafe)) return false;
             nvStatsIncrement(drv, NV_STAT_SECURITY_CLEAR_HOST_FALLBACKS);
             if (img->format != NV_FORMAT_ARGB && fmtInfo->bppc == 1) {

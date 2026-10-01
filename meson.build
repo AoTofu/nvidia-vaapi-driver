@@ -183,7 +183,7 @@ if libva_drm_deps.found()
                'LIBVA_DRIVER_NAME=nvidia', 'NVD_EXPORT_LAYOUT=packed',
                'NVD_MAX_DETACHED_BACKING_IMAGES=0', 'NVD_TEST_EVICT_EXPORTS=1',
                'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
-    clear_pixels_test = executable('test-security-clear', 'tests/test-security-clear.c', dependencies: libva_drm_deps)
+    clear_pixels_test = executable('test-security-clear', 'tests/test-security-clear.c', dependencies: [libva_drm_deps, dependency('threads')])
     foreach layout : ['packed', 'per-plane-natural', 'per-plane-shared-modifier']
         test('GPU security clear ' + layout, clear_pixels_test, suite: 'gpu', timeout: 180,
              depends: driver,
