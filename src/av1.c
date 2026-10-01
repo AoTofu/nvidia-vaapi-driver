@@ -563,7 +563,7 @@ static bool getAV1SliceTileIndex(const CUVIDAV1PICPARAMS *pps,
     return true;
 }
 
-static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams,
+static void setAV1SliceOffsetsImpl(NVContext *ctx, CUVIDPICPARAMS *picParams,
                                const VASliceParameterBufferAV1 *sliceParams,
                                const unsigned int count, const int64_t offsetAdjustment,
                                const size_t sliceDataSize) {
@@ -658,6 +658,16 @@ static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams,
     if (ctx->bitstreamBuffer.size > 0 && ctx->av1TileOffsetsSeen >= numSlices) {
         compactAV1BitstreamToCurrentFrame(ctx, picParams);
     }
+}
+
+static void setAV1SliceOffsets(NVContext *ctx, CUVIDPICPARAMS *picParams,
+                               const VASliceParameterBufferAV1 *sliceParams,
+                               unsigned int count, int64_t offsetAdjustment,
+                               size_t sliceDataSize) {
+    const uint64_t start = nvStatsTimestamp(ctx->drv);
+    setAV1SliceOffsetsImpl(ctx, picParams, sliceParams, count,
+                          offsetAdjustment, sliceDataSize);
+    nvStatsRecord(ctx->drv, NV_TIMING_AV1_VALIDATION, start);
 }
 
 static void copyAV1SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams) {

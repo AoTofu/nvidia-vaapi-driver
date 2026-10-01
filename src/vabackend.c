@@ -127,6 +127,8 @@ typedef struct {
     NVSurface *surface;
     CUvideodecoder decoder;
     uint64_t generation;
+    uint64_t enqueuedNs;
+    bool shared;
     int pictureIdx;
     bool progressiveFrame;
     bool topFieldFirst;
@@ -624,9 +626,11 @@ static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
         return false;
     }
     pthread_rwlock_t *lock = drv->objectLifetimeLock;
+    const uint64_t waitStart = nvStatsTimestamp(drv);
     const int result = write
         ? pthread_rwlock_wrlock(lock)
         : pthread_rwlock_rdlock(lock);
+    nvStatsRecord(drv, write ? NV_TIMING_LIFETIME_WRITE_WAIT : NV_TIMING_LIFETIME_READ_WAIT, waitStart);
     if (result != 0) {
         return false;
     }
@@ -750,9 +754,11 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
     free(nvCtx->codecData);
     nvCtx->codecData = NULL;
 
+    nvStatsContextLog(nvCtx);
     freeAppendableBuffer(&nvCtx->sliceOffsets);
     freeAppendableBuffer(&nvCtx->bitstreamBuffer);
     freeAppendableBuffer(&nvCtx->sliceParamsBuffer);
+    nvStatsContextHostBuffers(nvCtx);
 
     resolveQueueDestroy(&nvCtx->resolveQueue);
     if (nvCtx->pictureMutexInitialized) {
@@ -1247,6 +1253,7 @@ static void* resolveSurfaces(void *param) {
     LOG("[RT] Resolve thread for %p started", ctx);
     ResolveJob *job = NULL;
     while (resolveQueuePop(&ctx->resolveQueue, (void **) &job)) {
+        nvStatsRecordContext(ctx, NV_TIMING_QUEUE_RESIDENCE, job->shared, job->enqueuedNs);
         NVSurface *surface = job->surface;
         CUdeviceptr deviceMemory = (CUdeviceptr) NULL;
         unsigned int pitch = 0;
@@ -1262,28 +1269,34 @@ static void* resolveSurfaces(void *param) {
         };
 
         if (!failed) {
+            const uint64_t mapStart = nvStatsTimestamp(drv);
             const CUresult mapResult = cv->cuvidMapVideoFrame(
                 job->decoder, job->pictureIdx, &deviceMemory, &pitch,
                 &procParams);
+            nvStatsRecordContext(ctx, NV_TIMING_MAP, job->shared, mapStart);
             failed = CHECK_CUDA_RESULT(mapResult);
             mapped = !failed;
         }
 
         if (mapped) {
             nvStatsIncrement(drv, NV_STAT_RESOLVE_FRAMES);
+            const uint64_t exportStart = nvStatsTimestamp(drv);
             if (!drv->backend->exportCudaPtr(drv, deviceMemory, surface, pitch,
                                              ctx->resolveStream,
                                              ctx->resolveCompleteEvent)) {
                 failed = true;
             }
+            nvStatsRecordContext(ctx, NV_TIMING_EXPORT, job->shared, exportStart);
             // A failed export may have returned before copying (allocation,
             // host access, etc.). Drain NVDEC's output stream on that path too.
             if (failed && CHECK_CUDA_RESULT(cu->cuStreamSynchronize(ctx->resolveStream))) {
                 atomic_store(&drv->cudaWorkUnsafe, true);
             }
-            if (!atomic_load(&drv->cudaWorkUnsafe) && CHECK_CUDA_RESULT(
-                    cv->cuvidUnmapVideoFrame(job->decoder, deviceMemory))) {
-                failed = true;
+            if (!atomic_load(&drv->cudaWorkUnsafe)) {
+                const uint64_t unmapStart = nvStatsTimestamp(drv);
+                const CUresult unmapResult = cv->cuvidUnmapVideoFrame(job->decoder, deviceMemory);
+                nvStatsRecordContext(ctx, NV_TIMING_UNMAP, job->shared, unmapStart);
+                if (CHECK_CUDA_RESULT(unmapResult)) failed = true;
             }
         }
 
@@ -3023,6 +3036,10 @@ static bool allocateBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
         }
     }
     buffer->capacity = capacity;
+    buffer->statsRequestedBytes = drv->statsEnabled ? size : 0;
+    nvStatsAdd(drv, NV_STAT_BUFFER_LIVE_REQUESTED_BYTES, size);
+    nvStatsAdd(drv, NV_STAT_BUFFER_LIVE_CAPACITY_BYTES, capacity);
+    nvStatsUpdateMemoryEstimates(drv);
     buffer->poolClass = (int8_t) poolClass;
     nvStatsAdd(drv, NV_STAT_BUFFER_REQUESTED_BYTES, size);
     nvStatsAdd(drv, NV_STAT_BUFFER_CAPACITY_BYTES, capacity);
@@ -3036,6 +3053,9 @@ static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
     if (buffer == NULL || buffer->ptr == NULL) {
         return;
     }
+    nvStatsSubtract(drv, NV_STAT_BUFFER_LIVE_REQUESTED_BYTES, buffer->statsRequestedBytes);
+    nvStatsSubtract(drv, NV_STAT_BUFFER_LIVE_CAPACITY_BYTES, buffer->capacity);
+    buffer->statsRequestedBytes = 0;
     bool pooled = false;
     if (buffer->poolClass >= 0 && buffer->poolClass < NVD_BUFFER_POOL_CLASS_COUNT) {
         const int poolClass = buffer->poolClass;
@@ -3059,6 +3079,7 @@ static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
     buffer->ptr = NULL;
     buffer->capacity = 0;
     buffer->poolClass = -1;
+    nvStatsUpdateMemoryEstimates(drv);
 }
 
 static void destroyBufferPool(NVDriver *drv) {
@@ -3078,6 +3099,7 @@ static void destroyBufferPool(NVDriver *drv) {
     }
     drv->bufferPoolBytes = 0;
     nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, 0);
+    nvStatsUpdateMemoryEstimates(drv);
     pthread_mutex_unlock(&drv->bufferPoolMutex);
 }
 
@@ -4851,6 +4873,7 @@ static VAStatus nvRenderPicture(
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     const VAStatus status = nvRenderPictureImpl(ctx, context, buffers, num_buffers);
+    nvStatsContextHostBuffers(nvCtx);
     if (status != VA_STATUS_SUCCESS) {
         nvCtx->pictureState = NVD_PICTURE_FAILED;
         nvCtx->pictureFailure = status;
@@ -5009,13 +5032,21 @@ static VAStatus nvEndPictureImpl(
         setSurfaceResolving(nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget, false);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+    NVSurface *submittedSurface = nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget;
+    pthread_mutex_lock(&submittedSurface->mutex);
+    const bool submittedShared = submittedSurface->exported ||
+        (submittedSurface->backingImage != NULL && submittedSurface->backingImage->isExternalBuffer);
+    pthread_mutex_unlock(&submittedSurface->mutex);
+    const uint64_t submitStart = nvStatsTimestamp(drv);
     CUresult result = cv->cuvidDecodePicture(nvCtx->decoder, picParams);
+    nvStatsRecordContext(nvCtx, NV_TIMING_DECODE_SUBMIT, submittedShared, submitStart);
     if (CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL))) {
         setSurfaceResolving(nvCtx->displayTarget != NULL ? nvCtx->displayTarget : nvCtx->renderTarget, false);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     maybeTrimContextHostBuffers(nvCtx, bitstreamBytes,
                                 sliceOffsetBytes, sliceParamBytes);
+    nvStatsContextHostBuffers(nvCtx);
     nvStatsIncrement(drv, NV_STAT_DECODE_PICTURES);
 
     VAStatus status = VA_STATUS_SUCCESS;
@@ -5056,6 +5087,8 @@ static VAStatus nvEndPictureImpl(
     job->topFieldFirst = surface->topFieldFirst;
     job->secondField = surface->secondField;
     job->decodeStatus = status;
+    job->shared = surface->exported ||
+        (surface->backingImage != NULL && surface->backingImage->isExternalBuffer);
     pthread_mutex_unlock(&surface->mutex);
 
     if (status == VA_STATUS_SUCCESS && nvCtx->cudaCodec != cudaVideoCodec_AV1 &&
@@ -5067,7 +5100,7 @@ static VAStatus nvEndPictureImpl(
         pthread_mutex_unlock(&nvCtx->surfaceCreationMutex);
     }
 
-    if (!resolveQueuePush(&nvCtx->resolveQueue, job)) {
+    if (!resolveQueuePushTimed(&nvCtx->resolveQueue, job, drv->statsEnabled ? &job->enqueuedNs : NULL)) {
         free(job);
         failSurfaceResolve(surface, VA_STATUS_ERROR_OPERATION_FAILED);
         return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -5084,7 +5117,9 @@ static VAStatus nvEndPictureImpl(
         (surface->backingImage != NULL && surface->backingImage->isExternalBuffer);
     pthread_mutex_unlock(&surface->mutex);
     if (shared) {
+        const uint64_t sharedStart = nvStatsTimestamp(drv);
         waitSurfaceResolved(surface);
+        nvStatsRecordContext(nvCtx, NV_TIMING_SHARED_END_WAIT, true, sharedStart);
         pthread_mutex_lock(&surface->mutex);
         status = surface->completionStatus;
         pthread_mutex_unlock(&surface->mutex);
@@ -6162,6 +6197,8 @@ static VAStatus nvTerminate( VADriverContextP ctx )
         CHECK_CUDA_RESULT(cu->cuMemFree(drv->securityClearBuffer));
         drv->securityClearBuffer = 0;
         drv->securityClearBufferSize = 0;
+        nvStatsSet(drv, NV_STAT_SECURITY_CLEAR_SCRATCH_BYTES, 0);
+        nvStatsUpdateMemoryEstimates(drv);
     }
     if (drv->securityClearStream != NULL) {
         CHECK_CUDA_RESULT(cu->cuStreamDestroy(drv->securityClearStream));

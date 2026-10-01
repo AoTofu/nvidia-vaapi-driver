@@ -93,6 +93,8 @@ const port=server.address().port;
 const log=fs.openSync(path.join(runDir,'chrome.log'),'w');
 const env={...process.env,LIBVA_DRIVER_NAME:'nvidia',LIBVA_DRIVERS_PATH:path.resolve(driverDir),NVD_BACKEND:'direct',NVD_EXPORT_LAYOUT:layout};
 for(const key of ['NVD_SINGLE_BUFFER','NVD_LOG','NVD_STATS','NVD_STATS_LOG'])delete env[key];
+const diagnostic=process.env.NVD_BENCH_DIAGNOSTIC==='1';
+if(diagnostic){env.NVD_STATS='final';env.NVD_STATS_LOG=path.join(runDir,'stats.log')}
 const args=[`--user-data-dir=${profile}`,'--remote-debugging-port=0','--no-first-run',
  '--no-default-browser-check','--autoplay-policy=no-user-gesture-required','--disable-background-networking',
  '--enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs','--ignore-gpu-blocklist',
@@ -148,10 +150,17 @@ try {
  const document={date:new Date().toISOString(),driverDir:path.resolve(driverDir),layout,mode,fps,fixture,video:path.resolve(videoFile),
    videoSha256,
    driverSha256:createHash('sha256').update(fs.readFileSync(path.join(driverDir,'nvidia_drv_video.so'))).digest('hex'),
+   measurementMode:diagnostic?'diagnostic':'uninstrumented',statsLog:diagnostic?env.NVD_STATS_LOG:null,
    runDir,args,summary:{count,medianMs:percentile(.5),p95Ms:percentile(.95),p99Ms:percentile(.99),
      incorrect:data.rows.filter(x=>!x.correct).length,
      splitIds:data.rows.filter(x=>x.ids.some(id=>id!==x.top)).length},mapped,...data,mediaEvents};
  fs.writeFileSync(output,JSON.stringify(document,null,2));
+ if(diagnostic) {
+  // Release the decoder before terminating Chrome so final context statistics
+  // are flushed even if its GPU process exits without vaTerminate.
+  await send('Runtime.evaluate',{expression:"document.querySelector('#v').removeAttribute('src');document.querySelector('#v').load()"});
+  await new Promise(resolve=>setTimeout(resolve,500));
+ }
  console.log(JSON.stringify({output,summary:document.summary,mapped,decoder:mediaEvents.filter(x=>x.method==='Media.playerPropertiesChanged')}));
  if(process.env.NVD_BENCH_REQUIRE_CORRECT==='1') {
   const properties=mediaEvents.flatMap(x=>x.params.properties??[]);

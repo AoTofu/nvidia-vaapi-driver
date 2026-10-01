@@ -49,6 +49,7 @@ typedef struct
     void            *ptr;
     size_t          capacity;
     int8_t          poolClass;
+    size_t          statsRequestedBytes;
 } NVBuffer;
 
 typedef struct _NVBufferPoolBlock {
@@ -277,6 +278,7 @@ typedef struct _NVDriver
     bool                    statsEnabled;
     uint64_t                statsLogInterval;
     atomic_uint_fast64_t    stats[NV_STAT_COUNT];
+    NVTimingHistogram       timings[NV_TIMING_COUNT];
     uint64_t                maxDetachedBackingImageBytes;
     uint32_t                maxDetachedBackingImages;
     uint64_t                detachedBackingImageSerial;
@@ -347,6 +349,8 @@ typedef struct _NVContext
     bool                inputValidationFailed;
     NVDPictureState     pictureState;
     VAStatus            pictureFailure;
+    NVTimingHistogram   timings[2][NV_TIMING_CONTEXT_COUNT];
+    uint64_t            statsHostBufferBytes;
 } NVContext;
 
 bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,

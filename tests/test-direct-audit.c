@@ -454,7 +454,86 @@ static void testSharedSurfaceSubmission(void) {
     cv = NULL;
 }
 
+
+static void testStatsAccounting(void) {
+    NVDriver drv = {.statsEnabled = true};
+    BackingImage owner = {.totalSize = 4096};
+    BackingImage borrower1 = {.totalSize = 4096, .borrowedBackingImage = &owner};
+    BackingImage borrower2 = {.totalSize = 4096, .borrowedBackingImage = &owner};
+    BackingImage external = {.totalSize = 8192, .isExternalBuffer = true};
+    nvStatsBackingImageCreated(&drv, &owner, true);
+    nvStatsBackingImageCreated(&drv, &borrower1, true);
+    nvStatsBackingImageCreated(&drv, &borrower2, true);
+    nvStatsBackingImageCreated(&drv, &external, true);
+    assert(atomic_load(&drv.stats[NV_STAT_UNIQUE_OWNED_BACKING_BYTES]) == 4096);
+    assert(atomic_load(&drv.stats[NV_STAT_BORROWED_VIEW_BYTES]) == 8192);
+    assert(atomic_load(&drv.stats[NV_STAT_EXTERNAL_IMPORT_BYTES]) == 8192);
+    nvStatsBackingImageCreated(&drv, &owner, true); // Idempotent.
+    nvStatsBackingImageSetActive(&drv, &owner, false);
+    assert(atomic_load(&drv.stats[NV_STAT_UNIQUE_OWNED_BACKING_BYTES]) == 4096);
+    nvStatsBackingImageDestroyed(&drv, &borrower1);
+    nvStatsBackingImageDestroyed(&drv, &borrower1);
+    assert(atomic_load(&drv.stats[NV_STAT_BORROWED_VIEW_BYTES]) == 4096);
+    nvStatsBackingImageDestroyed(&drv, &borrower2);
+    nvStatsBackingImageDestroyed(&drv, &external);
+    nvStatsBackingImageDestroyed(&drv, &owner);
+    assert(atomic_load(&drv.stats[NV_STAT_OWNED_GPU_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_BORROWED_VIEW_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_EXTERNAL_IMPORT_BYTES]) == 0);
+
+    drv.bufferPoolMaxBytes = 8192;
+    assert(pthread_mutex_init(&drv.bufferPoolMutex, NULL) == 0);
+    drv.bufferPoolMutexInitialized = true;
+    NVBuffer buffer = {0};
+    assert(allocateBufferMemory(&drv, &buffer, 17));
+    assert(atomic_load(&drv.stats[NV_STAT_BUFFER_LIVE_REQUESTED_BYTES]) == 17);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == buffer.capacity);
+    const size_t capacity = buffer.capacity;
+    releaseBufferMemory(&drv, &buffer);
+    assert(atomic_load(&drv.stats[NV_STAT_BUFFER_LIVE_REQUESTED_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_BUFFER_LIVE_CAPACITY_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == capacity);
+    destroyBufferPool(&drv);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == 0);
+    pthread_mutex_destroy(&drv.bufferPoolMutex);
+
+    NVContext ctx = {.drv = &drv};
+    assert(reserveBuffer(&ctx.bitstreamBuffer, 1024));
+    nvStatsContextHostBuffers(&ctx);
+    assert(atomic_load(&drv.stats[NV_STAT_CONTEXT_HOST_BUFFER_BYTES]) == ctx.bitstreamBuffer.allocated);
+    freeAppendableBuffer(&ctx.bitstreamBuffer);
+    nvStatsContextHostBuffers(&ctx);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == 0);
+}
+
+static void testTimingHistograms(void) {
+    NVDriver drv = {0};
+    assert(nvStatsTimestamp(&drv) == 0);
+    nvStatsObserve(&drv, NV_TIMING_MAP, 1001);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[1]) == 0);
+    drv.statsEnabled = true;
+    nvStatsObserve(&drv, NV_TIMING_MAP, 0);
+    nvStatsObserve(&drv, NV_TIMING_MAP, 1000);
+    nvStatsObserve(&drv, NV_TIMING_MAP, 1001);
+    nvStatsObserve(&drv, NV_TIMING_MAP, UINT64_MAX);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[0]) == 2);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[1]) == 1);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[NV_TIMING_BUCKETS - 1]) == 1);
+    NVContext ctx = {.drv = &drv};
+    const uint64_t start = nvStatsTimestamp(&drv);
+    assert(start > 0);
+    nvStatsRecordContext(&ctx, NV_TIMING_QUEUE_RESIDENCE, true, start);
+    uint64_t shared = 0, private = 0;
+    for (unsigned i = 0; i < NV_TIMING_BUCKETS; i++) {
+        shared += atomic_load(&ctx.timings[1][NV_TIMING_QUEUE_RESIDENCE].buckets[i]);
+        private += atomic_load(&ctx.timings[0][NV_TIMING_QUEUE_RESIDENCE].buckets[i]);
+    }
+    assert(shared == 1 && private == 0);
+}
+
 int main(void) {
+    testStatsAccounting();
+    testTimingHistograms();
     testUuid();
     testGpuIdentity();
     testLayout();

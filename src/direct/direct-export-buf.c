@@ -311,6 +311,8 @@ static bool clearBackingImagePlaneHost(NVDriver *drv, BackingImage *img,
         return false;
     }
 
+    nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_HOST_BYTES, widthInBytes * chunkRows);
+    nvStatsUpdateMemoryEstimates(drv);
     fillBackingImageClearRows(rows, widthInBytes, chunkRows, img->format, plane);
 
     bool failed = false;
@@ -335,6 +337,8 @@ static bool clearBackingImagePlaneHost(NVDriver *drv, BackingImage *img,
     }
 
     free(rows);
+    nvStatsSubtract(drv, NV_STAT_SECURITY_CLEAR_HOST_BYTES, widthInBytes * chunkRows);
+    nvStatsUpdateMemoryEstimates(drv);
     return !failed;
 }
 
@@ -360,6 +364,8 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
         }
         drv->securityClearBuffer = 0;
         drv->securityClearBufferSize = 0;
+        nvStatsSet(drv, NV_STAT_SECURITY_CLEAR_SCRATCH_BYTES, 0);
+        nvStatsUpdateMemoryEstimates(drv);
     }
     if (CHECK_CUDA_RESULT(drv->cu->cuMemAlloc(
             &drv->securityClearBuffer, requiredBytes))) {
@@ -367,6 +373,8 @@ static bool ensureSecurityClearResourcesLocked(NVDriver *drv,
         return false;
     }
     drv->securityClearBufferSize = requiredBytes;
+    nvStatsSet(drv, NV_STAT_SECURITY_CLEAR_SCRATCH_BYTES, requiredBytes);
+    nvStatsUpdateMemoryEstimates(drv);
     return true;
 }
 
@@ -454,6 +462,7 @@ static bool clearBackingImage(NVDriver *drv, BackingImage *img) {
             }
         }
     }
+    nvStatsRecord(drv, NV_TIMING_SECURITY_CLEAR, start);
     const uint64_t end = nvStatsTimestamp(drv);
     if (start != 0 && end >= start) {
         nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_NS, end - start);
@@ -1157,7 +1166,10 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         }
         // Drain even after copy/event submission fails: earlier work may
         // still read the mapped NVDEC frame or write the exported array.
-        if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(stream))) {
+        const uint64_t waitStart = nvStatsTimestamp(drv);
+        const CUresult waitResult = drv->cu->cuStreamSynchronize(stream);
+        nvStatsRecord(drv, NV_TIMING_COPY_WAIT, waitStart);
+        if (CHECK_CUDA_RESULT(waitResult)) {
             atomic_store(&drv->cudaWorkUnsafe, true);
             failed = true;
         }
