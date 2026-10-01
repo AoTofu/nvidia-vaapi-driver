@@ -138,6 +138,7 @@ static void testShutdownWakesFullQueue(void) {
     for (uintptr_t i = 1; i <= RESOLVE_QUEUE_CAPACITY; i++) {
         assert(resolveQueuePush(&queue, (void *) i));
     }
+    assert(queue.highWater == RESOLVE_QUEUE_CAPACITY);
     assert(atomic_load(&depth) == RESOLVE_QUEUE_CAPACITY);
     assert(atomic_load(&highWater) == RESOLVE_QUEUE_CAPACITY);
 
@@ -190,6 +191,14 @@ static void testCancelReturnsPendingItems(void) {
 }
 
 int main(void) {
+    ResolveQueue timedQueue;
+    assert(resolveQueueInit(&timedQueue));
+    uint64_t enqueuedNs = 0;
+    assert(resolveQueuePushTimed(&timedQueue, (void *)1, &enqueuedNs));
+    assert(enqueuedNs != 0);
+    void *timedItem = NULL;
+    assert(resolveQueuePop(&timedQueue, &timedItem) && timedItem == (void *)1);
+    resolveQueueDestroy(&timedQueue);
     testWrapAndBackpressure();
     testMultipleProducersConsumers();
     testShutdownWakesFullQueue();

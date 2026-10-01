@@ -48,6 +48,10 @@ void resolveQueueSetTelemetry(ResolveQueue *queue, ResolveQueueTelemetry telemet
 }
 
 bool resolveQueuePush(ResolveQueue *queue, void *item) {
+    return resolveQueuePushTimed(queue, item, NULL);
+}
+
+bool resolveQueuePushTimed(ResolveQueue *queue, void *item, uint64_t *enqueuedNs) {
     pthread_mutex_lock(&queue->mutex);
     uint64_t waitStart = 0;
     bool waited = false;
@@ -73,8 +77,12 @@ bool resolveQueuePush(ResolveQueue *queue, void *item) {
     }
 
     queue->items[queue->writeIdx] = item;
+    if (enqueuedNs != NULL) {
+        *enqueuedNs = monotonicNs();
+    }
     queue->writeIdx = (queue->writeIdx + 1) % RESOLVE_QUEUE_CAPACITY;
     queue->count++;
+    if (queue->count > queue->highWater) queue->highWater = queue->count;
     if (queue->telemetry.depth != NULL) {
         const uint_fast64_t depth = atomic_fetch_add_explicit(queue->telemetry.depth, 1, memory_order_relaxed) + 1;
         updateHighWater(queue, depth);

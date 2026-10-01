@@ -218,7 +218,7 @@ static void testCopyFailures(void) {
     copyFailure = 2;
     syncFailure = 0;
     atomic_store(&drv.cudaWorkUnsafe, false);
-    assert(!clearBackingImagePlaneGpu(&drv, &img, 0));
+    assert(!clearBackingImageGpu(&drv, &img));
     assert(copies == 2 && syncs == 1 && !atomic_load(&drv.cudaWorkUnsafe));
     copies = syncs = 0;
     syncFailure = 1;
@@ -321,7 +321,9 @@ typedef struct {
     sem_t returned;
 } SubmitTest;
 
+static unsigned decodeCalls;
 static CUresult CUDAAPI mockDecode(CUvideodecoder decoder, CUVIDPICPARAMS *picture) {
+    decodeCalls++;
     return CUDA_SUCCESS;
 }
 
@@ -437,6 +439,15 @@ static void testSharedSurfaceSubmission(void) {
             &failedDescriptor) == VA_STATUS_SUCCESS);
         assert(surface->exported);
         closeDescriptor(&failedDescriptor);
+        ctx->renderTarget = ctx->displayTarget = surface;
+        ctx->cudaCodec = cudaVideoCodec_AV1;
+        ctx->pPicParams.nNumSlices = 4;
+        ctx->av1TileOffsetsSeen = 3;
+        ctx->pictureState = NVD_PICTURE_BUILDING;
+        const unsigned decodedBefore = decodeCalls;
+        setSurfaceResolving(surface, true);
+        assert(nvEndPicture(&driver, ctx->id) == VA_STATUS_ERROR_INVALID_PARAMETER);
+        assert(decodeCalls == decodedBefore && !surface->resolving);
         free(ctx->bitstreamBuffer.buf);
         resolveQueueDestroy(&ctx->resolveQueue);
         pthread_mutex_destroy(&ctx->pictureMutex);
@@ -454,7 +465,253 @@ static void testSharedSurfaceSubmission(void) {
     cv = NULL;
 }
 
+
+
+static _Thread_local unsigned clearFillCalls, clearCopyCalls, clearSyncCalls;
+static _Thread_local unsigned clearFillFailure, clearCopyFailure;
+static _Thread_local bool clearSyncFailure;
+static _Thread_local NVFormat clearFormat;
+static _Thread_local size_t clearElementCount;
+static CUresult CUDAAPI mockClear16(CUdeviceptr ptr, unsigned short value, size_t count, CUstream stream) {
+    clearFillCalls++;
+    clearElementCount = count;
+    for (size_t i = 0; i < count; i++) ((uint16_t *)(uintptr_t)ptr)[i] = value;
+    return clearFillCalls == clearFillFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI mockClear8(CUdeviceptr ptr, unsigned char value, size_t count, CUstream stream) {
+    clearFillCalls++;
+    clearElementCount = count;
+    memset((void *)(uintptr_t)ptr, value, count);
+    return clearFillCalls == clearFillFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI mockClearCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
+    clearCopyCalls++;
+    unsigned plane = (uintptr_t)copy->dstArray - 1;
+    const uint8_t *bytes = copy->srcMemoryType == CU_MEMORYTYPE_HOST ? copy->srcHost : (void *)(uintptr_t)copy->srcDevice;
+    const unsigned unit = clearFormat == NV_FORMAT_ARGB ? 4 : formatsInfo[clearFormat].bppc;
+    assert(copy->WidthInBytes % unit == 0);
+    if (copy->srcMemoryType == CU_MEMORYTYPE_DEVICE) assert(clearElementCount * unit >= copy->WidthInBytes * copy->Height);
+    for (size_t y = 0; y < copy->Height; y++) {
+        const uint8_t *row = bytes + y * copy->srcPitch;
+        for (size_t x = 0; x < copy->WidthInBytes; x += unit) {
+            if (unit == 4) { const uint8_t expected[] = {0,0,0,255}; assert(memcmp(row+x,expected,4)==0); }
+            else if (unit == 2) { uint16_t value; memcpy(&value,row+x,2); assert(value == (plane ? 0x8000 : 0x1000)); }
+            else assert(row[x] == (plane ? 128 : 16));
+        }
+    }
+    return clearCopyCalls == clearCopyFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI mockClearHostCopy(const CUDA_MEMCPY2D *copy) {
+    if (clearFillCalls) assert(clearSyncCalls > 0);
+    return mockClearCopy(copy, NULL);
+}
+static CUresult CUDAAPI mockClearSync(CUstream stream) {
+    clearSyncCalls++;
+    return clearSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+typedef struct { NVDriver *drv; NVFormat format; } ClearThread;
+static void *parallelClear(void *opaque) {
+    ClearThread *thread = opaque;
+    clearFormat = thread->format;
+    BackingImage img = {.format=thread->format,.width=63,.height=65,
+                        .arrays={(CUarray)1,(CUarray)2,(CUarray)3}};
+    for (unsigned i = 0; i < 100; i++) {
+        clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+        assert(clearBackingImage(thread->drv,&img));
+        assert(clearSyncCalls == 1);
+    }
+    return NULL;
+}
+static void testSecurityClearPatterns(void) {
+    void *scratch;
+    assert(posix_memalign(&scratch, 16, 8 * 1024 * 1024) == 0);
+    CudaFunctions cuda = {.cuMemcpy2DAsync = mockClearCopy, .cuMemcpy2D = mockClearHostCopy,
+        .cuStreamSynchronize = mockClearSync, .cuMemsetD8Async = mockClear8};
+    NVDriver drv = {.cu = &cuda, .statsEnabled = true, .securityClearStream = (CUstream)1,
+        .securityClearBuffer = (uintptr_t)scratch, .securityClearBufferSize = 8 * 1024 * 1024,
+        .cuMemsetD16Async = mockClear16,
+        .securityClearFunctionsLoaded = true};
+    assert(pthread_mutex_init(&drv.securityClearMutex, NULL) == 0);
+    for (unsigned f = NV_FORMAT_NV12; f < NV_FORMAT_ARGB; f++) {
+        clearFormat = f;
+        if (formatsInfo[f].numPlanes == 0) continue;
+        BackingImage img = {.format = f, .width = 63, .height = 65,
+                            .arrays = {(CUarray)1,(CUarray)2,(CUarray)3}};
+        clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+        assert(clearBackingImage(&drv, &img));
+        assert(clearFillCalls == formatsInfo[f].numPlanes);
+        assert(clearSyncCalls == 1);
+        assert(atomic_load(&drv.stats[NV_STAT_SECURITY_CLEAR_HOST_FALLBACKS]) == 0);
+    }
+    clearFormat = NV_FORMAT_P010;
+    BackingImage img = {.format = NV_FORMAT_P010, .width = 63, .height = 65,
+                        .arrays = {(CUarray)1,(CUarray)2}};
+    drv.cuMemsetD16Async = NULL;
+    clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+    assert(clearBackingImage(&drv, &img));
+    assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 0);
+    drv.cuMemsetD16Async = mockClear16;
+    for (unsigned scenario = 0; scenario < 5; scenario++) {
+        clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
+        clearFillFailure = scenario == 0 ? 1 : scenario == 3 ? 2 : 0;
+        clearCopyFailure = scenario == 1 ? 1 : scenario == 4 ? 2 : 0;
+        clearSyncFailure = scenario == 2;
+        atomic_store(&drv.cudaWorkUnsafe, false);
+        assert(clearBackingImage(&drv, &img) == (scenario != 2));
+        assert(clearSyncCalls > 0);
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 2));
+    }
+    clearFillFailure = clearCopyFailure = 0;
+    clearSyncFailure = false;
+    // The backing allocation and scratch remain owned after an unknown completion.
+    atomic_store(&drv.cudaWorkUnsafe, true);
+    assert(!clearBackingImage(&drv, &img));
+    atomic_store(&drv.cudaWorkUnsafe, false);
+    pthread_t threads[3];
+    ClearThread cases[] = {{&drv,NV_FORMAT_NV12},{&drv,NV_FORMAT_P010},{&drv,NV_FORMAT_444P}};
+    for (unsigned i = 0; i < 3; i++) assert(pthread_create(&threads[i],NULL,parallelClear,&cases[i]) == 0);
+    for (unsigned i = 0; i < 3; i++) assert(pthread_join(threads[i],NULL) == 0);
+    pthread_mutex_destroy(&drv.securityClearMutex);
+    free(scratch); // mock-only allocation; no actual GPU work was submitted.
+}
+
+extern const NVCodec av1Codec;
+static void testAV1SubmissionOrder(void) {
+    const unsigned order[] = {3,0,2,1};
+    for (unsigned paramsFirst = 0; paramsFirst < 2; paramsFirst++) {
+        NVDriver drv = {0};
+        NVContext ctx = {.drv=&drv, .av1TileMinOffset=UINT32_MAX};
+        CUVIDPICPARAMS pic = {.nNumSlices=4};
+        pic.CodecSpecific.av1.num_tile_cols = pic.CodecSpecific.av1.num_tile_rows = 2;
+        uint8_t bytes[32] = {0};
+        NVBuffer data = {.ptr=bytes, .size=sizeof(bytes)};
+        VASliceParameterBufferAV1 tiles[4];
+        for (unsigned i = 0; i < 4; i++) tiles[i] = (VASliceParameterBufferAV1){
+            .tile_row=order[i]/2, .tile_column=order[i]%2,
+            .slice_data_offset=order[i]*4, .slice_data_size=4};
+        NVBuffer params = {.ptr=tiles, .elements=4};
+        if (paramsFirst) {
+            av1Codec.handlers[VASliceParameterBufferType](&ctx,&params,&pic);
+            av1Codec.handlers[VASliceDataBufferType](&ctx,&data,&pic);
+        } else {
+            av1Codec.handlers[VASliceDataBufferType](&ctx,&data,&pic);
+            // Split across RenderPicture-style calls and keep NVDEC tile order.
+            for (unsigned i = 0; i < 4; i++) {
+                params.ptr=&tiles[i]; params.elements=1;
+                av1Codec.handlers[VASliceParameterBufferType](&ctx,&params,&pic);
+                assert(ctx.av1TileOffsetsSeen == i+1);
+            }
+        }
+        assert(!ctx.inputValidationFailed && !ctx.sliceOffsets.failed);
+        uint32_t *offsets=ctx.sliceOffsets.buf;
+        for (unsigned i = 0; i < 4; i++) assert(offsets[i*2] == i*4 && offsets[i*2+1] == i*4+4);
+        params.ptr=&tiles[0]; params.elements=1;
+        av1Codec.handlers[VASliceParameterBufferType](&ctx,&params,&pic);
+        assert(ctx.inputValidationFailed); // Duplicate coordinate remains immediate.
+        freeAppendableBuffer(&ctx.sliceOffsets);
+        freeAppendableBuffer(&ctx.bitstreamBuffer);
+        nvdIntervalIndexDestroy(&ctx.av1TileIntervals);
+    }
+    // A distinct tile overlapping an already registered range still fails
+    // before the full tile set arrives, even in arbitrary submission order.
+    NVDriver drv = {0};
+    NVContext ctx = {.drv=&drv,.av1TileMinOffset=UINT32_MAX};
+    CUVIDPICPARAMS pic = {.nNumSlices=4};
+    pic.CodecSpecific.av1.num_tile_cols = pic.CodecSpecific.av1.num_tile_rows = 2;
+    uint8_t bytes[32] = {0}; NVBuffer data = {.ptr=bytes,.size=sizeof(bytes)};
+    av1Codec.handlers[VASliceDataBufferType](&ctx,&data,&pic);
+    VASliceParameterBufferAV1 tile = {.tile_row=1,.tile_column=1,.slice_data_offset=8,.slice_data_size=8};
+    NVBuffer param = {.ptr=&tile,.elements=1};
+    av1Codec.handlers[VASliceParameterBufferType](&ctx,&param,&pic);
+    tile.tile_row=0; tile.tile_column=0; tile.slice_data_offset=4;
+    av1Codec.handlers[VASliceParameterBufferType](&ctx,&param,&pic);
+    assert(ctx.inputValidationFailed && ctx.av1TileOffsetsSeen == 1);
+    freeAppendableBuffer(&ctx.sliceOffsets);
+    freeAppendableBuffer(&ctx.bitstreamBuffer);
+    nvdIntervalIndexDestroy(&ctx.av1TileIntervals);
+}
+
+static void testStatsAccounting(void) {
+    NVDriver drv = {.statsEnabled = true};
+    BackingImage owner = {.totalSize = 4096};
+    BackingImage borrower1 = {.totalSize = 4096, .borrowedBackingImage = &owner};
+    BackingImage borrower2 = {.totalSize = 4096, .borrowedBackingImage = &owner};
+    BackingImage external = {.totalSize = 8192, .isExternalBuffer = true};
+    nvStatsBackingImageCreated(&drv, &owner, true);
+    nvStatsBackingImageCreated(&drv, &borrower1, true);
+    nvStatsBackingImageCreated(&drv, &borrower2, true);
+    nvStatsBackingImageCreated(&drv, &external, true);
+    assert(atomic_load(&drv.stats[NV_STAT_UNIQUE_OWNED_BACKING_BYTES]) == 4096);
+    assert(atomic_load(&drv.stats[NV_STAT_BORROWED_VIEW_BYTES]) == 8192);
+    assert(atomic_load(&drv.stats[NV_STAT_EXTERNAL_IMPORT_BYTES]) == 8192);
+    nvStatsBackingImageCreated(&drv, &owner, true); // Idempotent.
+    nvStatsBackingImageSetActive(&drv, &owner, false);
+    assert(atomic_load(&drv.stats[NV_STAT_UNIQUE_OWNED_BACKING_BYTES]) == 4096);
+    nvStatsBackingImageDestroyed(&drv, &borrower1);
+    nvStatsBackingImageDestroyed(&drv, &borrower1);
+    assert(atomic_load(&drv.stats[NV_STAT_BORROWED_VIEW_BYTES]) == 4096);
+    nvStatsBackingImageDestroyed(&drv, &borrower2);
+    nvStatsBackingImageDestroyed(&drv, &external);
+    nvStatsBackingImageDestroyed(&drv, &owner);
+    assert(atomic_load(&drv.stats[NV_STAT_OWNED_GPU_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_BORROWED_VIEW_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_EXTERNAL_IMPORT_BYTES]) == 0);
+
+    drv.bufferPoolMaxBytes = 8192;
+    assert(pthread_mutex_init(&drv.bufferPoolMutex, NULL) == 0);
+    drv.bufferPoolMutexInitialized = true;
+    NVBuffer buffer = {0};
+    assert(allocateBufferMemory(&drv, &buffer, 17));
+    assert(atomic_load(&drv.stats[NV_STAT_BUFFER_LIVE_REQUESTED_BYTES]) == 17);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == buffer.capacity);
+    const size_t capacity = buffer.capacity;
+    releaseBufferMemory(&drv, &buffer);
+    assert(atomic_load(&drv.stats[NV_STAT_BUFFER_LIVE_REQUESTED_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_BUFFER_LIVE_CAPACITY_BYTES]) == 0);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == capacity);
+    destroyBufferPool(&drv);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == 0);
+    pthread_mutex_destroy(&drv.bufferPoolMutex);
+
+    NVContext ctx = {.drv = &drv};
+    assert(reserveBuffer(&ctx.bitstreamBuffer, 1024));
+    nvStatsContextHostBuffers(&ctx);
+    assert(atomic_load(&drv.stats[NV_STAT_CONTEXT_HOST_BUFFER_BYTES]) == ctx.bitstreamBuffer.allocated);
+    freeAppendableBuffer(&ctx.bitstreamBuffer);
+    nvStatsContextHostBuffers(&ctx);
+    assert(atomic_load(&drv.stats[NV_STAT_TRACKED_HOST_BYTES]) == 0);
+}
+
+static void testTimingHistograms(void) {
+    NVDriver drv = {0};
+    assert(nvStatsTimestamp(&drv) == 0);
+    nvStatsObserve(&drv, NV_TIMING_MAP, 1001);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[1]) == 0);
+    drv.statsEnabled = true;
+    nvStatsObserve(&drv, NV_TIMING_MAP, 0);
+    nvStatsObserve(&drv, NV_TIMING_MAP, 1000);
+    nvStatsObserve(&drv, NV_TIMING_MAP, 1001);
+    nvStatsObserve(&drv, NV_TIMING_MAP, UINT64_MAX);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[0]) == 2);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[1]) == 1);
+    assert(atomic_load(&drv.timings[NV_TIMING_MAP].buckets[NV_TIMING_BUCKETS - 1]) == 1);
+    NVContext ctx = {.drv = &drv};
+    const uint64_t start = nvStatsTimestamp(&drv);
+    assert(start > 0);
+    nvStatsRecordContext(&ctx, NV_TIMING_QUEUE_RESIDENCE, true, start);
+    uint64_t shared = 0, private = 0;
+    for (unsigned i = 0; i < NV_TIMING_BUCKETS; i++) {
+        shared += atomic_load(&ctx.timings[1][NV_TIMING_QUEUE_RESIDENCE].buckets[i]);
+        private += atomic_load(&ctx.timings[0][NV_TIMING_QUEUE_RESIDENCE].buckets[i]);
+    }
+    assert(shared == 1 && private == 0);
+}
+
 int main(void) {
+    testSecurityClearPatterns();
+    testAV1SubmissionOrder();
+    testStatsAccounting();
+    testTimingHistograms();
     testUuid();
     testGpuIdentity();
     testLayout();

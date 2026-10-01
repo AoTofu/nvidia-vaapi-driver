@@ -3,6 +3,30 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
+
+// Fixed logarithmic CPU-time histograms. Bucket 0 ends at 1 us; the last
+// bucket is unbounded. Percentiles are upper bounds, not exact samples.
+#define NV_TIMING_BUCKETS 32
+typedef enum {
+    NV_TIMING_DECODE_SUBMIT,
+    NV_TIMING_QUEUE_RESIDENCE,
+    NV_TIMING_MAP,
+    NV_TIMING_EXPORT,
+    NV_TIMING_UNMAP,
+    NV_TIMING_SHARED_END_WAIT,
+    NV_TIMING_CONTEXT_COUNT,
+    NV_TIMING_COPY_WAIT = NV_TIMING_CONTEXT_COUNT,
+    NV_TIMING_LIFETIME_READ_WAIT,
+    NV_TIMING_LIFETIME_WRITE_WAIT,
+    NV_TIMING_SECURITY_CLEAR,
+    NV_TIMING_AV1_VALIDATION,
+    NV_TIMING_COUNT
+} NVTimingStage;
+
+typedef struct {
+    atomic_uint_fast64_t buckets[NV_TIMING_BUCKETS];
+} NVTimingHistogram;
 
 typedef enum {
     NV_STAT_DECODER_CREATES,
@@ -62,6 +86,7 @@ typedef enum {
     NV_STAT_BUFFER_CAPACITY_BYTES,
     NV_STAT_BUFFER_INTERNAL_FRAGMENTATION_BYTES,
     NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+    NV_STAT_SECURITY_CLEAR_SYNCS,
     NV_STAT_SECURITY_CLEAR_BYTES,
     NV_STAT_SECURITY_CLEAR_NS,
     NV_STAT_SECURITY_CLEAR_GPU_BYTES,
@@ -71,11 +96,23 @@ typedef enum {
     NV_STAT_JPEG_COPY_BYTES,
     NV_STAT_HOST_BUFFER_TRIM_COUNT,
     NV_STAT_HOST_BUFFER_TRIM_BYTES,
+    NV_STAT_UNIQUE_OWNED_BACKING_BYTES,
+    NV_STAT_UNIQUE_OWNED_BACKING_BYTES_PEAK,
+    NV_STAT_BORROWED_VIEW_BYTES,
+    NV_STAT_EXTERNAL_IMPORT_BYTES,
+    NV_STAT_SECURITY_CLEAR_SCRATCH_BYTES,
+    NV_STAT_SECURITY_CLEAR_HOST_BYTES,
+    NV_STAT_BUFFER_LIVE_REQUESTED_BYTES,
+    NV_STAT_BUFFER_LIVE_CAPACITY_BYTES,
+    NV_STAT_CONTEXT_HOST_BUFFER_BYTES,
+    NV_STAT_OWNED_GPU_BYTES,
+    NV_STAT_OWNED_GPU_BYTES_PEAK,
     NV_STAT_COUNT
 } NVStatCounter;
 
 struct _NVDriver;
 struct _BackingImage;
+struct _NVContext;
 
 // Reads NVD_STATS (and its optional interval) and enables periodic + final
 // statistics logging on the driver.
@@ -87,6 +124,7 @@ void nvStatsIncrement(struct _NVDriver *drv, NVStatCounter counter);
 
 // Counter and gauge helpers. All are no-ops unless NVD_STATS is enabled.
 void nvStatsAdd(struct _NVDriver *drv, NVStatCounter counter, uint64_t value);
+void nvStatsSubtract(struct _NVDriver *drv, NVStatCounter counter, uint64_t value);
 void nvStatsSet(struct _NVDriver *drv, NVStatCounter counter, uint64_t value);
 void nvStatsSetMax(struct _NVDriver *drv, NVStatCounter counter, uint64_t value);
 
@@ -94,6 +132,12 @@ void nvStatsSetMax(struct _NVDriver *drv, NVStatCounter counter, uint64_t value)
 // zero. Callers can therefore leave timing instrumentation in hot paths without
 // paying for a clock read in normal operation.
 uint64_t nvStatsTimestamp(struct _NVDriver *drv);
+void nvStatsObserve(struct _NVDriver *drv, NVTimingStage stage, uint64_t ns);
+void nvStatsRecord(struct _NVDriver *drv, NVTimingStage stage, uint64_t start);
+void nvStatsRecordContext(struct _NVContext *ctx, NVTimingStage stage,
+                          bool shared, uint64_t start);
+void nvStatsContextLog(struct _NVContext *ctx);
+void nvStatsContextHostBuffers(struct _NVContext *ctx);
 
 // Incremental backing-image accounting avoids walking the image list at every
 // periodic statistics dump. These functions are idempotent for partial cleanup.

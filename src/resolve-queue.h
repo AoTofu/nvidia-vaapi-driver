@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -23,6 +24,7 @@ typedef struct {
     size_t readIdx;
     size_t writeIdx;
     size_t count;
+    size_t highWater;
     bool exiting;
     bool initialized;
     ResolveQueueTelemetry telemetry;
@@ -31,6 +33,9 @@ typedef struct {
 bool resolveQueueInit(ResolveQueue *queue);
 void resolveQueueSetTelemetry(ResolveQueue *queue, ResolveQueueTelemetry telemetry);
 bool resolveQueuePush(ResolveQueue *queue, void *item);
+// Publishes the insertion timestamp under the queue lock, after any full wait.
+// Passing NULL keeps clock reads out of the uninstrumented path.
+bool resolveQueuePushTimed(ResolveQueue *queue, void *item, uint64_t *enqueuedNs);
 bool resolveQueuePop(ResolveQueue *queue, void **item);
 void resolveQueueShutdown(ResolveQueue *queue);
 size_t resolveQueueCancel(ResolveQueue *queue, void **cancelled, size_t capacity);

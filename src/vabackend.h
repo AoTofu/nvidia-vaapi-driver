@@ -17,6 +17,7 @@
 #include "list.h"
 #include "resolve-queue.h"
 #include "appendable-buffer.h"
+#include "av1-interval-index.h"
 #include "direct/nv-driver.h"
 #include "common.h"
 #include "stats.h"
@@ -49,6 +50,7 @@ typedef struct
     void            *ptr;
     size_t          capacity;
     int8_t          poolClass;
+    size_t          statsRequestedBytes;
 } NVBuffer;
 
 typedef struct _NVBufferPoolBlock {
@@ -59,7 +61,7 @@ struct _NVContext;
 struct _BackingImage;
 
 #define NVD_MAX_DECODE_SURFACES 32U
-#define NVD_MAX_AV1_TILES 4096U
+#define NVD_MAX_AV1_TILES NVD_INTERVAL_INDEX_CAPACITY
 
 typedef struct
 {
@@ -122,6 +124,8 @@ typedef uint64_t NVCUsurfObject;
 typedef CUresult CUDAAPI NVCuSurfObjectCreate(NVCUsurfObject *surfaceObject,
                                               const CUDA_RESOURCE_DESC *resourceDesc);
 typedef CUresult CUDAAPI NVCuSurfObjectDestroy(NVCUsurfObject surfaceObject);
+typedef CUresult CUDAAPI NVCuMemsetD16Async(CUdeviceptr dst, unsigned short value,
+                                           size_t count, CUstream stream);
 
 typedef struct _BackingImage {
     NVSurface   *surface;
@@ -229,6 +233,8 @@ typedef struct _NVDriver
     CUstream                securityClearStream;
     CUdeviceptr             securityClearBuffer;
     size_t                  securityClearBufferSize;
+    NVCuMemsetD16Async       *cuMemsetD16Async;
+    bool                    securityClearFunctionsLoaded;
     NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
     uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
     uint64_t                bufferPoolBytes;
@@ -277,6 +283,7 @@ typedef struct _NVDriver
     bool                    statsEnabled;
     uint64_t                statsLogInterval;
     atomic_uint_fast64_t    stats[NV_STAT_COUNT];
+    NVTimingHistogram       timings[NV_TIMING_COUNT];
     uint64_t                maxDetachedBackingImageBytes;
     uint32_t                maxDetachedBackingImages;
     uint64_t                detachedBackingImageSerial;
@@ -315,6 +322,7 @@ typedef struct _NVContext
     AppendableBuffer    sliceParamsBuffer;
     bool                av1SequenceEnableRestoration;
     uint32_t            av1TileOffsetsSeen;
+    NVDIntervalIndex    av1TileIntervals;
     uint64_t            av1TileSeen[NVD_MAX_AV1_TILES / 64U];
     uint32_t            av1TileMinOffset;
     uint32_t            av1TileMaxEnd;
@@ -347,6 +355,8 @@ typedef struct _NVContext
     bool                inputValidationFailed;
     NVDPictureState     pictureState;
     VAStatus            pictureFailure;
+    NVTimingHistogram   timings[2][NV_TIMING_CONTEXT_COUNT];
+    uint64_t            statsHostBufferBytes;
 } NVContext;
 
 bool nvValidateSliceRange(NVContext *ctx, const NVBuffer *buffer,
