@@ -1237,7 +1237,13 @@ static void* resolveSurfaces(void *param) {
         return NULL;
     }
 
-    if (CHECK_CUDA_RESULT(cu->cuStreamCreate(&ctx->resolveStream, CU_STREAM_NON_BLOCKING))) {
+    // JPEG frame maps enqueue their output copy on the legacy default stream
+    // rather than output_stream, so a non-blocking resolve stream could read
+    // the previous frame from the mapped surface. A blocking stream orders the
+    // resolve copy after that work.
+    const unsigned int resolveStreamFlags = ctx->cudaCodec == cudaVideoCodec_JPEG
+        ? CU_STREAM_DEFAULT : CU_STREAM_NON_BLOCKING;
+    if (CHECK_CUDA_RESULT(cu->cuStreamCreate(&ctx->resolveStream, resolveStreamFlags))) {
         ctx->resolveStream = NULL;
         LOG("Unable to create context resolve stream; using the legacy default stream");
     }
