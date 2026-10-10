@@ -138,7 +138,7 @@ Environment variables used to control the behavior of this library.
 | `NVD_DECODE_SURFACES_MIN` | Lower bound for automatic or forced decode-surface selection. Default: `2`. |
 | `NVD_DECODE_SURFACES_MAX` | Upper bound for decode-surface selection. NVIDIA picture indices are limited to 32, so larger values are clamped. Default: `32`. |
 | `NVD_VIDEOPROC_SCRATCH_MAX_BYTES` | Upper bound, separately, for fallback VideoProc GPU and CPU scratch buffers. Direct CUDA-array conversion does not allocate these buffers. Set to `0` to disable scratch-backed fallbacks. Default: `268435456` (256 MiB). Idle fallback scratch is released after 120 consecutive CUDA-processed frames. |
-| `NVD_BUFFER_POOL_MAX_BYTES` | Upper bound for reusable VA buffer/image host allocations. Six size classes from 4 KiB through 4 MiB are retained; oversize allocations are freed immediately. Set to `0` to disable retention. Default: `67108864` (64 MiB). |
+| `NVD_BUFFER_POOL_MAX_BYTES` | Upper bound for reusable VA buffer/image host allocations. Eleven power-of-two size classes from 4 KiB through 4 MiB are retained; oversize allocations are freed immediately. Set to `0` to disable retention. Default: `67108864` (64 MiB). |
 | `NVD_HOST_BUFFER_TRIM_THRESHOLD_BYTES` | Capacity above which an underused per-context codec bitstream/slice buffer becomes eligible for shrinking. `0` disables trimming. Default: `8388608` (8 MiB). |
 | `NVD_HOST_BUFFER_TRIM_FRAMES` | Consecutive frames using at most 25% of an oversized codec buffer before it is shrunk to twice the current need (with conservative floor capacity). Default: `120`. |
 | `NVD_STATS` | Enables performance counters. `final` logs only at context/driver teardown; `1` logs every 120 decoded pictures; a larger integer selects that interval. A final snapshot is always emitted when the driver terminates. Leave unset for benchmark runs that do not need instrumentation. |
@@ -209,7 +209,7 @@ The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or
 
 Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=packed`. Normal installation creates current-user desktop overrides with the same settings; it does not change system desktop files or global browser policy. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
 
-Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
+Under the library's default `auto` layout, Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`; the installer's launcher and desktop overrides replace this with `packed` as described above. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
 ### Recovering a launcher after a Chrome update
 
