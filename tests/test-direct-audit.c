@@ -37,7 +37,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...) {
     return 0;
 }
 
-static int copies, syncs, events, copyFailure, eventFailure, syncFailure;
+static int copies, syncs, events, copyFailure, syncFailure;
 static CUresult CUDAAPI mockCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
     copies++;
     assert(syncs == 0);
@@ -48,9 +48,9 @@ static CUresult CUDAAPI mockSync(CUstream stream) {
     return syncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 }
 static CUresult CUDAAPI mockEvent(CUevent event, CUstream stream) {
+    // Decode resolves complete through a stream drain; no event is recorded.
     events++;
-    assert(copies == 2 && syncs == 0);
-    return eventFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+    return CUDA_SUCCESS;
 }
 static CUresult CUDAAPI mockMemset(CUdeviceptr ptr, unsigned char value, size_t size, CUstream stream) {
     return CUDA_SUCCESS;
@@ -200,15 +200,14 @@ static void testCopyFailures(void) {
     NVDriver drv = {.cu = &cuda};
     BackingImage img = {.format = NV_FORMAT_NV12, .width = 4096, .height = 4096};
     NVSurface surface = {.width = 128, .height = 128, .backingImage = &img};
-    for (unsigned scenario = 0; scenario < 5; scenario++) {
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
         copies = syncs = events = 0;
         copyFailure = scenario == 1 ? 1 : scenario == 2 ? 2 : 0;
-        eventFailure = scenario == 3;
-        syncFailure = scenario == 4;
+        syncFailure = scenario == 3;
         atomic_store(&drv.cudaWorkUnsafe, false);
-        assert(copyFrameToSurface(&drv, 1, &surface, 128, (CUstream)1, (CUevent)1) == (scenario == 0));
-        assert(syncs == 1);
-        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 4));
+        assert(copyFrameToSurface(&drv, 1, &surface, 128, (CUstream)1) == (scenario == 0));
+        assert(syncs == 1 && events == 0);
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 3));
     }
     pthread_mutex_init(&drv.securityClearMutex, NULL);
     drv.securityClearStream = (CUstream)1;
@@ -275,12 +274,11 @@ static void testWorkerFailures(void) {
         .cuvidUnmapVideoFrame = mockUnmap, .cuvidDestroyDecoder = mockDestroyDecoder};
     cu = &cuda;
     cv = &cuvid;
-    for (unsigned scenario = 0; scenario < 5; scenario++) {
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
         copies = syncs = events = unmaps = decoderDestroys = 0;
         copyFailure = scenario == 1 ? 2 : 0;
-        eventFailure = scenario == 2;
-        syncFailure = scenario == 3;
-        pushFailure = scenario == 4;
+        syncFailure = scenario == 2;
+        pushFailure = scenario == 3;
         NVDriver drv = {.cu = &cuda, .backend = &DIRECT_BACKEND};
         BackingImage img = {.format = NV_FORMAT_NV12};
         assert(initBackingImageSync(&img));
@@ -301,9 +299,10 @@ static void testWorkerFailures(void) {
         resolveSurfaces(&ctx);
         assert(!surface.resolving && !img.resolving);
         assert(surface.decodeFailed == (scenario != 0));
-        assert(unmaps == (scenario < 3 ? 1 : 0));
-        assert(decoderDestroys == (scenario < 3 ? 1 : 0));
-        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 3));
+        assert(unmaps == (scenario < 2 ? 1 : 0));
+        assert(decoderDestroys == (scenario < 2 ? 1 : 0));
+        assert(events == 0);
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 2));
         resolveQueueDestroy(&ctx.resolveQueue);
         pthread_cond_destroy(&surface.cond);
         pthread_mutex_destroy(&surface.mutex);

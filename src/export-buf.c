@@ -755,7 +755,7 @@ static BackingImage *egl_allocateBackingImage(NVDriver *drv, const NVSurface *su
 }
 
 static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
-                               uint32_t pitch, CUstream stream, CUevent completeEvent) {
+                               uint32_t pitch, CUstream stream) {
     int bpp = surface->format == cudaVideoSurfaceFormat_NV12 ? 1 : 2;
     CUDA_MEMCPY2D cpy = {
         .srcMemoryType = CU_MEMORYTYPE_DEVICE,
@@ -781,9 +781,6 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
     CHECK_CUDA_RESULT_RETURN(drv->cu->cuMemcpy2DAsync(&cpy2, stream), false);
     nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, (uint64_t) cpy2.WidthInBytes * cpy2.Height);
 
-    if (completeEvent != NULL) {
-        CHECK_CUDA_RESULT_RETURN(drv->cu->cuEventRecord(completeEvent, stream), false);
-    }
     CHECK_CUDA_RESULT_RETURN(drv->cu->cuStreamSynchronize(stream), false);
 
     return true;
@@ -852,14 +849,14 @@ static bool egl_realiseSurface(NVDriver *drv, NVSurface *surface) {
 }
 
 static bool egl_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
-                              uint32_t pitch, CUstream stream, CUevent completeEvent) {
+                              uint32_t pitch, CUstream stream) {
     if (!egl_realiseSurface(drv, surface)) {
         return false;
     }
 
     if (ptr != 0) {
         nvBackingImageStoreSurfaceColorMetadata(surface->backingImage, surface);
-        if (!copyFrameToSurface(drv, ptr, surface, pitch, stream, completeEvent)) {
+        if (!copyFrameToSurface(drv, ptr, surface, pitch, stream)) {
             LOG("Unable to update surface from frame");
             return false;
         }

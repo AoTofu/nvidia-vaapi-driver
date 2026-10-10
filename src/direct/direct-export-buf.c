@@ -1144,7 +1144,7 @@ static bool direct_pruneToMemoryBudget(NVDriver *drv, uint64_t extraGpuBytes) {
 }
 
 static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
-                               uint32_t pitch, CUstream stream, CUevent completeEvent) {
+                               uint32_t pitch, CUstream stream) {
     BackingImage *img = surface->backingImage;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
     uint32_t y = 0;
@@ -1220,10 +1220,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
         failed = true;
     }
     if (!hostDestination) {
-        if (!failed && completeEvent != NULL) {
-            failed = CHECK_CUDA_RESULT(drv->cu->cuEventRecord(completeEvent, stream));
-        }
-        // Drain even after copy/event submission fails: earlier work may
+        // Drain even after copy submission fails: earlier work may
         // still read the mapped NVDEC frame or write the exported array.
         const uint64_t waitStart = nvStatsTimestamp(drv);
         const CUresult waitResult = drv->cu->cuStreamSynchronize(stream);
@@ -1300,7 +1297,7 @@ static BackingImage *resolveSyncImage(BackingImage *img) {
 }
 
 static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
-                                 uint32_t pitch, CUstream stream, CUevent completeEvent) {
+                                 uint32_t pitch, CUstream stream) {
     if (atomic_load(&drv->cudaWorkUnsafe)) return false;
     if (!direct_realiseSurface(drv, surface)) {
         return false;
@@ -1320,7 +1317,7 @@ static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surf
             nvStatsIncrement(drv, NV_STAT_HOST_FALLBACK_FRAMES);
         }
         nvBackingImageStoreSurfaceColorMetadata(img, surface);
-        bool copied = copyFrameToSurface(drv, ptr, surface, pitch, stream, completeEvent);
+        bool copied = copyFrameToSurface(drv, ptr, surface, pitch, stream);
         // The resolve worker clears an asynchronous image only after NVDEC
         // unmap. Publishing the backing image here permits an exporter to race
         // that final ownership transition even though the CUDA copy completed.

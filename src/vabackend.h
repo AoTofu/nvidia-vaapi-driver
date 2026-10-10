@@ -192,7 +192,7 @@ typedef struct {
     bool (*initExporter)(struct _NVDriver *drv);
     void (*releaseExporter)(struct _NVDriver *drv);
     bool (*exportCudaPtr)(struct _NVDriver *drv, CUdeviceptr ptr, NVSurface *surface,
-                          uint32_t pitch, CUstream stream, CUevent completeEvent);
+                          uint32_t pitch, CUstream stream);
     void (*detachBackingImageFromSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*realiseSurface)(struct _NVDriver *drv, NVSurface *surface);
     bool (*fillExportDescriptor)(struct _NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc);
@@ -341,7 +341,6 @@ typedef struct _NVContext
     pthread_t           resolveThread;
     bool                resolveThreadStarted;
     CUstream            resolveStream;
-    CUevent             resolveCompleteEvent;
     ResolveQueue        resolveQueue;
     pthread_mutex_t     surfaceCreationMutex;
     bool                surfaceCreationMutexInitialized;

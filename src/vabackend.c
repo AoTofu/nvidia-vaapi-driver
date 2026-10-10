@@ -1237,17 +1237,8 @@ static void* resolveSurfaces(void *param) {
         return NULL;
     }
 
-    if (CHECK_CUDA_RESULT(cu->cuStreamCreate(&ctx->resolveStream, CU_STREAM_NON_BLOCKING)) ||
-        CHECK_CUDA_RESULT(cu->cuEventCreate(&ctx->resolveCompleteEvent,
-                                            CU_EVENT_DISABLE_TIMING))) {
-        if (ctx->resolveCompleteEvent != NULL) {
-            CHECK_CUDA_RESULT(cu->cuEventDestroy(ctx->resolveCompleteEvent));
-            ctx->resolveCompleteEvent = NULL;
-        }
-        if (ctx->resolveStream != NULL) {
-            CHECK_CUDA_RESULT(cu->cuStreamDestroy(ctx->resolveStream));
-            ctx->resolveStream = NULL;
-        }
+    if (CHECK_CUDA_RESULT(cu->cuStreamCreate(&ctx->resolveStream, CU_STREAM_NON_BLOCKING))) {
+        ctx->resolveStream = NULL;
         LOG("Unable to create context resolve stream; using the legacy default stream");
     }
 
@@ -1283,8 +1274,7 @@ static void* resolveSurfaces(void *param) {
             nvStatsIncrement(drv, NV_STAT_RESOLVE_FRAMES);
             const uint64_t exportStart = nvStatsTimestamp(drv);
             if (!drv->backend->exportCudaPtr(drv, deviceMemory, surface, pitch,
-                                             ctx->resolveStream,
-                                             ctx->resolveCompleteEvent)) {
+                                             ctx->resolveStream)) {
                 failed = true;
             }
             nvStatsRecordContext(ctx, NV_TIMING_EXPORT, job->shared, exportStart);
@@ -1329,10 +1319,6 @@ static void* resolveSurfaces(void *param) {
         if (result != CUDA_SUCCESS) {
             LOG("cuvidDestroyDecoder failed: %d", result);
         }
-    }
-    if (ctx->resolveCompleteEvent != NULL) {
-        CHECK_CUDA_RESULT(cu->cuEventDestroy(ctx->resolveCompleteEvent));
-        ctx->resolveCompleteEvent = NULL;
     }
     if (ctx->resolveStream != NULL) {
         CHECK_CUDA_RESULT(cu->cuStreamDestroy(ctx->resolveStream));
