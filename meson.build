@@ -161,6 +161,15 @@ jpeg_reconstruct_test = executable('test-jpeg-reconstruct',
 )
 test('JPEG reconstruction', jpeg_reconstruct_test, timeout: 30)
 
+if gst_codecs_deps.found()
+    vp9_state_test = executable('test-vp9-state',
+        ['tests/test-vp9-state.c', 'src/appendable-buffer.c', 'src/codec-utils.c'],
+        include_directories: [include_directories('src'), nvidia_incdir],
+        dependencies: deps, c_args: ['-UNDEBUG'],
+    )
+    test('VP9 header state', vp9_state_test, timeout: 30)
+endif
+
 codec_utils_test = executable(
     'test-codec-utils',
     ['tests/test-codec-utils.c', 'src/codec-utils.c'],
