@@ -1237,17 +1237,14 @@ static void* resolveSurfaces(void *param) {
         return NULL;
     }
 
-    if (CHECK_CUDA_RESULT(cu->cuStreamCreate(&ctx->resolveStream, CU_STREAM_NON_BLOCKING)) ||
-        CHECK_CUDA_RESULT(cu->cuEventCreate(&ctx->resolveCompleteEvent,
-                                            CU_EVENT_DISABLE_TIMING))) {
-        if (ctx->resolveCompleteEvent != NULL) {
-            CHECK_CUDA_RESULT(cu->cuEventDestroy(ctx->resolveCompleteEvent));
-            ctx->resolveCompleteEvent = NULL;
-        }
-        if (ctx->resolveStream != NULL) {
-            CHECK_CUDA_RESULT(cu->cuStreamDestroy(ctx->resolveStream));
-            ctx->resolveStream = NULL;
-        }
+    // JPEG frame maps enqueue their output copy on the legacy default stream
+    // rather than output_stream, so a non-blocking resolve stream could read
+    // the previous frame from the mapped surface. A blocking stream orders the
+    // resolve copy after that work.
+    const unsigned int resolveStreamFlags = ctx->cudaCodec == cudaVideoCodec_JPEG
+        ? CU_STREAM_DEFAULT : CU_STREAM_NON_BLOCKING;
+    if (CHECK_CUDA_RESULT(cu->cuStreamCreate(&ctx->resolveStream, resolveStreamFlags))) {
+        ctx->resolveStream = NULL;
         LOG("Unable to create context resolve stream; using the legacy default stream");
     }
 
@@ -1283,8 +1280,7 @@ static void* resolveSurfaces(void *param) {
             nvStatsIncrement(drv, NV_STAT_RESOLVE_FRAMES);
             const uint64_t exportStart = nvStatsTimestamp(drv);
             if (!drv->backend->exportCudaPtr(drv, deviceMemory, surface, pitch,
-                                             ctx->resolveStream,
-                                             ctx->resolveCompleteEvent)) {
+                                             ctx->resolveStream)) {
                 failed = true;
             }
             nvStatsRecordContext(ctx, NV_TIMING_EXPORT, job->shared, exportStart);
@@ -1329,10 +1325,6 @@ static void* resolveSurfaces(void *param) {
         if (result != CUDA_SUCCESS) {
             LOG("cuvidDestroyDecoder failed: %d", result);
         }
-    }
-    if (ctx->resolveCompleteEvent != NULL) {
-        CHECK_CUDA_RESULT(cu->cuEventDestroy(ctx->resolveCompleteEvent));
-        ctx->resolveCompleteEvent = NULL;
     }
     if (ctx->resolveStream != NULL) {
         CHECK_CUDA_RESULT(cu->cuStreamDestroy(ctx->resolveStream));
@@ -2677,6 +2669,25 @@ static uint32_t defaultDecodeSurfaceCount(cudaVideoCodec codec) {
     }
 }
 
+// Codecs whose automatic count was qualified against the legacy 32 surfaces
+// on an RTX 5080: FFmpeg output bit-identical to the software decoder (or to
+// 32 surfaces for MPEG-2) with 16-reference, B-pyramid and alt-ref streams,
+// and identical Chrome frames while seeking for H.264, HEVC and VP9. They use
+// it when NVD_DECODE_SURFACES is unset; the others keep 32 until qualified.
+static bool automaticDecodeSurfacesByDefault(cudaVideoCodec codec) {
+    switch (codec) {
+    case cudaVideoCodec_H264:
+    case cudaVideoCodec_HEVC:
+    case cudaVideoCodec_VP9:
+    case cudaVideoCodec_VP8:
+    case cudaVideoCodec_MPEG2:
+    case cudaVideoCodec_JPEG:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint32_t selectContextDecodeSurfaceCount(NVContext *nvCtx) {
     NVDriver *drv = nvCtx->drv;
     const uint32_t automatic = nvdSelectDecodeSurfaceCount(
@@ -2684,7 +2695,9 @@ static uint32_t selectContextDecodeSurfaceCount(NVContext *nvCtx) {
         nvCtx->clientRenderTargetCount, 0, drv->decodeSurfacesMinimum,
         drv->decodeSurfacesMaximum);
     nvStatsSet(drv, NV_STAT_DECODE_SURFACES_AUTO_CANDIDATE, automatic);
-    if (drv->decodeSurfacesAuto) {
+    if (drv->decodeSurfacesAuto ||
+        (drv->decodeSurfacesOverride == 0 &&
+         automaticDecodeSurfacesByDefault(nvCtx->cudaCodec))) {
         return automatic;
     }
     const uint32_t overrideCount = drv->decodeSurfacesOverride != 0
@@ -3570,8 +3583,11 @@ static bool ensureVideoProcStream(NVDriver *drv) {
         CHECK_CUDA_RESULT(drv->cu->cuStreamCreate(&drv->videoProcStream, CU_STREAM_NON_BLOCKING))) {
         return false;
     }
+    // Without CU_EVENT_BLOCKING_SYNC, cuEventSynchronize spins the calling
+    // VA-API thread for the whole conversion regardless of the context flags.
     if (drv->videoProcEvent == NULL &&
-        CHECK_CUDA_RESULT(drv->cu->cuEventCreate(&drv->videoProcEvent, CU_EVENT_DISABLE_TIMING))) {
+        CHECK_CUDA_RESULT(drv->cu->cuEventCreate(&drv->videoProcEvent,
+                                                 CU_EVENT_DISABLE_TIMING | CU_EVENT_BLOCKING_SYNC))) {
         CHECK_CUDA_RESULT(drv->cu->cuStreamDestroy(drv->videoProcStream));
         drv->videoProcStream = NULL;
         return false;
@@ -3582,6 +3598,21 @@ static bool ensureVideoProcStream(NVDriver *drv) {
 static bool finishVideoProcStream(NVDriver *drv) {
     return !CHECK_CUDA_RESULT(drv->cu->cuEventRecord(drv->videoProcEvent, drv->videoProcStream)) &&
            !CHECK_CUDA_RESULT(drv->cu->cuEventSynchronize(drv->videoProcEvent));
+}
+
+// Called after a VideoProc submission or its completion wait failed. Earlier
+// commands may still read the source or write the destination and scratch, so
+// they must finish before any fallback or reuse. If the drain fails too, GPU
+// completion is unknown: quarantine CUDA work instead of falling back.
+static bool drainVideoProcStream(NVDriver *drv) {
+    if (drv->videoProcStream == NULL) {
+        return true;
+    }
+    if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->videoProcStream))) {
+        atomic_store(&drv->cudaWorkUnsafe, true);
+        return false;
+    }
+    return true;
 }
 
 static bool loadSurfaceObjectFunctions(NVDriver *drv) {
@@ -3936,10 +3967,16 @@ static bool convertNV12ArrayToARGBCudaLocked(NVDriver *drv,
     nvStatsIncrement(drv, NV_STAT_VIDEOPROC_DIRECT_ARRAY_FRAMES);
 
 done:
-    if (submitted == false && drv->videoProcStream != NULL) {
-        CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->videoProcStream));
+    if (!submitted) {
+        drainVideoProcStream(drv);
     }
     return submitted;
+}
+
+// An interleaved 4:2:0 chroma row holds ceil(width / 2) UV pairs, which is one
+// sample more than the luma row for an odd-width region.
+static size_t videoProcUVRowBytes(uint32_t width, size_t bpp) {
+    return ((size_t) width + 1) / 2 * 2 * bpp;
 }
 
 static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingImage *dstImg, uint32_t width, uint32_t height, bool is16Bit, const ColorMatrix *matrix, VideoProcSampleInfo sampleInfo) {
@@ -3950,7 +3987,8 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
     const size_t bpp = is16Bit ? 2 : 1;
     const size_t ySize = (size_t) width * height * bpp;
     const size_t uvHeight = (height + 1) / 2;
-    const size_t uvSize = (size_t) width * uvHeight * bpp;
+    const size_t uvRowBytes = videoProcUVRowBytes(width, bpp);
+    const size_t uvSize = uvRowBytes * uvHeight;
     const size_t argbSize = (size_t) width * height * 4;
     const bool externalDeviceDestination = nvBackingImageHasExternalDeviceMemory(dstImg);
     CUdeviceptr dstDevice = externalDeviceDestination ? nvBackingImageDevicePlane(dstImg, 0) : drv->videoProcArgbBuffer;
@@ -3967,6 +4005,10 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
         noteVideoProcCudaSuccessLocked(drv, true);
         pthread_mutex_unlock(&drv->exportMutex);
         return true;
+    }
+    if (atomic_load(&drv->cudaWorkUnsafe)) {
+        pthread_mutex_unlock(&drv->exportMutex);
+        return false;
     }
     if (!loadVideoProcKernel(drv, is16Bit) ||
         !ensureVideoProcStream(drv) ||
@@ -3996,8 +4038,8 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
         .srcArray = srcImg->arrays[1],
         .dstMemoryType = CU_MEMORYTYPE_DEVICE,
         .dstDevice = drv->videoProcUVBuffer,
-        .dstPitch = width * bpp,
-        .WidthInBytes = width * bpp,
+        .dstPitch = uvRowBytes,
+        .WidthInBytes = uvRowBytes,
         .Height = uvHeight
     };
     // Queue the fallback copies and kernel on the dedicated non-blocking stream.
@@ -4013,7 +4055,7 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
     nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, uvSize);
 
     uint32_t yPitch = width * bpp;
-    uint32_t uvPitch = width * bpp;
+    uint32_t uvPitch = (uint32_t) uvRowBytes;
     uint32_t order = rgbOrderForFourcc((uint32_t) dstImg->fourcc);
     uint32_t vToR = (uint32_t) matrix->vToR;
     uint32_t uToG = (uint32_t) matrix->uToG;
@@ -4098,9 +4140,7 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
     return true;
 
 fail:
-    if (drv->videoProcStream != NULL) {
-        CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(drv->videoProcStream));
-    }
+    drainVideoProcStream(drv);
     pthread_mutex_unlock(&drv->exportMutex);
     return false;
 }
@@ -4123,6 +4163,10 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
             return true;
         }
         nvStatsIncrement(drv, NV_STAT_VIDEOPROC_CUDA_FAILURES);
+        if (atomic_load(&drv->cudaWorkUnsafe)) {
+            // The GPU may still use the images; a CPU fallback would race it.
+            return false;
+        }
         static bool loggedCudaFallback[2] = { false, false };
         const int logIndex = is16Bit ? 1 : 0;
         if (!loggedCudaFallback[logIndex]) {
@@ -4134,7 +4178,9 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
 
     const size_t bpp = is16Bit ? 2 : 1;
     const size_t ySize = (size_t) width * height * bpp;
-    const size_t uvSize = (size_t) width * ((height + 1) / 2) * bpp;
+    const size_t uvRowBytes = videoProcUVRowBytes(width, bpp);
+    const size_t uvRowSamples = uvRowBytes / bpp;
+    const size_t uvSize = uvRowBytes * ((height + 1) / 2);
     const size_t argbSize = (size_t) width * height * 4;
     const bool externalHostSource = nvBackingImageHasExternalHostMemory(srcImg);
     bool sourceAccessStarted = false;
@@ -4178,7 +4224,7 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
             memcpy(yPlane + (size_t) y * width * bpp, srcY + (size_t) y * srcImg->strides[0], width * bpp);
         }
         for (uint32_t y = 0; y < (height + 1) / 2; y++) {
-            memcpy(uvPlane + (size_t) y * width * bpp, srcUV + (size_t) y * srcImg->strides[1], width * bpp);
+            memcpy(uvPlane + (size_t) y * uvRowBytes, srcUV + (size_t) y * srcImg->strides[1], uvRowBytes);
         }
         nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, ySize + uvSize);
     } else {
@@ -4193,8 +4239,8 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
         CUDA_MEMCPY2D uvCpy = {
             .dstMemoryType = CU_MEMORYTYPE_HOST,
             .dstHost = uvPlane,
-            .dstPitch = width * bpp,
-            .WidthInBytes = width * bpp,
+            .dstPitch = uvRowBytes,
+            .WidthInBytes = uvRowBytes,
             .Height = (height + 1) / 2
         };
         if (externalDeviceSource) {
@@ -4228,12 +4274,12 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
                 const uint16_t *yPlane16 = (const uint16_t*) yPlane;
                 const uint16_t *uvPlane16 = (const uint16_t*) uvPlane;
                 yy = yPlane16[(size_t) y * width + x] >> sampleInfo.sampleShift;
-                const size_t uvIndex = (size_t) (y / 2) * width + (x & ~1u);
+                const size_t uvIndex = (size_t) (y / 2) * uvRowSamples + (x & ~1u);
                 u = uvPlane16[uvIndex] >> sampleInfo.sampleShift;
                 v = uvPlane16[uvIndex + 1] >> sampleInfo.sampleShift;
             } else {
                 yy = yPlane[(size_t) y * width + x];
-                const size_t uvIndex = (size_t) (y / 2) * width + (x & ~1u);
+                const size_t uvIndex = (size_t) (y / 2) * uvRowSamples + (x & ~1u);
                 u = uvPlane[uvIndex];
                 v = uvPlane[uvIndex + 1];
             }
@@ -4270,7 +4316,8 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
         .WidthInBytes = width * 4,
         .Height = height
     };
-    bool failed = CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&argbCpy));
+    bool failed = CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&argbCpy)) ||
+                  !nvFinishPageableUpload(drv);
     if (!failed) {
         nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, argbSize);
     }
@@ -4465,6 +4512,14 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
 
     bool copyFailed = (externalHostSource && !sourceAccessStarted) ||
                       (externalHostDestination && !destinationAccessStarted);
+    // Device-to-device copies are asynchronous to the host even through
+    // cuMemcpy2D. Queue them on the VideoProc stream and publish only after an
+    // explicit completion; host copies stay synchronous.
+    const bool hostCopy = externalHostSource || externalHostDestination;
+    if (!hostCopy) {
+        pthread_mutex_lock(&drv->exportMutex);
+        copyFailed = !ensureVideoProcStream(drv);
+    }
 
     for (uint32_t i = 0; !copyFailed && i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
@@ -4499,15 +4554,26 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
             cpy.dstArray = dstImg->arrays[i];
         }
 
-        const bool hostCopy = externalHostSource || externalHostDestination;
-        copyFailed = hostCopy || i == fmtInfo->numPlanes - 1
+        copyFailed = hostCopy
             ? CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy))
-            : CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
+            : CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, drv->videoProcStream));
         if (!copyFailed) {
             nvStatsAdd(drv,
                 hostCopy ? NV_STAT_HOST_COPY_BYTES : NV_STAT_DEVICE_COPY_BYTES,
                 (uint64_t) cpy.WidthInBytes * cpy.Height);
         }
+    }
+    if (!hostCopy) {
+        if (!copyFailed && !finishVideoProcStream(drv)) {
+            copyFailed = true;
+        }
+        if (copyFailed) {
+            drainVideoProcStream(drv);
+        }
+        pthread_mutex_unlock(&drv->exportMutex);
+    } else if (!copyFailed && externalHostSource && !externalHostDestination &&
+               !nvFinishPageableUpload(drv)) {
+        copyFailed = true;
     }
 
     if (destinationAccessStarted &&

@@ -473,6 +473,17 @@ static bool reconstructJPEG(const JPEGContext *jpegCtx,
         totalEcsSize += slice->slice_data_size;
     }
 
+    // Every reconstructed frame carries at least the JFIF header and all
+    // slice data (slices may repeat one range). Reject frames that cannot fit
+    // the 32-bit CUVID bitstream length before reserving or copying anything.
+    const uint64_t minFrameSize = sizeof(jfifHeader) + totalEcsSize;
+    if (totalEcsSize > UINT32_MAX || output->size > UINT32_MAX ||
+        minFrameSize > UINT32_MAX - output->size) {
+        LOG("JPEG: Reconstructed bitstream exceeds CUVID limit (%llu ECS bytes)",
+            (unsigned long long) totalEcsSize);
+        return false;
+    }
+
     const VASliceParameterBufferJPEGBaseline *slice0 = &slices[0];
 
     bool allSameSOSHeader = true;

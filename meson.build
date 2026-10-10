@@ -106,9 +106,11 @@ driver = shared_library(
     gnu_symbol_visibility: 'hidden',
 )
 
+# Optional microbenchmark: it recompiles the whole driver, so build it only
+# when requested (meson compile -C <dir> bench-av1-tiles).
 bench_av1_tiles = executable('bench-av1-tiles', ['tests/bench-av1-tiles.c'] + sources,
     dependencies: deps, include_directories: nvidia_incdir,
-    c_args: ['-DNVD_BENCH_INDEX=1'])
+    c_args: ['-DNVD_BENCH_INDEX=1'], build_by_default: false)
 
 resolve_queue_test = executable(
     'test-resolve-queue',
@@ -151,6 +153,22 @@ object_table_test = executable(
     include_directories: include_directories('src'),
 )
 test('object table', object_table_test, timeout: 30)
+
+jpeg_reconstruct_test = executable('test-jpeg-reconstruct',
+    ['tests/test-jpeg-reconstruct.c', 'src/appendable-buffer.c', 'src/codec-utils.c'],
+    include_directories: [include_directories('src'), nvidia_incdir],
+    dependencies: deps, c_args: ['-UNDEBUG'],
+)
+test('JPEG reconstruction', jpeg_reconstruct_test, timeout: 30)
+
+if gst_codecs_deps.found()
+    vp9_state_test = executable('test-vp9-state',
+        ['tests/test-vp9-state.c', 'src/appendable-buffer.c', 'src/codec-utils.c'],
+        include_directories: [include_directories('src'), nvidia_incdir],
+        dependencies: deps, c_args: ['-UNDEBUG'],
+    )
+    test('VP9 header state', vp9_state_test, timeout: 30)
+endif
 
 codec_utils_test = executable(
     'test-codec-utils',
@@ -198,6 +216,13 @@ if libva_drm_deps.found()
          env: ['NVD_RUN_GPU_TESTS=' + (get_option('gpu_tests') ? '1' : '0'),
                'LIBVA_DRIVER_NAME=nvidia', 'NVD_BACKEND=direct', 'NVD_EXPORT_LAYOUT=packed',
                'NVD_MAX_DETACHED_BACKING_IMAGES=0',
+               'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
+    videoproc_pixels_test = executable('test-videoproc-pixels', 'tests/test-videoproc-pixels.c',
+                                       dependencies: libva_drm_deps)
+    test('GPU VideoProc pixels', videoproc_pixels_test, suite: 'gpu', timeout: 180,
+         depends: driver,
+         env: ['NVD_RUN_GPU_TESTS=' + (get_option('gpu_tests') ? '1' : '0'),
+               'LIBVA_DRIVER_NAME=nvidia', 'NVD_BACKEND=direct',
                'LIBVA_DRIVERS_PATH=' + meson.project_build_root()])
 elif get_option('gpu_tests')
     error('GPU tests require libva-drm')

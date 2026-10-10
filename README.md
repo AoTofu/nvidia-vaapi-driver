@@ -134,11 +134,11 @@ Environment variables used to control the behavior of this library.
 | `NVD_MAX_DETACHED_BACKING_IMAGE_BYTES` | Upper bound (in bytes) on the size of the detached backing-image cache used by the direct backend to recycle decode surfaces across stream switches. Lower this on low-VRAM GPUs to reduce memory usage at the cost of more re-allocation when streams change. Set to `0` to disable detached caching. Default: scales with the GPU — total VRAM / 64 (~1.6%), clamped to 64 MiB–512 MiB; falls back to `134217728` (128 MiB) if the VRAM size cannot be queried. |
 | `NVD_MAX_DETACHED_BACKING_IMAGES` | Upper bound on the number of cached detached backing images. Set to `0` to disable detached caching. Default: `16`. |
 | `NVD_MEMORY_BUDGET_BYTES` | Optional shared GPU-memory budget for detached backing images and VideoProc GPU scratch. The driver prunes reclaimable cache entries before optional scratch growth; essential active decode surfaces are never evicted. `0` disables the shared budget. Default: `0`. |
-| `NVD_DECODE_SURFACES` | Decode-surface selection mode. `auto` derives the count from codec reference requirements and client render targets; a positive integer forces a count, subject to the min/max bounds below. Unset keeps the compatibility value of 32 while statistics report the automatic candidate for validation. |
+| `NVD_DECODE_SURFACES` | Decode-surface selection mode. `auto` derives the count from codec reference requirements and client render targets; a positive integer forces a count, subject to the min/max bounds below. Unset uses `auto` for H.264, HEVC, VP9, VP8, MPEG-2 and JPEG, whose automatic counts (20, 20, 10, 8, 8 and 2 unless the client or stream needs more) were qualified against 32 on an RTX 5080, and keeps the compatibility value of 32 for AV1 and the remaining codecs; statistics report the automatic candidate either way. Set `32` to restore the previous fixed count for every codec. |
 | `NVD_DECODE_SURFACES_MIN` | Lower bound for automatic or forced decode-surface selection. Default: `2`. |
 | `NVD_DECODE_SURFACES_MAX` | Upper bound for decode-surface selection. NVIDIA picture indices are limited to 32, so larger values are clamped. Default: `32`. |
 | `NVD_VIDEOPROC_SCRATCH_MAX_BYTES` | Upper bound, separately, for fallback VideoProc GPU and CPU scratch buffers. Direct CUDA-array conversion does not allocate these buffers. Set to `0` to disable scratch-backed fallbacks. Default: `268435456` (256 MiB). Idle fallback scratch is released after 120 consecutive CUDA-processed frames. |
-| `NVD_BUFFER_POOL_MAX_BYTES` | Upper bound for reusable VA buffer/image host allocations. Six size classes from 4 KiB through 4 MiB are retained; oversize allocations are freed immediately. Set to `0` to disable retention. Default: `67108864` (64 MiB). |
+| `NVD_BUFFER_POOL_MAX_BYTES` | Upper bound for reusable VA buffer/image host allocations. Eleven power-of-two size classes from 4 KiB through 4 MiB are retained; oversize allocations are freed immediately. Set to `0` to disable retention. Default: `67108864` (64 MiB). |
 | `NVD_HOST_BUFFER_TRIM_THRESHOLD_BYTES` | Capacity above which an underused per-context codec bitstream/slice buffer becomes eligible for shrinking. `0` disables trimming. Default: `8388608` (8 MiB). |
 | `NVD_HOST_BUFFER_TRIM_FRAMES` | Consecutive frames using at most 25% of an oversized codec buffer before it is shrunk to twice the current need (with conservative floor capacity). Default: `120`. |
 | `NVD_STATS` | Enables performance counters. `final` logs only at context/driver teardown; `1` logs every 120 decoded pictures; a larger integer selects that interval. A final snapshot is always emitted when the driver terminates. Leave unset for benchmark runs that do not need instrumentation. |
@@ -209,7 +209,7 @@ The installer can detect `google-chrome-stable`, `google-chrome`, `chromium`, or
 
 Use `--chrome-bin /path/to/chrome` (or the `CHROME_BIN` environment variable) for a custom or unpacked browser. Arguments after `--`, including URLs and `--user-data-dir`, are passed to Chrome without re-parsing. The generated environment explicitly sets `LIBVA_DRIVER_NAME=nvidia`, the installed `LIBVA_DRIVERS_PATH`, `NVD_BACKEND=direct`, and `NVD_EXPORT_LAYOUT=packed`. Normal installation creates current-user desktop overrides with the same settings; it does not change system desktop files or global browser policy. Fully close existing Chrome processes before using the command, or provide a separate `--user-data-dir`; an already-running browser may reuse its old environment.
 
-Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
+Under the library's default `auto` layout, Chrome and Chromium receive one dma-buf object per plane with a shared DRM modifier, as required by Chromium's `vaapi_wrapper`; the installer's launcher and desktop overrides replace this with `packed` as described above. Other VA clients continue to receive separate plane objects with their natural per-plane modifiers; this avoids changing the block-height behavior needed by per-plane importers.
 
 ### Recovering a launcher after a Chrome update
 
@@ -318,7 +318,8 @@ small host allocation (256 bytes for small tile sets, approximately 73 KiB at
 4096 tiles with the current growth policy); this is counted in context buffers.
 The 4096-node cap is an internal validation bound, not a claim about playable
 4096-tile videos. Benchmark validation in isolation with
-`build-perf/bench-av1-tiles TILE_COUNT FRAME_COUNT`. GPU clear benchmarks use
+`build-perf/bench-av1-tiles TILE_COUNT FRAME_COUNT`; it is not part of the
+default build, so first run `meson compile -C build-perf bench-av1-tiles`. GPU clear benchmarks use
 `build-perf/test-security-clear --bench p010 60 3840 2160 [THREADS]` with
 `NVD_RUN_GPU_TESTS=1`, the selected `LIBVA_DRIVERS_PATH`, and an explicit layout.
 Their JSON reports fresh-allocation/export time and checks every visible pixel;

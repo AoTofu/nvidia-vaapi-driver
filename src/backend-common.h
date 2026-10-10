@@ -18,5 +18,6 @@ bool nvSyncBackingImageHostAccess(struct _BackingImage *img, uint64_t flags);
 void nvReleaseBackingImageBorrow(struct _BackingImage *img);
 void nvDestroyImportedBackingImage(struct _NVDriver *drv, struct _BackingImage *img);
 void nvDestroyBackingImageVideoProcObjects(struct _NVDriver *drv, struct _BackingImage *img);
+bool nvFinishPageableUpload(struct _NVDriver *drv);
 
 #endif // BACKENDCOMMON_H

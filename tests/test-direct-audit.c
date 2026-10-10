@@ -37,7 +37,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...) {
     return 0;
 }
 
-static int copies, syncs, events, copyFailure, eventFailure, syncFailure;
+static int copies, syncs, events, copyFailure, syncFailure;
 static CUresult CUDAAPI mockCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
     copies++;
     assert(syncs == 0);
@@ -48,9 +48,9 @@ static CUresult CUDAAPI mockSync(CUstream stream) {
     return syncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
 }
 static CUresult CUDAAPI mockEvent(CUevent event, CUstream stream) {
+    // Decode resolves complete through a stream drain; no event is recorded.
     events++;
-    assert(copies == 2 && syncs == 0);
-    return eventFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+    return CUDA_SUCCESS;
 }
 static CUresult CUDAAPI mockMemset(CUdeviceptr ptr, unsigned char value, size_t size, CUstream stream) {
     return CUDA_SUCCESS;
@@ -200,15 +200,14 @@ static void testCopyFailures(void) {
     NVDriver drv = {.cu = &cuda};
     BackingImage img = {.format = NV_FORMAT_NV12, .width = 4096, .height = 4096};
     NVSurface surface = {.width = 128, .height = 128, .backingImage = &img};
-    for (unsigned scenario = 0; scenario < 5; scenario++) {
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
         copies = syncs = events = 0;
         copyFailure = scenario == 1 ? 1 : scenario == 2 ? 2 : 0;
-        eventFailure = scenario == 3;
-        syncFailure = scenario == 4;
+        syncFailure = scenario == 3;
         atomic_store(&drv.cudaWorkUnsafe, false);
-        assert(copyFrameToSurface(&drv, 1, &surface, 128, (CUstream)1, (CUevent)1) == (scenario == 0));
-        assert(syncs == 1);
-        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 4));
+        assert(copyFrameToSurface(&drv, 1, &surface, 128, (CUstream)1) == (scenario == 0));
+        assert(syncs == 1 && events == 0);
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 3));
     }
     pthread_mutex_init(&drv.securityClearMutex, NULL);
     drv.securityClearStream = (CUstream)1;
@@ -275,12 +274,11 @@ static void testWorkerFailures(void) {
         .cuvidUnmapVideoFrame = mockUnmap, .cuvidDestroyDecoder = mockDestroyDecoder};
     cu = &cuda;
     cv = &cuvid;
-    for (unsigned scenario = 0; scenario < 5; scenario++) {
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
         copies = syncs = events = unmaps = decoderDestroys = 0;
         copyFailure = scenario == 1 ? 2 : 0;
-        eventFailure = scenario == 2;
-        syncFailure = scenario == 3;
-        pushFailure = scenario == 4;
+        syncFailure = scenario == 2;
+        pushFailure = scenario == 3;
         NVDriver drv = {.cu = &cuda, .backend = &DIRECT_BACKEND};
         BackingImage img = {.format = NV_FORMAT_NV12};
         assert(initBackingImageSync(&img));
@@ -301,9 +299,10 @@ static void testWorkerFailures(void) {
         resolveSurfaces(&ctx);
         assert(!surface.resolving && !img.resolving);
         assert(surface.decodeFailed == (scenario != 0));
-        assert(unmaps == (scenario < 3 ? 1 : 0));
-        assert(decoderDestroys == (scenario < 3 ? 1 : 0));
-        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 3));
+        assert(unmaps == (scenario < 2 ? 1 : 0));
+        assert(decoderDestroys == (scenario < 2 ? 1 : 0));
+        assert(events == 0);
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 2));
         resolveQueueDestroy(&ctx.resolveQueue);
         pthread_cond_destroy(&surface.cond);
         pthread_mutex_destroy(&surface.mutex);
@@ -312,6 +311,284 @@ static void testWorkerFailures(void) {
     }
     cu = NULL;
     cv = NULL;
+}
+
+// VideoProc mocks. A fake CUarray is host memory with a pitch so the CPU
+// fallback's synchronous copies can be checked pixel by pixel.
+typedef struct {
+    uint8_t *data;
+    size_t pitch;
+} FakeArray;
+static int vppAsyncCopies, vppSyncCopies, vppLaunches, vppStreamSyncs, vppEventSyncs;
+static int vppLaunchFailure, vppEventSyncFailure, vppStreamSyncFailure, vppAsyncCopyFailure;
+static CUstream vppLastAsyncStream;
+static CUDA_MEMCPY2D vppAsync[4];
+static uint32_t vppUvPitch;
+static CUdeviceptr vppNextAlloc = 0x1000;
+static CUresult CUDAAPI vppMockAsyncCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
+    if (vppAsyncCopies < 4) vppAsync[vppAsyncCopies] = *copy;
+    vppAsyncCopies++;
+    vppLastAsyncStream = stream;
+    return vppAsyncCopies == vppAsyncCopyFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockSyncCopy(const CUDA_MEMCPY2D *copy) {
+    vppSyncCopies++;
+    const uint8_t *src = copy->srcMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->srcArray)->data : copy->srcHost;
+    const size_t srcPitch = copy->srcMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->srcArray)->pitch : copy->srcPitch;
+    uint8_t *dst = copy->dstMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->dstArray)->data : copy->dstHost;
+    const size_t dstPitch = copy->dstMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->dstArray)->pitch : copy->dstPitch;
+    assert(copy->WidthInBytes <= srcPitch && copy->WidthInBytes <= dstPitch);
+    for (size_t y = 0; y < copy->Height; y++) {
+        memcpy(dst + (copy->dstY + y) * dstPitch, src + (copy->srcY + y) * srcPitch,
+               copy->WidthInBytes);
+    }
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockLaunch(CUfunction f, unsigned gx, unsigned gy, unsigned gz,
+                                      unsigned bx, unsigned by, unsigned bz, unsigned shared,
+                                      CUstream stream, void **params, void **extra) {
+    vppLaunches++;
+    if (f == (CUfunction) 2) vppUvPitch = *(uint32_t *) params[6]; // staged kernel uv pitch
+    return vppLaunchFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockEventRecord(CUevent event, CUstream stream) { return CUDA_SUCCESS; }
+static CUresult CUDAAPI vppMockEventSync(CUevent event) {
+    vppEventSyncs++;
+    return vppEventSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockStreamSync(CUstream stream) {
+    vppStreamSyncs++;
+    return vppStreamSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockAlloc(CUdeviceptr *ptr, size_t size) {
+    *ptr = vppNextAlloc;
+    vppNextAlloc += 0x1000;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockFree(CUdeviceptr ptr) { return CUDA_SUCCESS; }
+
+static CudaFunctions vppCuda = {
+    .cuMemcpy2DAsync = vppMockAsyncCopy, .cuMemcpy2D = vppMockSyncCopy,
+    .cuLaunchKernel = vppMockLaunch, .cuEventRecord = vppMockEventRecord,
+    .cuEventSynchronize = vppMockEventSync, .cuStreamSynchronize = vppMockStreamSync,
+    .cuMemAlloc = vppMockAlloc, .cuMemFree = vppMockFree,
+    .cuCtxPushCurrent = mockPush, .cuCtxPopCurrent = mockPop,
+};
+static NVBackend vppBackend;
+
+static void resetVppMocks(void) {
+    vppAsyncCopies = vppSyncCopies = vppLaunches = vppStreamSyncs = vppEventSyncs = 0;
+    vppLaunchFailure = vppEventSyncFailure = vppStreamSyncFailure = vppAsyncCopyFailure = 0;
+    vppLastAsyncStream = NULL;
+    vppUvPitch = 0;
+    memset(vppAsync, 0, sizeof(vppAsync));
+}
+
+static void initVppDriver(NVDriver *drv) {
+    memset(drv, 0, sizeof(*drv));
+    drv->cu = &vppCuda;
+    drv->backend = &vppBackend;
+    drv->videoProcStream = (CUstream) 7;
+    drv->videoProcEvent = (CUevent) 8;
+    drv->arrayToArgbKernel = (CUfunction) 1;
+    drv->nv12ToArgbKernel = (CUfunction) 2;
+    drv->p010ToArgbKernel = (CUfunction) 2;
+    drv->videoProcScratchMaxBytes = 64 * 1024 * 1024;
+    pthread_mutex_init(&drv->exportMutex, NULL);
+    pthread_mutex_init(&drv->objectCreationMutex, NULL);
+}
+
+static void freeVppDriver(NVDriver *drv) {
+    free(drv->cpuVideoProcYBuffer);
+    free(drv->cpuVideoProcUVBuffer);
+    free(drv->cpuVideoProcArgbBuffer);
+    pthread_mutex_destroy(&drv->exportMutex);
+    pthread_mutex_destroy(&drv->objectCreationMutex);
+}
+
+static uint8_t vppReferencePixel(int yy, int u, int v, const ColorMatrix *m,
+                                 VideoProcSampleInfo info, int channel) {
+    const int c = yy > info.yOffset ? yy - info.yOffset : 0;
+    const int d = u - info.uvOffset;
+    const int e = v - info.uvOffset;
+    const int value = channel == 0 ? info.yScale * c + m->vToR * e
+                    : channel == 1 ? info.yScale * c - m->uToG * d - m->vToG * e
+                    : info.yScale * c + m->uToB * d;
+    return clampU8((value + info.rounding) >> info.valueShift);
+}
+
+// COR-02: an odd-width region needs ceil(width / 2) UV pairs per chroma row in
+// both the staged CUDA path and the CPU fallback.
+static void testVideoProcOddRegion(void) {
+    enum { SW = 64, SH = 66, W = 63, H = 65 };
+    for (int is16 = 0; is16 < 2; is16++) {
+        const size_t bpp = is16 ? 2 : 1;
+        const NVFormat format = is16 ? NV_FORMAT_P010 : NV_FORMAT_NV12;
+        const VideoProcSampleInfo info = videoProcSampleInfoForFormat(format, false);
+        const ColorMatrix *matrix = colorMatrixForStandard(VAProcColorStandardBT709, W, false);
+        // Pad each row with poison so a mis-sized chroma row reads it.
+        const size_t pitch = SW * bpp + 64;
+        uint8_t *yData = malloc(pitch * SH);
+        uint8_t *uvData = malloc(pitch * (SH / 2));
+        uint8_t *argbData = calloc(SW * 4, SH);
+        assert(yData != NULL && uvData != NULL && argbData != NULL);
+        memset(yData, 0xff, pitch * SH);
+        memset(uvData, 0xff, pitch * (SH / 2));
+        for (int y = 0; y < SH; y++) {
+            for (int x = 0; x < SW; x++) {
+                const unsigned value = 16 + ((x * 3 + y * 5) % 200);
+                if (is16) ((uint16_t *) (yData + y * pitch))[x] = (uint16_t) (value << 8);
+                else yData[y * pitch + x] = (uint8_t) value;
+            }
+        }
+        for (int y = 0; y < SH / 2; y++) {
+            for (int x = 0; x < SW; x++) {
+                // U and V differ per pair and per row, so any misindexing shows.
+                const unsigned value = (x & 1) ? 40 + x * 3 + y : 220 - x * 2 - y;
+                if (is16) ((uint16_t *) (uvData + y * pitch))[x] = (uint16_t) (value << 8);
+                else uvData[y * pitch + x] = (uint8_t) value;
+            }
+        }
+        FakeArray yArray = { yData, pitch }, uvArray = { uvData, pitch }, argbArray = { argbData, SW * 4 };
+        BackingImage src = { .format = format, .width = SW, .height = SH };
+        src.arrays[0] = (CUarray) &yArray;
+        src.arrays[1] = (CUarray) &uvArray;
+        BackingImage dst = { .format = NV_FORMAT_ARGB, .width = SW, .height = SH,
+                             .fourcc = VA_FOURCC_BGRA };
+        dst.arrays[0] = (CUarray) &argbArray;
+
+        NVDriver drv;
+        initVppDriver(&drv);
+        drv.arrayToArgbKernel = NULL;
+        drv.videoProcArrayKernelFailed = true;
+
+        // Staged CUDA path geometry.
+        resetVppMocks();
+        assert(convertNV12ToARGB(&drv, &src, &dst, W, H, matrix, info));
+        assert(vppAsyncCopies == 3 && vppLaunches == 1);
+        assert(vppAsync[1].WidthInBytes == (W + 1) / 2 * 2 * bpp);
+        assert(vppAsync[1].dstPitch == vppAsync[1].WidthInBytes);
+        assert(vppAsync[1].Height == (H + 1) / 2);
+        assert(vppUvPitch == vppAsync[1].WidthInBytes);
+        assert(drv.videoProcUVBufferSize >= vppAsync[1].WidthInBytes * vppAsync[1].Height);
+
+        // CPU fallback pixels after a safely drained staged failure.
+        resetVppMocks();
+        vppLaunchFailure = 1;
+        assert(convertNV12ToARGB(&drv, &src, &dst, W, H, matrix, info));
+        assert(!atomic_load(&drv.cudaWorkUnsafe));
+        assert(vppSyncCopies == 3 && vppStreamSyncs >= 2); // drain + upload completion
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int yy, u, v;
+                if (is16) {
+                    yy = ((uint16_t *) (yData + y * pitch))[x] >> info.sampleShift;
+                    u = ((uint16_t *) (uvData + (y / 2) * pitch))[x & ~1] >> info.sampleShift;
+                    v = ((uint16_t *) (uvData + (y / 2) * pitch))[(x & ~1) + 1] >> info.sampleShift;
+                } else {
+                    yy = yData[y * pitch + x];
+                    u = uvData[(y / 2) * pitch + (x & ~1)];
+                    v = uvData[(y / 2) * pitch + (x & ~1) + 1];
+                }
+                const uint8_t *px = argbData + y * SW * 4 + x * 4;
+                assert(px[2] == vppReferencePixel(yy, u, v, matrix, info, 0));
+                assert(px[1] == vppReferencePixel(yy, u, v, matrix, info, 1));
+                assert(px[0] == vppReferencePixel(yy, u, v, matrix, info, 2));
+                assert(px[3] == 255);
+            }
+        }
+        freeVppDriver(&drv);
+        free(yData);
+        free(uvData);
+        free(argbData);
+    }
+}
+
+// COR-01: a VideoProc failure whose GPU completion cannot be established must
+// quarantine CUDA work and must not fall back to staged or CPU conversion.
+static void testVideoProcCompletionFailures(void) {
+    static uint8_t pixels[64 * 256];
+    FakeArray fake = { pixels, 256 };
+    BackingImage src = { .format = NV_FORMAT_NV12, .width = 64, .height = 64 };
+    src.arrays[0] = src.arrays[1] = (CUarray) &fake;
+    src.cachedVideoProcTextures[0] = 1;
+    src.cachedVideoProcTextures[1] = 2;
+    BackingImage dst = { .format = NV_FORMAT_ARGB, .width = 64, .height = 64,
+                         .fourcc = VA_FOURCC_BGRA };
+    dst.arrays[0] = (CUarray) &fake;
+    dst.cachedVideoProcSurfaces[0] = 3;
+    const VideoProcSampleInfo info = videoProcSampleInfoForFormat(NV_FORMAT_NV12, false);
+    const ColorMatrix *matrix = colorMatrixForStandard(VAProcColorStandardBT709, 64, false);
+    NVDriver drv;
+    for (unsigned scenario = 0; scenario < 2; scenario++) {
+        initVppDriver(&drv);
+        resetVppMocks();
+        vppEventSyncFailure = 1;
+        vppStreamSyncFailure = scenario == 0;
+        vppLaunchFailure = scenario == 1; // keep the staged retry from succeeding
+        const bool converted = convertNV12ToARGB(&drv, &src, &dst, 64, 64, matrix, info);
+        if (scenario == 0) {
+            // Event wait and drain failed: no fallback of any kind.
+            assert(!converted && atomic_load(&drv.cudaWorkUnsafe));
+            assert(vppLaunches == 1 && vppAsyncCopies == 0 && vppSyncCopies == 0);
+        } else {
+            // The drained stream is idle, so the CPU fallback is allowed.
+            assert(converted && !atomic_load(&drv.cudaWorkUnsafe));
+            assert(vppSyncCopies == 3);
+        }
+        freeVppDriver(&drv);
+    }
+}
+
+static bool vppMockRealise(NVDriver *drv, NVSurface *surface) { return true; }
+
+// COR-01: same-format device blits are queued on the VideoProc stream and are
+// published only after an explicit completion; failures drain the stream.
+static void testVideoProcSameFormatBlit(void) {
+    vppBackend.realiseSurface = vppMockRealise;
+    cu = &vppCuda;
+    pushFailure = 0;
+    FakeArray fake = { NULL, 0 };
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
+        NVDriver drv;
+        initVppDriver(&drv);
+        resetVppMocks();
+        vppAsyncCopyFailure = scenario == 1 ? 2 : 0;
+        vppEventSyncFailure = scenario >= 2;
+        vppStreamSyncFailure = scenario == 3;
+        BackingImage srcImg = { .format = NV_FORMAT_NV12, .width = 64, .height = 64 };
+        BackingImage dstImg = srcImg;
+        srcImg.arrays[0] = srcImg.arrays[1] = (CUarray) &fake;
+        dstImg.arrays[0] = dstImg.arrays[1] = (CUarray) &fake;
+        assert(initBackingImageSync(&dstImg));
+        NVSurface src = { .width = 64, .height = 64, .backingImage = &srcImg };
+        NVSurface dst = { .width = 64, .height = 64, .backingImage = &dstImg,
+                          .resolving = 1, .contextId = VA_INVALID_ID };
+        pthread_mutex_init(&src.mutex, NULL);
+        pthread_cond_init(&src.cond, NULL);
+        pthread_mutex_init(&dst.mutex, NULL);
+        pthread_cond_init(&dst.cond, NULL);
+        VAProcPipelineParameterBuffer pipeline = {0};
+        const bool copied = copySurfaceBackingImage(&drv, &src, &dst, &pipeline);
+        assert(copied == (scenario == 0));
+        assert(vppSyncCopies == 0 && vppLastAsyncStream == drv.videoProcStream);
+        assert(vppEventSyncs == (scenario == 1 ? 0 : 1));
+        assert(vppStreamSyncs == (scenario == 0 ? 0 : 1));
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 3));
+        assert(!dst.resolving && !dstImg.resolving);
+        pthread_cond_destroy(&src.cond);
+        pthread_mutex_destroy(&src.mutex);
+        pthread_cond_destroy(&dst.cond);
+        pthread_mutex_destroy(&dst.mutex);
+        pthread_cond_destroy(&dstImg.cond);
+        pthread_mutex_destroy(&dstImg.mutex);
+        freeVppDriver(&drv);
+    }
+    cu = NULL;
 }
 
 typedef struct {
@@ -549,7 +826,8 @@ static void testSecurityClearPatterns(void) {
     drv.cuMemsetD16Async = NULL;
     clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
     assert(clearBackingImage(&drv, &img));
-    assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 0);
+    // Pageable host uploads are completed before the image can be published.
+    assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 2);
     drv.cuMemsetD16Async = mockClear16;
     for (unsigned scenario = 0; scenario < 5; scenario++) {
         clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
@@ -718,6 +996,9 @@ int main(void) {
     testDescriptor();
     testCopyFailures();
     testWorkerFailures();
+    testVideoProcOddRegion();
+    testVideoProcCompletionFailures();
+    testVideoProcSameFormatBlit();
     testSharedSurfaceSubmission();
 #if NVD_TEST_VP9
     testVp9();
