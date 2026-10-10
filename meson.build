@@ -152,6 +152,13 @@ object_table_test = executable(
 )
 test('object table', object_table_test, timeout: 30)
 
+jpeg_reconstruct_test = executable('test-jpeg-reconstruct',
+    ['tests/test-jpeg-reconstruct.c', 'src/appendable-buffer.c', 'src/codec-utils.c'],
+    include_directories: [include_directories('src'), nvidia_incdir],
+    dependencies: deps, c_args: ['-UNDEBUG'],
+)
+test('JPEG reconstruction', jpeg_reconstruct_test, timeout: 30)
+
 codec_utils_test = executable(
     'test-codec-utils',
     ['tests/test-codec-utils.c', 'src/codec-utils.c'],
