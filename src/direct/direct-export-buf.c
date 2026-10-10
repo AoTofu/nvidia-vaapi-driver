@@ -336,6 +336,10 @@ static bool clearBackingImagePlaneHost(NVDriver *drv, BackingImage *img,
         }
         nvStatsAdd(drv, NV_STAT_SECURITY_CLEAR_BYTES, widthInBytes * rowsToCopy);
     }
+    // The cleared image may be exported as soon as this returns.
+    if (!failed && !nvFinishPageableUpload(drv)) {
+        failed = true;
+    }
 
     free(rows);
     nvStatsSubtract(drv, NV_STAT_SECURITY_CLEAR_HOST_BYTES, widthInBytes * chunkRows);

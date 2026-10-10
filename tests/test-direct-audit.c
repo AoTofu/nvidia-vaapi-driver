@@ -481,7 +481,7 @@ static void testVideoProcOddRegion(void) {
         vppLaunchFailure = 1;
         assert(convertNV12ToARGB(&drv, &src, &dst, W, H, matrix, info));
         assert(!atomic_load(&drv.cudaWorkUnsafe));
-        assert(vppSyncCopies == 3 && vppStreamSyncs >= 1); // staged failure drain
+        assert(vppSyncCopies == 3 && vppStreamSyncs >= 2); // drain + upload completion
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
                 int yy, u, v;
@@ -506,6 +506,89 @@ static void testVideoProcOddRegion(void) {
         free(uvData);
         free(argbData);
     }
+}
+
+// COR-01: a VideoProc failure whose GPU completion cannot be established must
+// quarantine CUDA work and must not fall back to staged or CPU conversion.
+static void testVideoProcCompletionFailures(void) {
+    static uint8_t pixels[64 * 256];
+    FakeArray fake = { pixels, 256 };
+    BackingImage src = { .format = NV_FORMAT_NV12, .width = 64, .height = 64 };
+    src.arrays[0] = src.arrays[1] = (CUarray) &fake;
+    src.cachedVideoProcTextures[0] = 1;
+    src.cachedVideoProcTextures[1] = 2;
+    BackingImage dst = { .format = NV_FORMAT_ARGB, .width = 64, .height = 64,
+                         .fourcc = VA_FOURCC_BGRA };
+    dst.arrays[0] = (CUarray) &fake;
+    dst.cachedVideoProcSurfaces[0] = 3;
+    const VideoProcSampleInfo info = videoProcSampleInfoForFormat(NV_FORMAT_NV12, false);
+    const ColorMatrix *matrix = colorMatrixForStandard(VAProcColorStandardBT709, 64, false);
+    NVDriver drv;
+    for (unsigned scenario = 0; scenario < 2; scenario++) {
+        initVppDriver(&drv);
+        resetVppMocks();
+        vppEventSyncFailure = 1;
+        vppStreamSyncFailure = scenario == 0;
+        vppLaunchFailure = scenario == 1; // keep the staged retry from succeeding
+        const bool converted = convertNV12ToARGB(&drv, &src, &dst, 64, 64, matrix, info);
+        if (scenario == 0) {
+            // Event wait and drain failed: no fallback of any kind.
+            assert(!converted && atomic_load(&drv.cudaWorkUnsafe));
+            assert(vppLaunches == 1 && vppAsyncCopies == 0 && vppSyncCopies == 0);
+        } else {
+            // The drained stream is idle, so the CPU fallback is allowed.
+            assert(converted && !atomic_load(&drv.cudaWorkUnsafe));
+            assert(vppSyncCopies == 3);
+        }
+        freeVppDriver(&drv);
+    }
+}
+
+static bool vppMockRealise(NVDriver *drv, NVSurface *surface) { return true; }
+
+// COR-01: same-format device blits are queued on the VideoProc stream and are
+// published only after an explicit completion; failures drain the stream.
+static void testVideoProcSameFormatBlit(void) {
+    vppBackend.realiseSurface = vppMockRealise;
+    cu = &vppCuda;
+    pushFailure = 0;
+    FakeArray fake = { NULL, 0 };
+    for (unsigned scenario = 0; scenario < 4; scenario++) {
+        NVDriver drv;
+        initVppDriver(&drv);
+        resetVppMocks();
+        vppAsyncCopyFailure = scenario == 1 ? 2 : 0;
+        vppEventSyncFailure = scenario >= 2;
+        vppStreamSyncFailure = scenario == 3;
+        BackingImage srcImg = { .format = NV_FORMAT_NV12, .width = 64, .height = 64 };
+        BackingImage dstImg = srcImg;
+        srcImg.arrays[0] = srcImg.arrays[1] = (CUarray) &fake;
+        dstImg.arrays[0] = dstImg.arrays[1] = (CUarray) &fake;
+        assert(initBackingImageSync(&dstImg));
+        NVSurface src = { .width = 64, .height = 64, .backingImage = &srcImg };
+        NVSurface dst = { .width = 64, .height = 64, .backingImage = &dstImg,
+                          .resolving = 1, .contextId = VA_INVALID_ID };
+        pthread_mutex_init(&src.mutex, NULL);
+        pthread_cond_init(&src.cond, NULL);
+        pthread_mutex_init(&dst.mutex, NULL);
+        pthread_cond_init(&dst.cond, NULL);
+        VAProcPipelineParameterBuffer pipeline = {0};
+        const bool copied = copySurfaceBackingImage(&drv, &src, &dst, &pipeline);
+        assert(copied == (scenario == 0));
+        assert(vppSyncCopies == 0 && vppLastAsyncStream == drv.videoProcStream);
+        assert(vppEventSyncs == (scenario == 1 ? 0 : 1));
+        assert(vppStreamSyncs == (scenario == 0 ? 0 : 1));
+        assert(atomic_load(&drv.cudaWorkUnsafe) == (scenario == 3));
+        assert(!dst.resolving && !dstImg.resolving);
+        pthread_cond_destroy(&src.cond);
+        pthread_mutex_destroy(&src.mutex);
+        pthread_cond_destroy(&dst.cond);
+        pthread_mutex_destroy(&dst.mutex);
+        pthread_cond_destroy(&dstImg.cond);
+        pthread_mutex_destroy(&dstImg.mutex);
+        freeVppDriver(&drv);
+    }
+    cu = NULL;
 }
 
 typedef struct {
@@ -743,7 +826,8 @@ static void testSecurityClearPatterns(void) {
     drv.cuMemsetD16Async = NULL;
     clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
     assert(clearBackingImage(&drv, &img));
-    assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 0);
+    // Pageable host uploads are completed before the image can be published.
+    assert(clearFillCalls == 0 && clearCopyCalls == 2 && clearSyncCalls == 2);
     drv.cuMemsetD16Async = mockClear16;
     for (unsigned scenario = 0; scenario < 5; scenario++) {
         clearFillCalls = clearCopyCalls = clearSyncCalls = 0;
@@ -913,6 +997,8 @@ int main(void) {
     testCopyFailures();
     testWorkerFailures();
     testVideoProcOddRegion();
+    testVideoProcCompletionFailures();
+    testVideoProcSameFormatBlit();
     testSharedSurfaceSubmission();
 #if NVD_TEST_VP9
     testVp9();

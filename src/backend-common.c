@@ -105,6 +105,18 @@ void nvReleaseBackingImageBorrow(BackingImage *img) {
     img->borrowedBackingImage = NULL;
 }
 
+// A synchronous cuMemcpy2D from pageable host memory may return once the
+// source has been staged, before the DMA reaches the destination. Finish the
+// legacy stream before publishing such an upload; if that wait fails, GPU
+// completion is unknown and all later CUDA work is quarantined.
+bool nvFinishPageableUpload(NVDriver *drv) {
+    if (CHECK_CUDA_RESULT(drv->cu->cuStreamSynchronize(NULL))) {
+        atomic_store(&drv->cudaWorkUnsafe, true);
+        return false;
+    }
+    return true;
+}
+
 void nvDestroyImportedBackingImage(NVDriver *drv, BackingImage *img) {
     if (atomic_load(&drv->cudaWorkUnsafe)) {
         LOG("Retaining imported backing image: GPU completion is unknown");
