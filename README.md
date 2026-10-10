@@ -318,7 +318,8 @@ small host allocation (256 bytes for small tile sets, approximately 73 KiB at
 4096 tiles with the current growth policy); this is counted in context buffers.
 The 4096-node cap is an internal validation bound, not a claim about playable
 4096-tile videos. Benchmark validation in isolation with
-`build-perf/bench-av1-tiles TILE_COUNT FRAME_COUNT`. GPU clear benchmarks use
+`build-perf/bench-av1-tiles TILE_COUNT FRAME_COUNT`; it is not part of the
+default build, so first run `meson compile -C build-perf bench-av1-tiles`. GPU clear benchmarks use
 `build-perf/test-security-clear --bench p010 60 3840 2160 [THREADS]` with
 `NVD_RUN_GPU_TESTS=1`, the selected `LIBVA_DRIVERS_PATH`, and an explicit layout.
 Their JSON reports fresh-allocation/export time and checks every visible pixel;

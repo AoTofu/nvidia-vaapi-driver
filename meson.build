@@ -106,9 +106,11 @@ driver = shared_library(
     gnu_symbol_visibility: 'hidden',
 )
 
+# Optional microbenchmark: it recompiles the whole driver, so build it only
+# when requested (meson compile -C <dir> bench-av1-tiles).
 bench_av1_tiles = executable('bench-av1-tiles', ['tests/bench-av1-tiles.c'] + sources,
     dependencies: deps, include_directories: nvidia_incdir,
-    c_args: ['-DNVD_BENCH_INDEX=1'])
+    c_args: ['-DNVD_BENCH_INDEX=1'], build_by_default: false)
 
 resolve_queue_test = executable(
     'test-resolve-queue',
