@@ -3556,8 +3556,11 @@ static bool ensureVideoProcStream(NVDriver *drv) {
         CHECK_CUDA_RESULT(drv->cu->cuStreamCreate(&drv->videoProcStream, CU_STREAM_NON_BLOCKING))) {
         return false;
     }
+    // Without CU_EVENT_BLOCKING_SYNC, cuEventSynchronize spins the calling
+    // VA-API thread for the whole conversion regardless of the context flags.
     if (drv->videoProcEvent == NULL &&
-        CHECK_CUDA_RESULT(drv->cu->cuEventCreate(&drv->videoProcEvent, CU_EVENT_DISABLE_TIMING))) {
+        CHECK_CUDA_RESULT(drv->cu->cuEventCreate(&drv->videoProcEvent,
+                                                 CU_EVENT_DISABLE_TIMING | CU_EVENT_BLOCKING_SYNC))) {
         CHECK_CUDA_RESULT(drv->cu->cuStreamDestroy(drv->videoProcStream));
         drv->videoProcStream = NULL;
         return false;
