@@ -2669,6 +2669,25 @@ static uint32_t defaultDecodeSurfaceCount(cudaVideoCodec codec) {
     }
 }
 
+// Codecs whose automatic count was qualified against the legacy 32 surfaces
+// on an RTX 5080: FFmpeg output bit-identical to the software decoder (or to
+// 32 surfaces for MPEG-2) with 16-reference, B-pyramid and alt-ref streams,
+// and identical Chrome frames while seeking for H.264, HEVC and VP9. They use
+// it when NVD_DECODE_SURFACES is unset; the others keep 32 until qualified.
+static bool automaticDecodeSurfacesByDefault(cudaVideoCodec codec) {
+    switch (codec) {
+    case cudaVideoCodec_H264:
+    case cudaVideoCodec_HEVC:
+    case cudaVideoCodec_VP9:
+    case cudaVideoCodec_VP8:
+    case cudaVideoCodec_MPEG2:
+    case cudaVideoCodec_JPEG:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint32_t selectContextDecodeSurfaceCount(NVContext *nvCtx) {
     NVDriver *drv = nvCtx->drv;
     const uint32_t automatic = nvdSelectDecodeSurfaceCount(
@@ -2676,7 +2695,9 @@ static uint32_t selectContextDecodeSurfaceCount(NVContext *nvCtx) {
         nvCtx->clientRenderTargetCount, 0, drv->decodeSurfacesMinimum,
         drv->decodeSurfacesMaximum);
     nvStatsSet(drv, NV_STAT_DECODE_SURFACES_AUTO_CANDIDATE, automatic);
-    if (drv->decodeSurfacesAuto) {
+    if (drv->decodeSurfacesAuto ||
+        (drv->decodeSurfacesOverride == 0 &&
+         automaticDecodeSurfacesByDefault(nvCtx->cudaCodec))) {
         return automatic;
     }
     const uint32_t overrideCount = drv->decodeSurfacesOverride != 0
