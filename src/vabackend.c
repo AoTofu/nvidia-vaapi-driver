@@ -3928,6 +3928,12 @@ done:
     return submitted;
 }
 
+// An interleaved 4:2:0 chroma row holds ceil(width / 2) UV pairs, which is one
+// sample more than the luma row for an odd-width region.
+static size_t videoProcUVRowBytes(uint32_t width, size_t bpp) {
+    return ((size_t) width + 1) / 2 * 2 * bpp;
+}
+
 static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingImage *dstImg, uint32_t width, uint32_t height, bool is16Bit, const ColorMatrix *matrix, VideoProcSampleInfo sampleInfo) {
     if (srcImg->arrays[0] == NULL || srcImg->arrays[1] == NULL) {
         return false;
@@ -3936,7 +3942,8 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
     const size_t bpp = is16Bit ? 2 : 1;
     const size_t ySize = (size_t) width * height * bpp;
     const size_t uvHeight = (height + 1) / 2;
-    const size_t uvSize = (size_t) width * uvHeight * bpp;
+    const size_t uvRowBytes = videoProcUVRowBytes(width, bpp);
+    const size_t uvSize = uvRowBytes * uvHeight;
     const size_t argbSize = (size_t) width * height * 4;
     const bool externalDeviceDestination = nvBackingImageHasExternalDeviceMemory(dstImg);
     CUdeviceptr dstDevice = externalDeviceDestination ? nvBackingImageDevicePlane(dstImg, 0) : drv->videoProcArgbBuffer;
@@ -3982,8 +3989,8 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
         .srcArray = srcImg->arrays[1],
         .dstMemoryType = CU_MEMORYTYPE_DEVICE,
         .dstDevice = drv->videoProcUVBuffer,
-        .dstPitch = width * bpp,
-        .WidthInBytes = width * bpp,
+        .dstPitch = uvRowBytes,
+        .WidthInBytes = uvRowBytes,
         .Height = uvHeight
     };
     // Queue the fallback copies and kernel on the dedicated non-blocking stream.
@@ -3999,7 +4006,7 @@ static bool convertNV12ToARGBCuda(NVDriver *drv, BackingImage *srcImg, BackingIm
     nvStatsAdd(drv, NV_STAT_DEVICE_COPY_BYTES, uvSize);
 
     uint32_t yPitch = width * bpp;
-    uint32_t uvPitch = width * bpp;
+    uint32_t uvPitch = (uint32_t) uvRowBytes;
     uint32_t order = rgbOrderForFourcc((uint32_t) dstImg->fourcc);
     uint32_t vToR = (uint32_t) matrix->vToR;
     uint32_t uToG = (uint32_t) matrix->uToG;
@@ -4120,7 +4127,9 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
 
     const size_t bpp = is16Bit ? 2 : 1;
     const size_t ySize = (size_t) width * height * bpp;
-    const size_t uvSize = (size_t) width * ((height + 1) / 2) * bpp;
+    const size_t uvRowBytes = videoProcUVRowBytes(width, bpp);
+    const size_t uvRowSamples = uvRowBytes / bpp;
+    const size_t uvSize = uvRowBytes * ((height + 1) / 2);
     const size_t argbSize = (size_t) width * height * 4;
     const bool externalHostSource = nvBackingImageHasExternalHostMemory(srcImg);
     bool sourceAccessStarted = false;
@@ -4164,7 +4173,7 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
             memcpy(yPlane + (size_t) y * width * bpp, srcY + (size_t) y * srcImg->strides[0], width * bpp);
         }
         for (uint32_t y = 0; y < (height + 1) / 2; y++) {
-            memcpy(uvPlane + (size_t) y * width * bpp, srcUV + (size_t) y * srcImg->strides[1], width * bpp);
+            memcpy(uvPlane + (size_t) y * uvRowBytes, srcUV + (size_t) y * srcImg->strides[1], uvRowBytes);
         }
         nvStatsAdd(drv, NV_STAT_HOST_COPY_BYTES, ySize + uvSize);
     } else {
@@ -4179,8 +4188,8 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
         CUDA_MEMCPY2D uvCpy = {
             .dstMemoryType = CU_MEMORYTYPE_HOST,
             .dstHost = uvPlane,
-            .dstPitch = width * bpp,
-            .WidthInBytes = width * bpp,
+            .dstPitch = uvRowBytes,
+            .WidthInBytes = uvRowBytes,
             .Height = (height + 1) / 2
         };
         if (externalDeviceSource) {
@@ -4214,12 +4223,12 @@ static bool convertNV12ToARGB(NVDriver *drv, BackingImage *srcImg, BackingImage 
                 const uint16_t *yPlane16 = (const uint16_t*) yPlane;
                 const uint16_t *uvPlane16 = (const uint16_t*) uvPlane;
                 yy = yPlane16[(size_t) y * width + x] >> sampleInfo.sampleShift;
-                const size_t uvIndex = (size_t) (y / 2) * width + (x & ~1u);
+                const size_t uvIndex = (size_t) (y / 2) * uvRowSamples + (x & ~1u);
                 u = uvPlane16[uvIndex] >> sampleInfo.sampleShift;
                 v = uvPlane16[uvIndex + 1] >> sampleInfo.sampleShift;
             } else {
                 yy = yPlane[(size_t) y * width + x];
-                const size_t uvIndex = (size_t) (y / 2) * width + (x & ~1u);
+                const size_t uvIndex = (size_t) (y / 2) * uvRowSamples + (x & ~1u);
                 u = uvPlane[uvIndex];
                 v = uvPlane[uvIndex + 1];
             }

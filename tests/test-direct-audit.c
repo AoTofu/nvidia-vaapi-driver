@@ -313,6 +313,201 @@ static void testWorkerFailures(void) {
     cv = NULL;
 }
 
+// VideoProc mocks. A fake CUarray is host memory with a pitch so the CPU
+// fallback's synchronous copies can be checked pixel by pixel.
+typedef struct {
+    uint8_t *data;
+    size_t pitch;
+} FakeArray;
+static int vppAsyncCopies, vppSyncCopies, vppLaunches, vppStreamSyncs, vppEventSyncs;
+static int vppLaunchFailure, vppEventSyncFailure, vppStreamSyncFailure, vppAsyncCopyFailure;
+static CUstream vppLastAsyncStream;
+static CUDA_MEMCPY2D vppAsync[4];
+static uint32_t vppUvPitch;
+static CUdeviceptr vppNextAlloc = 0x1000;
+static CUresult CUDAAPI vppMockAsyncCopy(const CUDA_MEMCPY2D *copy, CUstream stream) {
+    if (vppAsyncCopies < 4) vppAsync[vppAsyncCopies] = *copy;
+    vppAsyncCopies++;
+    vppLastAsyncStream = stream;
+    return vppAsyncCopies == vppAsyncCopyFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockSyncCopy(const CUDA_MEMCPY2D *copy) {
+    vppSyncCopies++;
+    const uint8_t *src = copy->srcMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->srcArray)->data : copy->srcHost;
+    const size_t srcPitch = copy->srcMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->srcArray)->pitch : copy->srcPitch;
+    uint8_t *dst = copy->dstMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->dstArray)->data : copy->dstHost;
+    const size_t dstPitch = copy->dstMemoryType == CU_MEMORYTYPE_ARRAY
+        ? ((FakeArray *) copy->dstArray)->pitch : copy->dstPitch;
+    assert(copy->WidthInBytes <= srcPitch && copy->WidthInBytes <= dstPitch);
+    for (size_t y = 0; y < copy->Height; y++) {
+        memcpy(dst + (copy->dstY + y) * dstPitch, src + (copy->srcY + y) * srcPitch,
+               copy->WidthInBytes);
+    }
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockLaunch(CUfunction f, unsigned gx, unsigned gy, unsigned gz,
+                                      unsigned bx, unsigned by, unsigned bz, unsigned shared,
+                                      CUstream stream, void **params, void **extra) {
+    vppLaunches++;
+    if (f == (CUfunction) 2) vppUvPitch = *(uint32_t *) params[6]; // staged kernel uv pitch
+    return vppLaunchFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockEventRecord(CUevent event, CUstream stream) { return CUDA_SUCCESS; }
+static CUresult CUDAAPI vppMockEventSync(CUevent event) {
+    vppEventSyncs++;
+    return vppEventSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockStreamSync(CUstream stream) {
+    vppStreamSyncs++;
+    return vppStreamSyncFailure ? CUDA_ERROR_UNKNOWN : CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockAlloc(CUdeviceptr *ptr, size_t size) {
+    *ptr = vppNextAlloc;
+    vppNextAlloc += 0x1000;
+    return CUDA_SUCCESS;
+}
+static CUresult CUDAAPI vppMockFree(CUdeviceptr ptr) { return CUDA_SUCCESS; }
+
+static CudaFunctions vppCuda = {
+    .cuMemcpy2DAsync = vppMockAsyncCopy, .cuMemcpy2D = vppMockSyncCopy,
+    .cuLaunchKernel = vppMockLaunch, .cuEventRecord = vppMockEventRecord,
+    .cuEventSynchronize = vppMockEventSync, .cuStreamSynchronize = vppMockStreamSync,
+    .cuMemAlloc = vppMockAlloc, .cuMemFree = vppMockFree,
+    .cuCtxPushCurrent = mockPush, .cuCtxPopCurrent = mockPop,
+};
+static NVBackend vppBackend;
+
+static void resetVppMocks(void) {
+    vppAsyncCopies = vppSyncCopies = vppLaunches = vppStreamSyncs = vppEventSyncs = 0;
+    vppLaunchFailure = vppEventSyncFailure = vppStreamSyncFailure = vppAsyncCopyFailure = 0;
+    vppLastAsyncStream = NULL;
+    vppUvPitch = 0;
+    memset(vppAsync, 0, sizeof(vppAsync));
+}
+
+static void initVppDriver(NVDriver *drv) {
+    memset(drv, 0, sizeof(*drv));
+    drv->cu = &vppCuda;
+    drv->backend = &vppBackend;
+    drv->videoProcStream = (CUstream) 7;
+    drv->videoProcEvent = (CUevent) 8;
+    drv->arrayToArgbKernel = (CUfunction) 1;
+    drv->nv12ToArgbKernel = (CUfunction) 2;
+    drv->p010ToArgbKernel = (CUfunction) 2;
+    drv->videoProcScratchMaxBytes = 64 * 1024 * 1024;
+    pthread_mutex_init(&drv->exportMutex, NULL);
+    pthread_mutex_init(&drv->objectCreationMutex, NULL);
+}
+
+static void freeVppDriver(NVDriver *drv) {
+    free(drv->cpuVideoProcYBuffer);
+    free(drv->cpuVideoProcUVBuffer);
+    free(drv->cpuVideoProcArgbBuffer);
+    pthread_mutex_destroy(&drv->exportMutex);
+    pthread_mutex_destroy(&drv->objectCreationMutex);
+}
+
+static uint8_t vppReferencePixel(int yy, int u, int v, const ColorMatrix *m,
+                                 VideoProcSampleInfo info, int channel) {
+    const int c = yy > info.yOffset ? yy - info.yOffset : 0;
+    const int d = u - info.uvOffset;
+    const int e = v - info.uvOffset;
+    const int value = channel == 0 ? info.yScale * c + m->vToR * e
+                    : channel == 1 ? info.yScale * c - m->uToG * d - m->vToG * e
+                    : info.yScale * c + m->uToB * d;
+    return clampU8((value + info.rounding) >> info.valueShift);
+}
+
+// COR-02: an odd-width region needs ceil(width / 2) UV pairs per chroma row in
+// both the staged CUDA path and the CPU fallback.
+static void testVideoProcOddRegion(void) {
+    enum { SW = 64, SH = 66, W = 63, H = 65 };
+    for (int is16 = 0; is16 < 2; is16++) {
+        const size_t bpp = is16 ? 2 : 1;
+        const NVFormat format = is16 ? NV_FORMAT_P010 : NV_FORMAT_NV12;
+        const VideoProcSampleInfo info = videoProcSampleInfoForFormat(format, false);
+        const ColorMatrix *matrix = colorMatrixForStandard(VAProcColorStandardBT709, W, false);
+        // Pad each row with poison so a mis-sized chroma row reads it.
+        const size_t pitch = SW * bpp + 64;
+        uint8_t *yData = malloc(pitch * SH);
+        uint8_t *uvData = malloc(pitch * (SH / 2));
+        uint8_t *argbData = calloc(SW * 4, SH);
+        assert(yData != NULL && uvData != NULL && argbData != NULL);
+        memset(yData, 0xff, pitch * SH);
+        memset(uvData, 0xff, pitch * (SH / 2));
+        for (int y = 0; y < SH; y++) {
+            for (int x = 0; x < SW; x++) {
+                const unsigned value = 16 + ((x * 3 + y * 5) % 200);
+                if (is16) ((uint16_t *) (yData + y * pitch))[x] = (uint16_t) (value << 8);
+                else yData[y * pitch + x] = (uint8_t) value;
+            }
+        }
+        for (int y = 0; y < SH / 2; y++) {
+            for (int x = 0; x < SW; x++) {
+                // U and V differ per pair and per row, so any misindexing shows.
+                const unsigned value = (x & 1) ? 40 + x * 3 + y : 220 - x * 2 - y;
+                if (is16) ((uint16_t *) (uvData + y * pitch))[x] = (uint16_t) (value << 8);
+                else uvData[y * pitch + x] = (uint8_t) value;
+            }
+        }
+        FakeArray yArray = { yData, pitch }, uvArray = { uvData, pitch }, argbArray = { argbData, SW * 4 };
+        BackingImage src = { .format = format, .width = SW, .height = SH };
+        src.arrays[0] = (CUarray) &yArray;
+        src.arrays[1] = (CUarray) &uvArray;
+        BackingImage dst = { .format = NV_FORMAT_ARGB, .width = SW, .height = SH,
+                             .fourcc = VA_FOURCC_BGRA };
+        dst.arrays[0] = (CUarray) &argbArray;
+
+        NVDriver drv;
+        initVppDriver(&drv);
+        drv.arrayToArgbKernel = NULL;
+        drv.videoProcArrayKernelFailed = true;
+
+        // Staged CUDA path geometry.
+        resetVppMocks();
+        assert(convertNV12ToARGB(&drv, &src, &dst, W, H, matrix, info));
+        assert(vppAsyncCopies == 3 && vppLaunches == 1);
+        assert(vppAsync[1].WidthInBytes == (W + 1) / 2 * 2 * bpp);
+        assert(vppAsync[1].dstPitch == vppAsync[1].WidthInBytes);
+        assert(vppAsync[1].Height == (H + 1) / 2);
+        assert(vppUvPitch == vppAsync[1].WidthInBytes);
+        assert(drv.videoProcUVBufferSize >= vppAsync[1].WidthInBytes * vppAsync[1].Height);
+
+        // CPU fallback pixels after a safely drained staged failure.
+        resetVppMocks();
+        vppLaunchFailure = 1;
+        assert(convertNV12ToARGB(&drv, &src, &dst, W, H, matrix, info));
+        assert(!atomic_load(&drv.cudaWorkUnsafe));
+        assert(vppSyncCopies == 3 && vppStreamSyncs >= 1); // staged failure drain
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int yy, u, v;
+                if (is16) {
+                    yy = ((uint16_t *) (yData + y * pitch))[x] >> info.sampleShift;
+                    u = ((uint16_t *) (uvData + (y / 2) * pitch))[x & ~1] >> info.sampleShift;
+                    v = ((uint16_t *) (uvData + (y / 2) * pitch))[(x & ~1) + 1] >> info.sampleShift;
+                } else {
+                    yy = yData[y * pitch + x];
+                    u = uvData[(y / 2) * pitch + (x & ~1)];
+                    v = uvData[(y / 2) * pitch + (x & ~1) + 1];
+                }
+                const uint8_t *px = argbData + y * SW * 4 + x * 4;
+                assert(px[2] == vppReferencePixel(yy, u, v, matrix, info, 0));
+                assert(px[1] == vppReferencePixel(yy, u, v, matrix, info, 1));
+                assert(px[0] == vppReferencePixel(yy, u, v, matrix, info, 2));
+                assert(px[3] == 255);
+            }
+        }
+        freeVppDriver(&drv);
+        free(yData);
+        free(uvData);
+        free(argbData);
+    }
+}
+
 typedef struct {
     VADriverContextP driver;
     VAContextID context;
@@ -717,6 +912,7 @@ int main(void) {
     testDescriptor();
     testCopyFailures();
     testWorkerFailures();
+    testVideoProcOddRegion();
     testSharedSurfaceSubmission();
 #if NVD_TEST_VP9
     testVp9();
