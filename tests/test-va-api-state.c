@@ -180,6 +180,35 @@ int main(int argc, char **argv) {
                                            &unsupportedEntrypointCount),
                   VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
 
+    // Attributes the driver does not implement must come back as
+    // VA_ATTRIB_NOT_SUPPORTED rather than whatever the caller passed in.
+    VAConfigAttrib decodeAttribs[] = {
+        { .type = VAConfigAttribRTFormat, .value = 0x5a5a5a5a },
+        { .type = VAConfigAttribDecSliceMode, .value = 0x5a5a5a5a },
+        { .type = VAConfigAttribMaxPictureWidth, .value = 0x5a5a5a5a },
+    };
+    requireStatus("H264 vaGetConfigAttributes",
+                  vaGetConfigAttributes(display, VAProfileH264High, VAEntrypointVLD,
+                                        decodeAttribs, 3),
+                  VA_STATUS_SUCCESS);
+    if ((decodeAttribs[0].value & VA_RT_FORMAT_YUV420) == 0 ||
+        decodeAttribs[1].value != VA_ATTRIB_NOT_SUPPORTED ||
+        decodeAttribs[2].value == 0 || decodeAttribs[2].value == 0x5a5a5a5a) {
+        fprintf(stderr, "unexpected H264 config attributes: %#x %#x %#x\n",
+                decodeAttribs[0].value, decodeAttribs[1].value,
+                decodeAttribs[2].value);
+        exit(EXIT_FAILURE);
+    }
+    VAConfigAttrib vppAttrib = { .type = VAConfigAttribDecSliceMode, .value = 0x5a5a5a5a };
+    requireStatus("VideoProc vaGetConfigAttributes",
+                  vaGetConfigAttributes(display, VAProfileNone, VAEntrypointVideoProc,
+                                        &vppAttrib, 1),
+                  VA_STATUS_SUCCESS);
+    if (vppAttrib.value != VA_ATTRIB_NOT_SUPPORTED) {
+        fprintf(stderr, "unexpected VideoProc attribute: %#x\n", vppAttrib.value);
+        exit(EXIT_FAILURE);
+    }
+
     VAConfigID config = VA_INVALID_ID;
     requireStatus("vaCreateConfig",
                   vaCreateConfig(display, VAProfileNone, VAEntrypointVideoProc,

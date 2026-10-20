@@ -1634,6 +1634,7 @@ static VAStatus nvGetConfigAttributes(
                 }
             } else {
                 LOG("unhandled vpp config attribute: %d", attrib_list[i].type);
+                attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
             }
         }
         return VA_STATUS_SUCCESS;
@@ -1718,6 +1719,7 @@ static VAStatus nvGetConfigAttributes(
         else
         {
             LOG("unhandled config attribute: %d", attrib_list[i].type);
+            attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
         }
     }
 
