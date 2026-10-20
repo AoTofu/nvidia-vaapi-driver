@@ -1497,10 +1497,14 @@ static VAStatus nvQueryConfigProfiles2(
     if (doesGPUSupportCodec(drv, cudaVideoCodec_JPEG, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileJPEGBaseline;
     }
-    if (doesGPUSupportCodec(drv, cudaVideoCodec_H264_SVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    // No codec module decodes these yet and they are filtered out below; skip
+    // their ~6 ms capability queries.
+    if (vaToCuCodec(VAProfileH264StereoHigh) != cudaVideoCodec_NONE &&
+        doesGPUSupportCodec(drv, cudaVideoCodec_H264_SVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264StereoHigh;
     }
-    if (doesGPUSupportCodec(drv, cudaVideoCodec_H264_MVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (vaToCuCodec(VAProfileH264MultiviewHigh) != cudaVideoCodec_NONE &&
+        doesGPUSupportCodec(drv, cudaVideoCodec_H264_MVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264MultiviewHigh;
     }
     if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
