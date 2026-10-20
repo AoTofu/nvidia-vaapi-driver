@@ -1089,6 +1089,44 @@ static void testBufferDestroyDoesNotWaitForSync(void) {
     pthread_rwlock_destroy(&objectLock);
 }
 
+static unsigned capsCalls;
+static CUresult capsResult;
+static CUresult CUDAAPI mockDecoderCaps(CUVIDDECODECAPS *caps) {
+    capsCalls++;
+    caps->bIsSupported = 1;
+    caps->nMaxWidth = 8192 + caps->nBitDepthMinus8;
+    return capsResult;
+}
+
+static void testDecoderCapsCache(void) {
+    CuvidFunctions cuvid = {.cuvidGetDecoderCaps = mockDecoderCaps};
+    cv = &cuvid;
+    NVDriver gpu0 = {.cudaGpuId = 0}, gpu1 = {.cudaGpuId = 1};
+    // A failed query is not remembered.
+    capsResult = CUDA_ERROR_UNKNOWN;
+    CUVIDDECODECAPS caps = {.eCodecType = cudaVideoCodec_HEVC, .nBitDepthMinus8 = 2};
+    assert(getDecoderCaps(&gpu0, &caps) == CUDA_ERROR_UNKNOWN && capsCalls == 1);
+    capsResult = CUDA_SUCCESS;
+    for (unsigned i = 0; i < 3; i++) {
+        caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC, .nBitDepthMinus8 = 2,
+                                 .nMaxWidth = 1};
+        assert(getDecoderCaps(&gpu0, &caps) == CUDA_SUCCESS);
+        assert(caps.bIsSupported == 1 && caps.nMaxWidth == 8194 && capsCalls == 2);
+    }
+    // The key covers bit depth, chroma format and GPU.
+    caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC};
+    assert(getDecoderCaps(&gpu0, &caps) == CUDA_SUCCESS && capsCalls == 3);
+    caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC,
+                             .eChromaFormat = cudaVideoChromaFormat_444};
+    assert(getDecoderCaps(&gpu0, &caps) == CUDA_SUCCESS && capsCalls == 4);
+    caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC, .nBitDepthMinus8 = 2,
+                             .eChromaFormat = cudaVideoChromaFormat_420};
+    assert(getDecoderCaps(&gpu1, &caps) == CUDA_SUCCESS && capsCalls == 5);
+    assert(doesGPUSupportCodec(&gpu1, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_420,
+                               NULL, NULL) && capsCalls == 5);
+    cv = NULL;
+}
+
 int main(void) {
     testSecurityClearPatterns();
     testAV1SubmissionOrder();
@@ -1105,6 +1143,7 @@ int main(void) {
     testVideoProcSameFormatBlit();
     testSharedSurfaceSubmission();
     testBufferDestroyDoesNotWaitForSync();
+    testDecoderCapsCache();
 #if NVD_TEST_VP9
     testVp9();
 #endif

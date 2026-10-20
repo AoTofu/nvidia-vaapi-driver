@@ -1169,7 +1169,75 @@ static cudaVideoCodec vaToCuCodec(VAProfile profile) {
     return cudaVideoCodec_NONE;
 }
 
-static bool doesGPUSupportCodec(cudaVideoCodec codec, int bitDepth, cudaVideoChromaFormat chromaFormat, uint32_t *width, uint32_t *height)
+// cuvidGetDecoderCaps costs ~6 ms per call (RTX 5080, 615.78) and the answer
+// is fixed for a GPU, yet vaInitialize alone asks for ~20 tuples and clients
+// such as Chrome re-ask per profile through GetConfigAttributes and
+// QuerySurfaceAttributes. Remember successful answers for the process.
+typedef struct {
+    int gpu;
+    CUVIDDECODECAPS caps;
+} CachedDecodeCaps;
+
+static pthread_mutex_t decodeCapsMutex = PTHREAD_MUTEX_INITIALIZER;
+static CachedDecodeCaps decodeCapsCache[64];
+static unsigned int decodeCapsCount;
+
+static bool lookupCachedDecodeCaps(int gpu, CUVIDDECODECAPS *caps) {
+    bool found = false;
+    pthread_mutex_lock(&decodeCapsMutex);
+    for (unsigned int i = 0; i < decodeCapsCount; i++) {
+        const CachedDecodeCaps *entry = &decodeCapsCache[i];
+        if (entry->gpu == gpu &&
+            entry->caps.eCodecType == caps->eCodecType &&
+            entry->caps.eChromaFormat == caps->eChromaFormat &&
+            entry->caps.nBitDepthMinus8 == caps->nBitDepthMinus8) {
+            *caps = entry->caps;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&decodeCapsMutex);
+    return found;
+}
+
+static void storeCachedDecodeCaps(int gpu, const CUVIDDECODECAPS *caps) {
+    pthread_mutex_lock(&decodeCapsMutex);
+    bool present = false;
+    for (unsigned int i = 0; i < decodeCapsCount && !present; i++) {
+        const CachedDecodeCaps *entry = &decodeCapsCache[i];
+        present = entry->gpu == gpu &&
+            entry->caps.eCodecType == caps->eCodecType &&
+            entry->caps.eChromaFormat == caps->eChromaFormat &&
+            entry->caps.nBitDepthMinus8 == caps->nBitDepthMinus8;
+    }
+    if (!present && decodeCapsCount < ARRAY_SIZE(decodeCapsCache)) {
+        decodeCapsCache[decodeCapsCount].gpu = gpu;
+        decodeCapsCache[decodeCapsCount].caps = *caps;
+        decodeCapsCount++;
+    }
+    pthread_mutex_unlock(&decodeCapsMutex);
+}
+
+// The caller must have the driver's CUDA context current. Only the codec,
+// chroma format and bit depth of caps are inputs; the rest is overwritten.
+static CUresult getDecoderCaps(const NVDriver *drv, CUVIDDECODECAPS *caps) {
+    const CUVIDDECODECAPS request = {
+        .eCodecType      = caps->eCodecType,
+        .eChromaFormat   = caps->eChromaFormat,
+        .nBitDepthMinus8 = caps->nBitDepthMinus8,
+    };
+    *caps = request;
+    if (lookupCachedDecodeCaps(drv->cudaGpuId, caps)) {
+        return CUDA_SUCCESS;
+    }
+    const CUresult result = cv->cuvidGetDecoderCaps(caps);
+    if (result == CUDA_SUCCESS) {
+        storeCachedDecodeCaps(drv->cudaGpuId, caps);
+    }
+    return result;
+}
+
+static bool doesGPUSupportCodec(const NVDriver *drv, cudaVideoCodec codec, int bitDepth, cudaVideoChromaFormat chromaFormat, uint32_t *width, uint32_t *height)
 {
     CUVIDDECODECAPS videoDecodeCaps = {
         .eCodecType      = codec,
@@ -1177,7 +1245,7 @@ static bool doesGPUSupportCodec(cudaVideoCodec codec, int bitDepth, cudaVideoChr
         .nBitDepthMinus8 = bitDepth - 8
     };
 
-    CHECK_CUDA_RESULT_RETURN(cv->cuvidGetDecoderCaps(&videoDecodeCaps), false);
+    CHECK_CUDA_RESULT_RETURN(getDecoderCaps(drv, &videoDecodeCaps), false);
 
     if (width != NULL) {
         *width = videoDecodeCaps.nMaxWidth;
@@ -1250,7 +1318,7 @@ static VAStatus queryProfileDecodeCaps(NVDriver *drv, VAProfile profile,
     if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
-    const CUresult capsResult = cv->cuvidGetDecoderCaps(caps);
+    const CUresult capsResult = getDecoderCaps(drv, caps);
     const CUresult popResult = cu->cuCtxPopCurrent(NULL);
     if (CHECK_CUDA_RESULT(capsResult) || CHECK_CUDA_RESULT(popResult)) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -1407,79 +1475,79 @@ static VAStatus nvQueryConfigProfiles2(
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
     int profiles = 0;
-    if (doesGPUSupportCodec(cudaVideoCodec_MPEG2, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_MPEG2, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileMPEG2Simple;
         profile_list[profiles++] = VAProfileMPEG2Main;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_MPEG4, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_MPEG4, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileMPEG4Simple;
         profile_list[profiles++] = VAProfileMPEG4AdvancedSimple;
         profile_list[profiles++] = VAProfileMPEG4Main;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_VC1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_VC1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileVC1Simple;
         profile_list[profiles++] = VAProfileVC1Main;
         profile_list[profiles++] = VAProfileVC1Advanced;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_H264, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_H264, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264Main;
         profile_list[profiles++] = VAProfileH264High;
         profile_list[profiles++] = VAProfileH264ConstrainedBaseline;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_JPEG, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_JPEG, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileJPEGBaseline;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_H264_SVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_H264_SVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264StereoHigh;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_H264_MVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_H264_MVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264MultiviewHigh;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileHEVCMain;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_VP8, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_VP8, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileVP8Version0_3;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileVP9Profile0; //color depth: 8 bit, 4:2:0
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileAV1Profile0;
     }
 
     if (drv->supports16BitSurface) {
-        if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
             profile_list[profiles++] = VAProfileHEVCMain10;
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_420, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_420, NULL, NULL)) {
             profile_list[profiles++] = VAProfileHEVCMain12;
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
             profile_list[profiles++] = VAProfileVP9Profile2; //color depth: 10–12 bit, 4:2:0
         }
     }
 
     if (drv->supports444Surface) {
-        if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
             profile_list[profiles++] = VAProfileHEVCMain444;
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
             profile_list[profiles++] = VAProfileVP9Profile1; //color depth: 8 bit, 4:2:2, 4:4:0, 4:4:4
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
             profile_list[profiles++] = VAProfileAV1Profile1;
         }
 
 #if VA_CHECK_VERSION(1, 20, 0)
         if (drv->supports16BitSurface) {
-            if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
+            if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
                 profile_list[profiles++] = VAProfileHEVCMain444_10;
             }
-            if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_444, NULL, NULL)) {
+            if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_444, NULL, NULL)) {
                 profile_list[profiles++] = VAProfileHEVCMain444_12;
             }
-            if (doesGPUSupportCodec(cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
+            if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
                 profile_list[profiles++] = VAProfileVP9Profile3; //color depth: 10–12 bit, 4:2:2, 4:4:0, 4:4:4
             }
         }
@@ -1488,10 +1556,10 @@ static VAStatus nvQueryConfigProfiles2(
 
     // Nvidia decoder doesn't support 422 chroma layout
 #if 0
-    if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_422, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_422, NULL, NULL)) {
         profile_list[profiles++] = VAProfileHEVCMain422_10;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_422, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_422, NULL, NULL)) {
         profile_list[profiles++] = VAProfileHEVCMain422_12;
     }
 #endif
@@ -6005,7 +6073,7 @@ static VAStatus nvQuerySurfaceAttributes(
         };
 
         CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-        const CUresult capsResult = cv->cuvidGetDecoderCaps(&videoDecodeCaps);
+        const CUresult capsResult = getDecoderCaps(drv, &videoDecodeCaps);
         const CUresult popResult = cu->cuCtxPopCurrent(NULL);
         if (CHECK_CUDA_RESULT(capsResult) || CHECK_CUDA_RESULT(popResult)) {
             return VA_STATUS_ERROR_OPERATION_FAILED;
