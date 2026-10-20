@@ -529,6 +529,22 @@ static uint32_t parseDecodeSurfaceOverride(bool *automatic) {
 // cache size race with whatever else the GPU is running. ffnvcodec's loader
 // doesn't expose cuDeviceTotalMem, so resolve it from the already-loaded
 // libcuda; if anything fails, fall back to the fixed default.
+// ffnvcodec's loader does not expose the page-locked host allocator.
+static void loadPinnedHostFunctions(NVDriver *drv) {
+    void *libcuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (libcuda == NULL) {
+        return;
+    }
+    // libcuda stays loaded through cuda_load_functions' own reference.
+    drv->cuMemAllocHost = (CUresult (*)(void **, size_t)) dlsym(libcuda, "cuMemAllocHost_v2");
+    drv->cuMemFreeHost = (CUresult (*)(void *)) dlsym(libcuda, "cuMemFreeHost");
+    if (drv->cuMemAllocHost == NULL || drv->cuMemFreeHost == NULL) {
+        drv->cuMemAllocHost = NULL;
+        drv->cuMemFreeHost = NULL;
+    }
+    dlclose(libcuda);
+}
+
 static uint64_t defaultMaxDetachedBackingImageBytes(int cudaGpuId) {
     typedef CUresult CUDAAPI tcuDeviceTotalMem_l(size_t *bytes, CUdevice dev);
 
@@ -3154,7 +3170,8 @@ static bool allocateBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
             drv->bufferPoolBytes -= capacity;
             buffer->ptr = block;
         }
-        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, drv->bufferPoolBytes);
+        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+                   drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
         pthread_mutex_unlock(&drv->bufferPoolMutex);
     }
 
@@ -3181,6 +3198,107 @@ static bool allocateBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
     return true;
 }
 
+static void freePinnedHostMemory(NVDriver *drv, void *ptr) {
+    if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
+        return;
+    }
+    CHECK_CUDA_RESULT(drv->cuMemFreeHost(ptr));
+    CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+}
+
+static void releasePinnedImageMemory(NVDriver *drv, void *ptr, size_t capacity) {
+    pthread_mutex_lock(&drv->bufferPoolMutex);
+    if (drv->pinnedImagePoolCount < ARRAY_SIZE(drv->pinnedImagePool) &&
+        capacity <= drv->bufferPoolMaxBytes &&
+        drv->pinnedImagePoolBytes <= drv->bufferPoolMaxBytes - capacity) {
+        drv->pinnedImagePool[drv->pinnedImagePoolCount] = ptr;
+        drv->pinnedImagePoolSizes[drv->pinnedImagePoolCount] = capacity;
+        drv->pinnedImagePoolCount++;
+        drv->pinnedImagePoolBytes += capacity;
+        ptr = NULL;
+    }
+    nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+               drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
+    pthread_mutex_unlock(&drv->bufferPoolMutex);
+    if (ptr != NULL) {
+        freePinnedHostMemory(drv, ptr);
+    }
+}
+
+// Backs a VAImage with page-locked memory so vaGetImage copies straight from
+// the GPU instead of through the CUDA driver's pageable staging buffers.
+// Falls back to ordinary memory when page-locked memory is unavailable.
+static bool allocateImageBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
+    // Round so that slightly different image sizes can share pool entries.
+    const size_t granularity = 64U * 1024U;
+    if (drv->cuMemAllocHost == NULL || drv->cuMemFreeHost == NULL ||
+        size == 0 || size > SIZE_MAX - granularity) {
+        return allocateBufferMemory(drv, buffer, size);
+    }
+    const size_t capacity = (size + granularity - 1) / granularity * granularity;
+    // Without retention every frame would pay for cuMemAllocHost, which is
+    // slower than the pageable copy it replaces.
+    if (capacity > drv->bufferPoolMaxBytes) {
+        return allocateBufferMemory(drv, buffer, size);
+    }
+
+    void *ptr = NULL;
+    size_t ptrCapacity = 0;
+    void *evicted = NULL;
+    pthread_mutex_lock(&drv->bufferPoolMutex);
+    for (uint32_t i = 0; i < drv->pinnedImagePoolCount; i++) {
+        if (drv->pinnedImagePoolSizes[i] == capacity) {
+            ptr = drv->pinnedImagePool[i];
+            ptrCapacity = capacity;
+            drv->pinnedImagePoolBytes -= capacity;
+            drv->pinnedImagePoolCount--;
+            drv->pinnedImagePool[i] = drv->pinnedImagePool[drv->pinnedImagePoolCount];
+            drv->pinnedImagePoolSizes[i] = drv->pinnedImagePoolSizes[drv->pinnedImagePoolCount];
+            break;
+        }
+    }
+    if (ptr == NULL && drv->pinnedImagePoolCount == ARRAY_SIZE(drv->pinnedImagePool)) {
+        // The client switched sizes; drop the oldest entry rather than pinning
+        // ever more memory.
+        evicted = drv->pinnedImagePool[0];
+        drv->pinnedImagePoolBytes -= drv->pinnedImagePoolSizes[0];
+        drv->pinnedImagePoolCount--;
+        drv->pinnedImagePool[0] = drv->pinnedImagePool[drv->pinnedImagePoolCount];
+        drv->pinnedImagePoolSizes[0] = drv->pinnedImagePoolSizes[drv->pinnedImagePoolCount];
+    }
+    nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+               drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
+    pthread_mutex_unlock(&drv->bufferPoolMutex);
+    if (evicted != NULL) {
+        freePinnedHostMemory(drv, evicted);
+    }
+
+    if (ptr == NULL) {
+        if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
+            return allocateBufferMemory(drv, buffer, size);
+        }
+        const CUresult result = drv->cuMemAllocHost(&ptr, capacity);
+        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+        if (result != CUDA_SUCCESS) {
+            LOG("cuMemAllocHost(%zu) failed: %d; using pageable image memory", capacity, result);
+            return allocateBufferMemory(drv, buffer, size);
+        }
+        ptrCapacity = capacity;
+    }
+
+    buffer->ptr = ptr;
+    buffer->capacity = ptrCapacity;
+    buffer->poolClass = -1;
+    buffer->pinned = true;
+    buffer->statsRequestedBytes = drv->statsEnabled ? size : 0;
+    nvStatsAdd(drv, NV_STAT_BUFFER_LIVE_REQUESTED_BYTES, size);
+    nvStatsAdd(drv, NV_STAT_BUFFER_LIVE_CAPACITY_BYTES, ptrCapacity);
+    nvStatsAdd(drv, NV_STAT_BUFFER_REQUESTED_BYTES, size);
+    nvStatsAdd(drv, NV_STAT_BUFFER_CAPACITY_BYTES, ptrCapacity);
+    nvStatsUpdateMemoryEstimates(drv);
+    return true;
+}
+
 static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
     if (buffer == NULL || buffer->ptr == NULL) {
         return;
@@ -3188,6 +3306,14 @@ static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
     nvStatsSubtract(drv, NV_STAT_BUFFER_LIVE_REQUESTED_BYTES, buffer->statsRequestedBytes);
     nvStatsSubtract(drv, NV_STAT_BUFFER_LIVE_CAPACITY_BYTES, buffer->capacity);
     buffer->statsRequestedBytes = 0;
+    if (buffer->pinned) {
+        releasePinnedImageMemory(drv, buffer->ptr, buffer->capacity);
+        buffer->ptr = NULL;
+        buffer->capacity = 0;
+        buffer->pinned = false;
+        nvStatsUpdateMemoryEstimates(drv);
+        return;
+    }
     bool pooled = false;
     if (buffer->poolClass >= 0 && buffer->poolClass < NVD_BUFFER_POOL_CLASS_COUNT) {
         const int poolClass = buffer->poolClass;
@@ -3202,7 +3328,8 @@ static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
             drv->bufferPoolBytes += buffer->capacity;
             pooled = true;
         }
-        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, drv->bufferPoolBytes);
+        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+                   drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
         pthread_mutex_unlock(&drv->bufferPoolMutex);
     }
     if (!pooled) {
@@ -3230,9 +3357,17 @@ static void destroyBufferPool(NVDriver *drv) {
         drv->bufferPoolCounts[i] = 0;
     }
     drv->bufferPoolBytes = 0;
+    void *pinned[ARRAY_SIZE(drv->pinnedImagePool)];
+    const uint32_t pinnedCount = drv->pinnedImagePoolCount;
+    memcpy(pinned, drv->pinnedImagePool, sizeof(pinned));
+    drv->pinnedImagePoolCount = 0;
+    drv->pinnedImagePoolBytes = 0;
     nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, 0);
     nvStatsUpdateMemoryEstimates(drv);
     pthread_mutex_unlock(&drv->bufferPoolMutex);
+    for (uint32_t i = 0; i < pinnedCount; i++) {
+        freePinnedHostMemory(drv, pinned[i]);
+    }
 }
 
 static VAStatus nvCreateBuffer(
@@ -5563,7 +5698,7 @@ static VAStatus nvCreateImage(
     imageBuffer->size = imageSize;
     imageBuffer->elementSize = imageSize;
     imageBuffer->elements = 1;
-    if (!allocateBufferMemory(drv, imageBuffer, imageBuffer->size)) {
+    if (!allocateImageBufferMemory(drv, imageBuffer, imageBuffer->size)) {
         deleteObject(drv, imageBufferObject->id);
         deleteObject(drv, imageObj->id);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -6762,6 +6897,7 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         goto fail;
     }
     cudaContextCreated = true;
+    loadPinnedHostFunctions(drv);
 
     //CHECK_CUDA_RESULT_RETURN(cv->cuvidCtxLockCreate(&drv->vidLock, drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 

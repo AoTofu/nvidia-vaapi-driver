@@ -1127,6 +1127,74 @@ static void testDecoderCapsCache(void) {
     cv = NULL;
 }
 
+static unsigned pinnedAllocs, pinnedFrees;
+static CUresult pinnedAlloc(void **ptr, size_t size) {
+    pinnedAllocs++;
+    *ptr = malloc(size);
+    return *ptr != NULL ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
+}
+static CUresult pinnedFree(void *ptr) {
+    pinnedFrees++;
+    free(ptr);
+    return CUDA_SUCCESS;
+}
+
+static VAImageID createTestImage(struct VADriverContext *driver, int width, bool pinned) {
+    VAImageFormat format = {.fourcc = VA_FOURCC_NV12};
+    VAImage image;
+    assert(nvCreateImage(driver, &format, width, 64, &image) == VA_STATUS_SUCCESS);
+    NVDriver *drv = driver->pDriverData;
+    NVImage *img = getObjectPtr(drv, OBJECT_TYPE_IMAGE, image.image_id);
+    assert(img != NULL && img->imageBuffer->pinned == pinned);
+    assert(((uint8_t *) img->imageBuffer->ptr)[image.data_size - 1] == 0);
+    return image.image_id;
+}
+
+static void testPinnedImagePool(void) {
+    CudaFunctions cuda = {.cuCtxPushCurrent = mockPush, .cuCtxPopCurrent = mockPop};
+    cu = &cuda;
+    pushFailure = 0;
+    pthread_rwlock_t objectLock, bufferLock, imageLock;
+    assert(pthread_rwlock_init(&objectLock, NULL) == 0);
+    assert(pthread_rwlock_init(&bufferLock, NULL) == 0);
+    assert(pthread_rwlock_init(&imageLock, NULL) == 0);
+    NVDriver drv = {.objectLifetimeLock = &objectLock, .bufferLifetimeLock = &bufferLock,
+                    .imageLifetimeLock = &imageLock, .cuMemAllocHost = pinnedAlloc,
+                    .cuMemFreeHost = pinnedFree, .bufferPoolMaxBytes = 64U << 20};
+    nvdObjectTableInit(&drv.objects);
+    assert(pthread_mutex_init(&drv.objectCreationMutex, NULL) == 0);
+    assert(pthread_mutex_init(&drv.bufferPoolMutex, NULL) == 0);
+    drv.bufferPoolMutexInitialized = true;
+    struct VADriverContext driver = {.pDriverData = &drv};
+
+    // One image per frame reuses a single page-locked allocation.
+    for (unsigned i = 0; i < 5; i++) {
+        assert(nvDestroyImage(&driver, createTestImage(&driver, 64, true)) == VA_STATUS_SUCCESS);
+    }
+    assert(pinnedAllocs == 1 && pinnedFrees == 0 && drv.pinnedImagePoolCount == 1);
+
+    // Four other sizes evict the oldest entry instead of growing the pool.
+    for (int width = 2048; width <= 5120; width += 1024) {
+        assert(nvDestroyImage(&driver, createTestImage(&driver, width, true)) == VA_STATUS_SUCCESS);
+    }
+    assert(pinnedAllocs == 5 && pinnedFrees == 1 && drv.pinnedImagePoolCount == 4);
+
+    // A zero budget disables page-locked images altogether.
+    drv.bufferPoolMaxBytes = 0;
+    assert(nvDestroyImage(&driver, createTestImage(&driver, 64, false)) == VA_STATUS_SUCCESS);
+    assert(pinnedAllocs == 5);
+
+    destroyBufferPool(&drv);
+    assert(pinnedFrees == 5 && drv.pinnedImagePoolCount == 0 && drv.pinnedImagePoolBytes == 0);
+    nvdObjectTableDestroy(&drv.objects);
+    pthread_mutex_destroy(&drv.bufferPoolMutex);
+    pthread_mutex_destroy(&drv.objectCreationMutex);
+    pthread_rwlock_destroy(&imageLock);
+    pthread_rwlock_destroy(&bufferLock);
+    pthread_rwlock_destroy(&objectLock);
+    cu = NULL;
+}
+
 int main(void) {
     testSecurityClearPatterns();
     testAV1SubmissionOrder();
@@ -1144,6 +1212,7 @@ int main(void) {
     testSharedSurfaceSubmission();
     testBufferDestroyDoesNotWaitForSync();
     testDecoderCapsCache();
+    testPinnedImagePool();
 #if NVD_TEST_VP9
     testVp9();
 #endif

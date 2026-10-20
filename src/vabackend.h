@@ -50,6 +50,8 @@ typedef struct
     void            *ptr;
     size_t          capacity;
     int8_t          poolClass;
+    // Page-locked memory from cuMemAllocHost (VAImage buffers only).
+    bool            pinned;
     size_t          statsRequestedBytes;
 } NVBuffer;
 
@@ -247,6 +249,15 @@ typedef struct _NVDriver
     NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
     uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
     uint64_t                bufferPoolBytes;
+    // Page-locked VAImage buffers kept for reuse; guarded by bufferPoolMutex.
+    // Clients create and destroy one image per downloaded frame, and
+    // allocating page-locked memory costs more than the copy it speeds up.
+    CUresult                (*cuMemAllocHost)(void **ptr, size_t size);
+    CUresult                (*cuMemFreeHost)(void *ptr);
+    void                    *pinnedImagePool[4];
+    size_t                  pinnedImagePoolSizes[4];
+    uint32_t                pinnedImagePoolCount;
+    uint64_t                pinnedImagePoolBytes;
     uint64_t                bufferPoolMaxBytes;
     Array/*<NVEGLImage>*/   images;
     const NVBackend         *backend;
