@@ -471,6 +471,10 @@ void logger(const char *filename, const char *function, int line, const char *ms
     fflush(LOG_OUTPUT);
 }
 
+bool nvdLogEnabled(void) {
+    return LOG_OUTPUT != NULL;
+}
+
 bool nvdLogDebugEnabled(void) {
     return LOG_DEBUG_ENABLED;
 }

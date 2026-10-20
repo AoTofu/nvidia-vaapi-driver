@@ -454,6 +454,7 @@ void nvBackingImageStoreSurfaceColorMetadata(BackingImage *img, const NVSurface 
 void nvBackingImageCopyColorMetadata(BackingImage *dst, const BackingImage *src);
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line);
 void logger(const char *filename, const char *function, int line, const char *msg, ...);
+bool nvdLogEnabled(void);
 bool nvdLogDebugEnabled(void);
 typedef enum {
     NVD_EXPORT_LAYOUT_PER_PLANE_NATURAL = 0,
