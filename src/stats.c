@@ -16,6 +16,8 @@ static const char *const timingNames[NV_TIMING_COUNT] = {
     "decode_submit_cpu", "queue_residence", "map_cpu", "export_cpu",
     "unmap_cpu", "shared_end_wait", "copy_wait_cpu", "lifetime_read_wait",
     "lifetime_write_wait", "security_clear_cpu", "av1_validation_cpu",
+    "buffer_lifetime_read_wait", "buffer_lifetime_write_wait",
+    "image_lifetime_read_wait", "image_lifetime_write_wait",
 };
 
 static void histogramAdd(NVTimingHistogram *histogram, uint64_t ns) {

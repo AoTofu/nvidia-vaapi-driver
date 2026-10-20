@@ -620,17 +620,19 @@ static void releaseObjectLifetimeGuard(NVDObjectLifetimeGuard *guard) {
     }
 }
 
-static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
-                                       NVDObjectLifetimeGuard *guard) {
-    if (drv == NULL || guard == NULL || drv->objectLifetimeLock == NULL) {
+static bool acquireLifetimeGuard(NVDriver *drv, void *rwlock, bool write,
+                                 NVTimingStage readStage,
+                                 NVTimingStage writeStage,
+                                 NVDObjectLifetimeGuard *guard) {
+    if (drv == NULL || guard == NULL || rwlock == NULL) {
         return false;
     }
-    pthread_rwlock_t *lock = drv->objectLifetimeLock;
+    pthread_rwlock_t *lock = rwlock;
     const uint64_t waitStart = nvStatsTimestamp(drv);
     const int result = write
         ? pthread_rwlock_wrlock(lock)
         : pthread_rwlock_rdlock(lock);
-    nvStatsRecord(drv, write ? NV_TIMING_LIFETIME_WRITE_WAIT : NV_TIMING_LIFETIME_READ_WAIT, waitStart);
+    nvStatsRecord(drv, write ? writeStage : readStage, waitStart);
     if (result != 0) {
         return false;
     }
@@ -638,11 +640,49 @@ static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
     return true;
 }
 
+static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
+                                       NVDObjectLifetimeGuard *guard) {
+    return acquireLifetimeGuard(drv, drv != NULL ? drv->objectLifetimeLock : NULL,
+                                write, NV_TIMING_LIFETIME_READ_WAIT,
+                                NV_TIMING_LIFETIME_WRITE_WAIT, guard);
+}
+
+static bool acquireBufferLifetimeGuard(NVDriver *drv, bool write,
+                                       NVDObjectLifetimeGuard *guard) {
+    return acquireLifetimeGuard(drv, drv != NULL ? drv->bufferLifetimeLock : NULL,
+                                write, NV_TIMING_BUFFER_LIFETIME_READ_WAIT,
+                                NV_TIMING_BUFFER_LIFETIME_WRITE_WAIT, guard);
+}
+
+static bool acquireImageLifetimeGuard(NVDriver *drv, bool write,
+                                      NVDObjectLifetimeGuard *guard) {
+    return acquireLifetimeGuard(drv, drv != NULL ? drv->imageLifetimeLock : NULL,
+                                write, NV_TIMING_IMAGE_LIFETIME_READ_WAIT,
+                                NV_TIMING_IMAGE_LIFETIME_WRITE_WAIT, guard);
+}
+
 #define NVD_OBJECT_LIFETIME_GUARD(drv, write)                         \
     NVDObjectLifetimeGuard lifetimeGuard                              \
         __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 }; \
     if (!acquireObjectLifetimeGuard((drv), (write), &lifetimeGuard)) { \
         return VA_STATUS_ERROR_OPERATION_FAILED;                      \
+    }
+
+// Both must follow NVD_OBJECT_LIFETIME_GUARD(drv, false); when both are needed
+// the image guard comes first. Destroying a buffer or an image takes these for
+// writing instead of the object write lock.
+#define NVD_BUFFER_LIFETIME_GUARD(drv, write)                               \
+    NVDObjectLifetimeGuard bufferLifetimeGuard                              \
+        __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 };       \
+    if (!acquireBufferLifetimeGuard((drv), (write), &bufferLifetimeGuard)) { \
+        return VA_STATUS_ERROR_OPERATION_FAILED;                            \
+    }
+
+#define NVD_IMAGE_LIFETIME_GUARD(drv, write)                               \
+    NVDObjectLifetimeGuard imageLifetimeGuard                              \
+        __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 };      \
+    if (!acquireImageLifetimeGuard((drv), (write), &imageLifetimeGuard)) { \
+        return VA_STATUS_ERROR_OPERATION_FAILED;                           \
     }
 
 static void deleteObject(NVDriver *drv, VAGenericID id) {
@@ -3202,6 +3242,7 @@ static VAStatus nvMapBuffer(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, false);
     if (pbuf == NULL) {
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
@@ -3222,6 +3263,7 @@ static VAStatus nvUnmapBuffer(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, false);
     return getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id) != NULL
         ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_BUFFER;
 }
@@ -3232,7 +3274,8 @@ static VAStatus nvDestroyBuffer(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
-    NVD_OBJECT_LIFETIME_GUARD(drv, true);
+    NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, true);
     NVBuffer *buf = getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffer_id);
 
     if (buf == NULL) {
@@ -4798,14 +4841,24 @@ static VAStatus nvRenderPictureImpl(
     if (nvCtx->entrypoint == VAEntrypointVideoProc) {
         bool processed = false;
         for (int i = 0; i < num_buffers; i++) {
+            // Snapshot the pipeline parameters so the buffer lock is not held
+            // across the GPU conversion and its completion wait.
+            VAProcPipelineParameterBuffer pipelineCopy;
+            NVDObjectLifetimeGuard bufferGuard = { 0 };
+            if (!acquireBufferLifetimeGuard(drv, false, &bufferGuard)) {
+                cancelCurrentPictureResolve(nvCtx);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
             NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
             if (buf == NULL) {
+                releaseObjectLifetimeGuard(&bufferGuard);
                 cancelCurrentPictureResolve(nvCtx);
                 return VA_STATUS_ERROR_INVALID_BUFFER;
             }
             if (buf->ownerContextId != context) {
                 LOG("VideoProc buffer %d belongs to context %d, not %d",
                     buffers[i], buf->ownerContextId, context);
+                releaseObjectLifetimeGuard(&bufferGuard);
                 cancelCurrentPictureResolve(nvCtx);
                 return VA_STATUS_ERROR_INVALID_BUFFER;
             }
@@ -4814,13 +4867,16 @@ static VAStatus nvRenderPictureImpl(
                 buf->elementSize < sizeof(VAProcPipelineParameterBuffer) ||
                 buf->ptr == NULL) {
                 LOG("Invalid VideoProc buffer detected: %d", buffers[i]);
+                releaseObjectLifetimeGuard(&bufferGuard);
                 cancelCurrentPictureResolve(nvCtx);
                 return VA_STATUS_ERROR_INVALID_PARAMETER;
             }
+            memcpy(&pipelineCopy, buf->ptr, sizeof(pipelineCopy));
+            releaseObjectLifetimeGuard(&bufferGuard);
 
             nvStatsIncrement(drv, NV_STAT_VIDEOPROC_REQUESTS);
             processed = true;
-            VAProcPipelineParameterBuffer *pipeline = (VAProcPipelineParameterBuffer*) buf->ptr;
+            const VAProcPipelineParameterBuffer *pipeline = &pipelineCopy;
             NVSurface *src = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, pipeline->surface);
             const uint64_t videoProcStart = nvStatsTimestamp(drv);
             // copySurfaceBackingImage always clears the render target's resolving
@@ -4845,6 +4901,13 @@ static VAStatus nvRenderPictureImpl(
     }
 
     CUVIDPICPARAMS *picParams = &nvCtx->pPicParams;
+
+    NVDObjectLifetimeGuard bufferGuard
+        __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 };
+    if (!acquireBufferLifetimeGuard(drv, false, &bufferGuard)) {
+        cancelCurrentPictureResolve(nvCtx);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
 
     for (int i = 0; i < num_buffers; i++) {
         NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
@@ -5481,7 +5544,9 @@ static VAStatus nvDestroyImage(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
-    NVD_OBJECT_LIFETIME_GUARD(drv, true);
+    NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_IMAGE_LIFETIME_GUARD(drv, true);
+    NVD_BUFFER_LIFETIME_GUARD(drv, true);
     NVImage *img = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
 
     if (img == NULL) {
@@ -5527,12 +5592,25 @@ static VAStatus nvGetImage(
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
 
     NVSurface *surfaceObj = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
-    NVImage *imageObj = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
 
     if (surfaceObj == NULL) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
+    if (getObjectPtr(drv, OBJECT_TYPE_IMAGE, image) == NULL) {
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
+
+    //wait for the surface to be decoded
+    const VAStatus syncStatus = nvSyncSurface(ctx, surface);
+    if (syncStatus != VA_STATUS_SUCCESS) {
+        return syncStatus;
+    }
+
+    // Look the image up again under the image lock: it may have been
+    // destroyed while this thread waited for the decode above.
+    NVD_IMAGE_LIFETIME_GUARD(drv, false);
+    NVImage *imageObj = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
     if (imageObj == NULL) {
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
@@ -5545,12 +5623,6 @@ static VAStatus nvGetImage(
         (uint64_t) (unsigned int) y + height > surfaceObj->height ||
         width > imageObj->width || height > imageObj->height) {
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    }
-
-    //wait for the surface to be decoded
-    const VAStatus syncStatus = nvSyncSurface(ctx, surface);
-    if (syncStatus != VA_STATUS_SUCCESS) {
-        return syncStatus;
     }
 
     BackingImage *backingImage = surfaceObj->backingImage;
@@ -6032,6 +6104,7 @@ static VAStatus nvBufferInfo(
     }
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, false);
     NVBuffer *buffer = getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
     if (buffer == NULL || buffer->elementSize > UINT_MAX) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -6338,6 +6411,16 @@ static VAStatus nvTerminate( VADriverContextP ctx )
     pthread_mutex_destroy(&drv->exportMutex);
     pthread_mutex_destroy(&drv->imagesMutex);
     pthread_mutex_destroy(&drv->objectCreationMutex);
+    if (drv->imageLifetimeLock != NULL) {
+        pthread_rwlock_destroy(drv->imageLifetimeLock);
+        free(drv->imageLifetimeLock);
+        drv->imageLifetimeLock = NULL;
+    }
+    if (drv->bufferLifetimeLock != NULL) {
+        pthread_rwlock_destroy(drv->bufferLifetimeLock);
+        free(drv->bufferLifetimeLock);
+        drv->bufferLifetimeLock = NULL;
+    }
     if (drv->objectLifetimeLock != NULL) {
         pthread_rwlock_destroy(drv->objectLifetimeLock);
         free(drv->objectLifetimeLock);
@@ -6459,6 +6542,8 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     nvdObjectTableInit(&drv->objects);
     ctx->pDriverData = drv;
     bool objectLifetimeLockInitialized = false;
+    bool bufferLifetimeLockInitialized = false;
+    bool imageLifetimeLockInitialized = false;
     bool objectMutexInitialized = false;
     bool imagesMutexInitialized = false;
     bool exportMutexInitialized = false;
@@ -6537,6 +6622,24 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         goto fail;
     }
     objectLifetimeLockInitialized = true;
+
+    drv->bufferLifetimeLock = calloc(1, sizeof(pthread_rwlock_t));
+    if (drv->bufferLifetimeLock == NULL ||
+        pthread_rwlock_init(drv->bufferLifetimeLock, NULL) != 0) {
+        free(drv->bufferLifetimeLock);
+        drv->bufferLifetimeLock = NULL;
+        goto fail;
+    }
+    bufferLifetimeLockInitialized = true;
+
+    drv->imageLifetimeLock = calloc(1, sizeof(pthread_rwlock_t));
+    if (drv->imageLifetimeLock == NULL ||
+        pthread_rwlock_init(drv->imageLifetimeLock, NULL) != 0) {
+        free(drv->imageLifetimeLock);
+        drv->imageLifetimeLock = NULL;
+        goto fail;
+    }
+    imageLifetimeLockInitialized = true;
 
     pthread_mutexattr_t attrib;
     if (pthread_mutexattr_init(&attrib) != 0) {
@@ -6621,6 +6724,16 @@ fail:
     }
     if (objectMutexInitialized) {
         pthread_mutex_destroy(&drv->objectCreationMutex);
+    }
+    if (imageLifetimeLockInitialized) {
+        pthread_rwlock_destroy(drv->imageLifetimeLock);
+        free(drv->imageLifetimeLock);
+        drv->imageLifetimeLock = NULL;
+    }
+    if (bufferLifetimeLockInitialized) {
+        pthread_rwlock_destroy(drv->bufferLifetimeLock);
+        free(drv->bufferLifetimeLock);
+        drv->bufferLifetimeLock = NULL;
     }
     if (objectLifetimeLockInitialized) {
         pthread_rwlock_destroy(drv->objectLifetimeLock);

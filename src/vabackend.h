@@ -217,6 +217,15 @@ typedef struct _NVDriver
     // Opaque here so users of this shared header do not need POSIX rwlock
     // feature-test macros; vabackend.c owns the pthread_rwlock_t allocation.
     void                    *objectLifetimeLock;
+    // Narrower barrier for VABuffer/VAImage memory, taken after the object
+    // lifetime read lock. Buffers and images are destroyed several times per
+    // frame; taking the object write lock for that would wait for every
+    // in-flight SyncSurface/EndPicture of every other decoder on the display.
+    void                    *bufferLifetimeLock;
+    // Same for VAImage objects, so a long GetImage download does not hold
+    // up decode buffer destruction. Destroying an image takes this lock and
+    // then bufferLifetimeLock, since it also frees the image's buffer.
+    void                    *imageLifetimeLock;
     pthread_mutex_t         objectCreationMutex;
     bool                    terminating;
     bool                    useCorrectNV12Format;

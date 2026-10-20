@@ -985,6 +985,110 @@ static void testTimingHistograms(void) {
     assert(shared == 1 && private == 0);
 }
 
+typedef struct {
+    struct VADriverContext *driver;
+    VAGenericID id;
+    VAStatus status;
+    sem_t done;
+} LifetimeCall;
+
+static void *syncSurfaceCall(void *opaque) {
+    LifetimeCall *call = opaque;
+    call->status = nvSyncSurface(call->driver, call->id);
+    assert(sem_post(&call->done) == 0);
+    return NULL;
+}
+
+static void *bufferAndImageChurn(void *opaque) {
+    LifetimeCall *call = opaque;
+    VABufferID buffer = VA_INVALID_ID;
+    call->status = nvCreateBuffer(call->driver, call->id, VAPictureParameterBufferType,
+                                  64, 1, NULL, &buffer);
+    if (call->status == VA_STATUS_SUCCESS)
+        call->status = nvDestroyBuffer(call->driver, buffer);
+    VAImageFormat format = {.fourcc = VA_FOURCC_NV12};
+    VAImage image;
+    if (call->status == VA_STATUS_SUCCESS)
+        call->status = nvCreateImage(call->driver, &format, 64, 64, &image);
+    if (call->status == VA_STATUS_SUCCESS)
+        call->status = nvDestroyImage(call->driver, image.image_id);
+    assert(sem_post(&call->done) == 0);
+    return NULL;
+}
+
+static bool waitWithin(sem_t *sem, long ms) {
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int result;
+    do { result = sem_timedwait(sem, &deadline); } while (result != 0 && errno == EINTR);
+    return result == 0;
+}
+
+static void testBufferDestroyDoesNotWaitForSync(void) {
+    // Decoders destroy several VA buffers per frame. That must not queue
+    // behind another thread's SyncSurface, which may wait for a whole decode.
+    pthread_rwlock_t objectLock, bufferLock, imageLock;
+    assert(pthread_rwlock_init(&objectLock, NULL) == 0);
+    assert(pthread_rwlock_init(&bufferLock, NULL) == 0);
+    assert(pthread_rwlock_init(&imageLock, NULL) == 0);
+    NVDriver drv = {.objectLifetimeLock = &objectLock,
+                    .bufferLifetimeLock = &bufferLock,
+                    .imageLifetimeLock = &imageLock};
+    nvdObjectTableInit(&drv.objects);
+    assert(pthread_mutex_init(&drv.objectCreationMutex, NULL) == 0);
+    assert(pthread_mutex_init(&drv.bufferPoolMutex, NULL) == 0);
+    drv.bufferPoolMutexInitialized = true;
+    struct VADriverContext driver = {.pDriverData = &drv};
+    Object contextObject = allocateObject(&drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
+    Object surfaceObject = allocateObject(&drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
+    assert(contextObject != NULL && surfaceObject != NULL);
+    NVSurface *surface = surfaceObject->obj;
+    assert(pthread_mutex_init(&surface->mutex, NULL) == 0);
+    assert(pthread_cond_init(&surface->cond, NULL) == 0);
+    setSurfaceResolving(surface, true);
+
+    LifetimeCall sync = {.driver = &driver, .id = surfaceObject->id};
+    LifetimeCall churn = {.driver = &driver, .id = contextObject->id};
+    assert(sem_init(&sync.done, 0, 0) == 0 && sem_init(&churn.done, 0, 0) == 0);
+    pthread_t syncThread, churnThread;
+    assert(pthread_create(&syncThread, NULL, syncSurfaceCall, &sync) == 0);
+    // Wait until the sync call holds the object lifetime read lock.
+    while (pthread_rwlock_trywrlock(&objectLock) == 0) {
+        assert(pthread_rwlock_unlock(&objectLock) == 0);
+        sched_yield();
+    }
+    assert(!waitWithin(&sync.done, 20));
+    assert(pthread_create(&churnThread, NULL, bufferAndImageChurn, &churn) == 0);
+    assert(waitWithin(&churn.done, 2000));
+    assert(churn.status == VA_STATUS_SUCCESS);
+    assert(pthread_join(churnThread, NULL) == 0);
+
+    setSurfaceResolving(surface, false);
+    assert(waitWithin(&sync.done, 2000));
+    assert(pthread_join(syncThread, NULL) == 0);
+    assert(sync.status == VA_STATUS_SUCCESS);
+
+    sem_destroy(&sync.done);
+    sem_destroy(&churn.done);
+    destroyBufferPool(&drv);
+    pthread_cond_destroy(&surface->cond);
+    pthread_mutex_destroy(&surface->mutex);
+    deleteObject(&drv, surfaceObject->id);
+    deleteObject(&drv, contextObject->id);
+    nvdObjectTableDestroy(&drv.objects);
+    pthread_mutex_destroy(&drv.bufferPoolMutex);
+    pthread_mutex_destroy(&drv.objectCreationMutex);
+    pthread_rwlock_destroy(&imageLock);
+    pthread_rwlock_destroy(&bufferLock);
+    pthread_rwlock_destroy(&objectLock);
+}
+
 int main(void) {
     testSecurityClearPatterns();
     testAV1SubmissionOrder();
@@ -1000,6 +1104,7 @@ int main(void) {
     testVideoProcCompletionFailures();
     testVideoProcSameFormatBlit();
     testSharedSurfaceSubmission();
+    testBufferDestroyDoesNotWaitForSync();
 #if NVD_TEST_VP9
     testVp9();
 #endif
