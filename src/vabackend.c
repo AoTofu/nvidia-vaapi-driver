@@ -3464,6 +3464,9 @@ static VAStatus nvMapBuffer(
     if (buf == NULL) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
+    if (atomic_exchange(&buf->needsZero, false)) {
+        memset(buf->ptr, 0, buf->size);
+    }
     *pbuf = buf->ptr;
 
     return VA_STATUS_SUCCESS;
@@ -5703,7 +5706,7 @@ static VAStatus nvCreateImage(
         deleteObject(drv, imageObj->id);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
-    memset(imageBuffer->ptr, 0, imageBuffer->size);
+    atomic_store(&imageBuffer->needsZero, true);
 
     img->imageBuffer = imageBuffer;
     img->imageBufferId = imageBufferObject->id;
@@ -5863,6 +5866,15 @@ static VAStatus nvGetImage(
         }
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
+    // A download of the whole image writes every byte of its buffer (planes
+    // are packed with pitch == row size), so only a partial one needs the
+    // deferred zero fill first.
+    NVBuffer *imageBuffer = imageObj->imageBuffer;
+    const bool wholeImage = x == 0 && y == 0 &&
+        width == imageObj->width && height == imageObj->height;
+    if (!wholeImage && atomic_exchange(&imageBuffer->needsZero, false)) {
+        memset(imageBuffer->ptr, 0, imageBuffer->size);
+    }
     size_t destinationOffset = 0;
     VAStatus status = VA_STATUS_SUCCESS;
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
@@ -5905,6 +5917,9 @@ static VAStatus nvGetImage(
         }
         destinationOffset += destinationPitch *
             nvPlaneExtent(imageObj->height, p->ss.y);
+    }
+    if (wholeImage && status == VA_STATUS_SUCCESS) {
+        atomic_store(&imageBuffer->needsZero, false);
     }
     CUresult popResult = cu->cuCtxPopCurrent(NULL);
     if (popResult != CUDA_SUCCESS) {

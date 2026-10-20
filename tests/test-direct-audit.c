@@ -1146,7 +1146,13 @@ static VAImageID createTestImage(struct VADriverContext *driver, int width, bool
     NVDriver *drv = driver->pDriverData;
     NVImage *img = getObjectPtr(drv, OBJECT_TYPE_IMAGE, image.image_id);
     assert(img != NULL && img->imageBuffer->pinned == pinned);
-    assert(((uint8_t *) img->imageBuffer->ptr)[image.data_size - 1] == 0);
+    // Pooled memory still holds the previous image; mapping must zero it.
+    uint8_t *data = NULL;
+    assert(nvMapBuffer(driver, image.buf, (void **) &data) == VA_STATUS_SUCCESS);
+    for (uint32_t i = 0; i < image.data_size; i++) assert(data[i] == 0);
+    memset(data, 0xab, image.data_size);
+    assert(nvMapBuffer(driver, image.buf, (void **) &data) == VA_STATUS_SUCCESS);
+    assert(data[0] == 0xab);
     return image.image_id;
 }
 

@@ -52,6 +52,10 @@ typedef struct
     int8_t          poolClass;
     // Page-locked memory from cuMemAllocHost (VAImage buffers only).
     bool            pinned;
+    // VAImage data not yet written by a whole-image vaGetImage. It is zeroed
+    // on the first vaMapBuffer or partial vaGetImage instead of at creation,
+    // since a full download overwrites every byte anyway.
+    atomic_bool     needsZero;
     size_t          statsRequestedBytes;
 } NVBuffer;
 
