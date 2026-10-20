@@ -471,6 +471,10 @@ void logger(const char *filename, const char *function, int line, const char *ms
     fflush(LOG_OUTPUT);
 }
 
+bool nvdLogEnabled(void) {
+    return LOG_OUTPUT != NULL;
+}
+
 bool nvdLogDebugEnabled(void) {
     return LOG_DEBUG_ENABLED;
 }
@@ -525,6 +529,22 @@ static uint32_t parseDecodeSurfaceOverride(bool *automatic) {
 // cache size race with whatever else the GPU is running. ffnvcodec's loader
 // doesn't expose cuDeviceTotalMem, so resolve it from the already-loaded
 // libcuda; if anything fails, fall back to the fixed default.
+// ffnvcodec's loader does not expose the page-locked host allocator.
+static void loadPinnedHostFunctions(NVDriver *drv) {
+    void *libcuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (libcuda == NULL) {
+        return;
+    }
+    // libcuda stays loaded through cuda_load_functions' own reference.
+    drv->cuMemAllocHost = (CUresult (*)(void **, size_t)) dlsym(libcuda, "cuMemAllocHost_v2");
+    drv->cuMemFreeHost = (CUresult (*)(void *)) dlsym(libcuda, "cuMemFreeHost");
+    if (drv->cuMemAllocHost == NULL || drv->cuMemFreeHost == NULL) {
+        drv->cuMemAllocHost = NULL;
+        drv->cuMemFreeHost = NULL;
+    }
+    dlclose(libcuda);
+}
+
 static uint64_t defaultMaxDetachedBackingImageBytes(int cudaGpuId) {
     typedef CUresult CUDAAPI tcuDeviceTotalMem_l(size_t *bytes, CUdevice dev);
 
@@ -620,17 +640,19 @@ static void releaseObjectLifetimeGuard(NVDObjectLifetimeGuard *guard) {
     }
 }
 
-static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
-                                       NVDObjectLifetimeGuard *guard) {
-    if (drv == NULL || guard == NULL || drv->objectLifetimeLock == NULL) {
+static bool acquireLifetimeGuard(NVDriver *drv, void *rwlock, bool write,
+                                 NVTimingStage readStage,
+                                 NVTimingStage writeStage,
+                                 NVDObjectLifetimeGuard *guard) {
+    if (drv == NULL || guard == NULL || rwlock == NULL) {
         return false;
     }
-    pthread_rwlock_t *lock = drv->objectLifetimeLock;
+    pthread_rwlock_t *lock = rwlock;
     const uint64_t waitStart = nvStatsTimestamp(drv);
     const int result = write
         ? pthread_rwlock_wrlock(lock)
         : pthread_rwlock_rdlock(lock);
-    nvStatsRecord(drv, write ? NV_TIMING_LIFETIME_WRITE_WAIT : NV_TIMING_LIFETIME_READ_WAIT, waitStart);
+    nvStatsRecord(drv, write ? writeStage : readStage, waitStart);
     if (result != 0) {
         return false;
     }
@@ -638,11 +660,49 @@ static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
     return true;
 }
 
+static bool acquireObjectLifetimeGuard(NVDriver *drv, bool write,
+                                       NVDObjectLifetimeGuard *guard) {
+    return acquireLifetimeGuard(drv, drv != NULL ? drv->objectLifetimeLock : NULL,
+                                write, NV_TIMING_LIFETIME_READ_WAIT,
+                                NV_TIMING_LIFETIME_WRITE_WAIT, guard);
+}
+
+static bool acquireBufferLifetimeGuard(NVDriver *drv, bool write,
+                                       NVDObjectLifetimeGuard *guard) {
+    return acquireLifetimeGuard(drv, drv != NULL ? drv->bufferLifetimeLock : NULL,
+                                write, NV_TIMING_BUFFER_LIFETIME_READ_WAIT,
+                                NV_TIMING_BUFFER_LIFETIME_WRITE_WAIT, guard);
+}
+
+static bool acquireImageLifetimeGuard(NVDriver *drv, bool write,
+                                      NVDObjectLifetimeGuard *guard) {
+    return acquireLifetimeGuard(drv, drv != NULL ? drv->imageLifetimeLock : NULL,
+                                write, NV_TIMING_IMAGE_LIFETIME_READ_WAIT,
+                                NV_TIMING_IMAGE_LIFETIME_WRITE_WAIT, guard);
+}
+
 #define NVD_OBJECT_LIFETIME_GUARD(drv, write)                         \
     NVDObjectLifetimeGuard lifetimeGuard                              \
         __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 }; \
     if (!acquireObjectLifetimeGuard((drv), (write), &lifetimeGuard)) { \
         return VA_STATUS_ERROR_OPERATION_FAILED;                      \
+    }
+
+// Both must follow NVD_OBJECT_LIFETIME_GUARD(drv, false); when both are needed
+// the image guard comes first. Destroying a buffer or an image takes these for
+// writing instead of the object write lock.
+#define NVD_BUFFER_LIFETIME_GUARD(drv, write)                               \
+    NVDObjectLifetimeGuard bufferLifetimeGuard                              \
+        __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 };       \
+    if (!acquireBufferLifetimeGuard((drv), (write), &bufferLifetimeGuard)) { \
+        return VA_STATUS_ERROR_OPERATION_FAILED;                            \
+    }
+
+#define NVD_IMAGE_LIFETIME_GUARD(drv, write)                               \
+    NVDObjectLifetimeGuard imageLifetimeGuard                              \
+        __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 };      \
+    if (!acquireImageLifetimeGuard((drv), (write), &imageLifetimeGuard)) { \
+        return VA_STATUS_ERROR_OPERATION_FAILED;                           \
     }
 
 static void deleteObject(NVDriver *drv, VAGenericID id) {
@@ -1129,7 +1189,75 @@ static cudaVideoCodec vaToCuCodec(VAProfile profile) {
     return cudaVideoCodec_NONE;
 }
 
-static bool doesGPUSupportCodec(cudaVideoCodec codec, int bitDepth, cudaVideoChromaFormat chromaFormat, uint32_t *width, uint32_t *height)
+// cuvidGetDecoderCaps costs ~6 ms per call (RTX 5080, 615.78) and the answer
+// is fixed for a GPU, yet vaInitialize alone asks for ~20 tuples and clients
+// such as Chrome re-ask per profile through GetConfigAttributes and
+// QuerySurfaceAttributes. Remember successful answers for the process.
+typedef struct {
+    int gpu;
+    CUVIDDECODECAPS caps;
+} CachedDecodeCaps;
+
+static pthread_mutex_t decodeCapsMutex = PTHREAD_MUTEX_INITIALIZER;
+static CachedDecodeCaps decodeCapsCache[64];
+static unsigned int decodeCapsCount;
+
+static bool lookupCachedDecodeCaps(int gpu, CUVIDDECODECAPS *caps) {
+    bool found = false;
+    pthread_mutex_lock(&decodeCapsMutex);
+    for (unsigned int i = 0; i < decodeCapsCount; i++) {
+        const CachedDecodeCaps *entry = &decodeCapsCache[i];
+        if (entry->gpu == gpu &&
+            entry->caps.eCodecType == caps->eCodecType &&
+            entry->caps.eChromaFormat == caps->eChromaFormat &&
+            entry->caps.nBitDepthMinus8 == caps->nBitDepthMinus8) {
+            *caps = entry->caps;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&decodeCapsMutex);
+    return found;
+}
+
+static void storeCachedDecodeCaps(int gpu, const CUVIDDECODECAPS *caps) {
+    pthread_mutex_lock(&decodeCapsMutex);
+    bool present = false;
+    for (unsigned int i = 0; i < decodeCapsCount && !present; i++) {
+        const CachedDecodeCaps *entry = &decodeCapsCache[i];
+        present = entry->gpu == gpu &&
+            entry->caps.eCodecType == caps->eCodecType &&
+            entry->caps.eChromaFormat == caps->eChromaFormat &&
+            entry->caps.nBitDepthMinus8 == caps->nBitDepthMinus8;
+    }
+    if (!present && decodeCapsCount < ARRAY_SIZE(decodeCapsCache)) {
+        decodeCapsCache[decodeCapsCount].gpu = gpu;
+        decodeCapsCache[decodeCapsCount].caps = *caps;
+        decodeCapsCount++;
+    }
+    pthread_mutex_unlock(&decodeCapsMutex);
+}
+
+// The caller must have the driver's CUDA context current. Only the codec,
+// chroma format and bit depth of caps are inputs; the rest is overwritten.
+static CUresult getDecoderCaps(const NVDriver *drv, CUVIDDECODECAPS *caps) {
+    const CUVIDDECODECAPS request = {
+        .eCodecType      = caps->eCodecType,
+        .eChromaFormat   = caps->eChromaFormat,
+        .nBitDepthMinus8 = caps->nBitDepthMinus8,
+    };
+    *caps = request;
+    if (lookupCachedDecodeCaps(drv->cudaGpuId, caps)) {
+        return CUDA_SUCCESS;
+    }
+    const CUresult result = cv->cuvidGetDecoderCaps(caps);
+    if (result == CUDA_SUCCESS) {
+        storeCachedDecodeCaps(drv->cudaGpuId, caps);
+    }
+    return result;
+}
+
+static bool doesGPUSupportCodec(const NVDriver *drv, cudaVideoCodec codec, int bitDepth, cudaVideoChromaFormat chromaFormat, uint32_t *width, uint32_t *height)
 {
     CUVIDDECODECAPS videoDecodeCaps = {
         .eCodecType      = codec,
@@ -1137,7 +1265,7 @@ static bool doesGPUSupportCodec(cudaVideoCodec codec, int bitDepth, cudaVideoChr
         .nBitDepthMinus8 = bitDepth - 8
     };
 
-    CHECK_CUDA_RESULT_RETURN(cv->cuvidGetDecoderCaps(&videoDecodeCaps), false);
+    CHECK_CUDA_RESULT_RETURN(getDecoderCaps(drv, &videoDecodeCaps), false);
 
     if (width != NULL) {
         *width = videoDecodeCaps.nMaxWidth;
@@ -1210,7 +1338,7 @@ static VAStatus queryProfileDecodeCaps(NVDriver *drv, VAProfile profile,
     if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
-    const CUresult capsResult = cv->cuvidGetDecoderCaps(caps);
+    const CUresult capsResult = getDecoderCaps(drv, caps);
     const CUresult popResult = cu->cuCtxPopCurrent(NULL);
     if (CHECK_CUDA_RESULT(capsResult) || CHECK_CUDA_RESULT(popResult)) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -1367,79 +1495,83 @@ static VAStatus nvQueryConfigProfiles2(
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
     int profiles = 0;
-    if (doesGPUSupportCodec(cudaVideoCodec_MPEG2, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_MPEG2, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileMPEG2Simple;
         profile_list[profiles++] = VAProfileMPEG2Main;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_MPEG4, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_MPEG4, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileMPEG4Simple;
         profile_list[profiles++] = VAProfileMPEG4AdvancedSimple;
         profile_list[profiles++] = VAProfileMPEG4Main;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_VC1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_VC1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileVC1Simple;
         profile_list[profiles++] = VAProfileVC1Main;
         profile_list[profiles++] = VAProfileVC1Advanced;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_H264, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_H264, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264Main;
         profile_list[profiles++] = VAProfileH264High;
         profile_list[profiles++] = VAProfileH264ConstrainedBaseline;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_JPEG, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_JPEG, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileJPEGBaseline;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_H264_SVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    // No codec module decodes these yet and they are filtered out below; skip
+    // their ~6 ms capability queries.
+    if (vaToCuCodec(VAProfileH264StereoHigh) != cudaVideoCodec_NONE &&
+        doesGPUSupportCodec(drv, cudaVideoCodec_H264_SVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264StereoHigh;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_H264_MVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (vaToCuCodec(VAProfileH264MultiviewHigh) != cudaVideoCodec_NONE &&
+        doesGPUSupportCodec(drv, cudaVideoCodec_H264_MVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileH264MultiviewHigh;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileHEVCMain;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_VP8, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_VP8, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileVP8Version0_3;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileVP9Profile0; //color depth: 8 bit, 4:2:0
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_420, NULL, NULL)) {
         profile_list[profiles++] = VAProfileAV1Profile0;
     }
 
     if (drv->supports16BitSurface) {
-        if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
             profile_list[profiles++] = VAProfileHEVCMain10;
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_420, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_420, NULL, NULL)) {
             profile_list[profiles++] = VAProfileHEVCMain12;
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_420, NULL, NULL)) {
             profile_list[profiles++] = VAProfileVP9Profile2; //color depth: 10–12 bit, 4:2:0
         }
     }
 
     if (drv->supports444Surface) {
-        if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
             profile_list[profiles++] = VAProfileHEVCMain444;
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
             profile_list[profiles++] = VAProfileVP9Profile1; //color depth: 8 bit, 4:2:2, 4:4:0, 4:4:4
         }
-        if (doesGPUSupportCodec(cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
+        if (doesGPUSupportCodec(drv, cudaVideoCodec_AV1, 8, cudaVideoChromaFormat_444, NULL, NULL)) {
             profile_list[profiles++] = VAProfileAV1Profile1;
         }
 
 #if VA_CHECK_VERSION(1, 20, 0)
         if (drv->supports16BitSurface) {
-            if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
+            if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
                 profile_list[profiles++] = VAProfileHEVCMain444_10;
             }
-            if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_444, NULL, NULL)) {
+            if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_444, NULL, NULL)) {
                 profile_list[profiles++] = VAProfileHEVCMain444_12;
             }
-            if (doesGPUSupportCodec(cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
+            if (doesGPUSupportCodec(drv, cudaVideoCodec_VP9, 10, cudaVideoChromaFormat_444, NULL, NULL)) {
                 profile_list[profiles++] = VAProfileVP9Profile3; //color depth: 10–12 bit, 4:2:2, 4:4:0, 4:4:4
             }
         }
@@ -1448,10 +1580,10 @@ static VAStatus nvQueryConfigProfiles2(
 
     // Nvidia decoder doesn't support 422 chroma layout
 #if 0
-    if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_422, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_422, NULL, NULL)) {
         profile_list[profiles++] = VAProfileHEVCMain422_10;
     }
-    if (doesGPUSupportCodec(cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_422, NULL, NULL)) {
+    if (doesGPUSupportCodec(drv, cudaVideoCodec_HEVC, 12, cudaVideoChromaFormat_422, NULL, NULL)) {
         profile_list[profiles++] = VAProfileHEVCMain422_12;
     }
 #endif
@@ -1526,6 +1658,7 @@ static VAStatus nvGetConfigAttributes(
                 }
             } else {
                 LOG("unhandled vpp config attribute: %d", attrib_list[i].type);
+                attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
             }
         }
         return VA_STATUS_SUCCESS;
@@ -1610,6 +1743,7 @@ static VAStatus nvGetConfigAttributes(
         else
         {
             LOG("unhandled config attribute: %d", attrib_list[i].type);
+            attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
         }
     }
 
@@ -3036,7 +3170,8 @@ static bool allocateBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
             drv->bufferPoolBytes -= capacity;
             buffer->ptr = block;
         }
-        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, drv->bufferPoolBytes);
+        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+                   drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
         pthread_mutex_unlock(&drv->bufferPoolMutex);
     }
 
@@ -3063,6 +3198,107 @@ static bool allocateBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
     return true;
 }
 
+static void freePinnedHostMemory(NVDriver *drv, void *ptr) {
+    if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
+        return;
+    }
+    CHECK_CUDA_RESULT(drv->cuMemFreeHost(ptr));
+    CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+}
+
+static void releasePinnedImageMemory(NVDriver *drv, void *ptr, size_t capacity) {
+    pthread_mutex_lock(&drv->bufferPoolMutex);
+    if (drv->pinnedImagePoolCount < ARRAY_SIZE(drv->pinnedImagePool) &&
+        capacity <= drv->bufferPoolMaxBytes &&
+        drv->pinnedImagePoolBytes <= drv->bufferPoolMaxBytes - capacity) {
+        drv->pinnedImagePool[drv->pinnedImagePoolCount] = ptr;
+        drv->pinnedImagePoolSizes[drv->pinnedImagePoolCount] = capacity;
+        drv->pinnedImagePoolCount++;
+        drv->pinnedImagePoolBytes += capacity;
+        ptr = NULL;
+    }
+    nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+               drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
+    pthread_mutex_unlock(&drv->bufferPoolMutex);
+    if (ptr != NULL) {
+        freePinnedHostMemory(drv, ptr);
+    }
+}
+
+// Backs a VAImage with page-locked memory so vaGetImage copies straight from
+// the GPU instead of through the CUDA driver's pageable staging buffers.
+// Falls back to ordinary memory when page-locked memory is unavailable.
+static bool allocateImageBufferMemory(NVDriver *drv, NVBuffer *buffer, size_t size) {
+    // Round so that slightly different image sizes can share pool entries.
+    const size_t granularity = 64U * 1024U;
+    if (drv->cuMemAllocHost == NULL || drv->cuMemFreeHost == NULL ||
+        size == 0 || size > SIZE_MAX - granularity) {
+        return allocateBufferMemory(drv, buffer, size);
+    }
+    const size_t capacity = (size + granularity - 1) / granularity * granularity;
+    // Without retention every frame would pay for cuMemAllocHost, which is
+    // slower than the pageable copy it replaces.
+    if (capacity > drv->bufferPoolMaxBytes) {
+        return allocateBufferMemory(drv, buffer, size);
+    }
+
+    void *ptr = NULL;
+    size_t ptrCapacity = 0;
+    void *evicted = NULL;
+    pthread_mutex_lock(&drv->bufferPoolMutex);
+    for (uint32_t i = 0; i < drv->pinnedImagePoolCount; i++) {
+        if (drv->pinnedImagePoolSizes[i] == capacity) {
+            ptr = drv->pinnedImagePool[i];
+            ptrCapacity = capacity;
+            drv->pinnedImagePoolBytes -= capacity;
+            drv->pinnedImagePoolCount--;
+            drv->pinnedImagePool[i] = drv->pinnedImagePool[drv->pinnedImagePoolCount];
+            drv->pinnedImagePoolSizes[i] = drv->pinnedImagePoolSizes[drv->pinnedImagePoolCount];
+            break;
+        }
+    }
+    if (ptr == NULL && drv->pinnedImagePoolCount == ARRAY_SIZE(drv->pinnedImagePool)) {
+        // The client switched sizes; drop the oldest entry rather than pinning
+        // ever more memory.
+        evicted = drv->pinnedImagePool[0];
+        drv->pinnedImagePoolBytes -= drv->pinnedImagePoolSizes[0];
+        drv->pinnedImagePoolCount--;
+        drv->pinnedImagePool[0] = drv->pinnedImagePool[drv->pinnedImagePoolCount];
+        drv->pinnedImagePoolSizes[0] = drv->pinnedImagePoolSizes[drv->pinnedImagePoolCount];
+    }
+    nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+               drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
+    pthread_mutex_unlock(&drv->bufferPoolMutex);
+    if (evicted != NULL) {
+        freePinnedHostMemory(drv, evicted);
+    }
+
+    if (ptr == NULL) {
+        if (CHECK_CUDA_RESULT(cu->cuCtxPushCurrent(drv->cudaContext))) {
+            return allocateBufferMemory(drv, buffer, size);
+        }
+        const CUresult result = drv->cuMemAllocHost(&ptr, capacity);
+        CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
+        if (result != CUDA_SUCCESS) {
+            LOG("cuMemAllocHost(%zu) failed: %d; using pageable image memory", capacity, result);
+            return allocateBufferMemory(drv, buffer, size);
+        }
+        ptrCapacity = capacity;
+    }
+
+    buffer->ptr = ptr;
+    buffer->capacity = ptrCapacity;
+    buffer->poolClass = -1;
+    buffer->pinned = true;
+    buffer->statsRequestedBytes = drv->statsEnabled ? size : 0;
+    nvStatsAdd(drv, NV_STAT_BUFFER_LIVE_REQUESTED_BYTES, size);
+    nvStatsAdd(drv, NV_STAT_BUFFER_LIVE_CAPACITY_BYTES, ptrCapacity);
+    nvStatsAdd(drv, NV_STAT_BUFFER_REQUESTED_BYTES, size);
+    nvStatsAdd(drv, NV_STAT_BUFFER_CAPACITY_BYTES, ptrCapacity);
+    nvStatsUpdateMemoryEstimates(drv);
+    return true;
+}
+
 static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
     if (buffer == NULL || buffer->ptr == NULL) {
         return;
@@ -3070,6 +3306,14 @@ static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
     nvStatsSubtract(drv, NV_STAT_BUFFER_LIVE_REQUESTED_BYTES, buffer->statsRequestedBytes);
     nvStatsSubtract(drv, NV_STAT_BUFFER_LIVE_CAPACITY_BYTES, buffer->capacity);
     buffer->statsRequestedBytes = 0;
+    if (buffer->pinned) {
+        releasePinnedImageMemory(drv, buffer->ptr, buffer->capacity);
+        buffer->ptr = NULL;
+        buffer->capacity = 0;
+        buffer->pinned = false;
+        nvStatsUpdateMemoryEstimates(drv);
+        return;
+    }
     bool pooled = false;
     if (buffer->poolClass >= 0 && buffer->poolClass < NVD_BUFFER_POOL_CLASS_COUNT) {
         const int poolClass = buffer->poolClass;
@@ -3084,7 +3328,8 @@ static void releaseBufferMemory(NVDriver *drv, NVBuffer *buffer) {
             drv->bufferPoolBytes += buffer->capacity;
             pooled = true;
         }
-        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, drv->bufferPoolBytes);
+        nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES,
+                   drv->bufferPoolBytes + drv->pinnedImagePoolBytes);
         pthread_mutex_unlock(&drv->bufferPoolMutex);
     }
     if (!pooled) {
@@ -3112,9 +3357,17 @@ static void destroyBufferPool(NVDriver *drv) {
         drv->bufferPoolCounts[i] = 0;
     }
     drv->bufferPoolBytes = 0;
+    void *pinned[ARRAY_SIZE(drv->pinnedImagePool)];
+    const uint32_t pinnedCount = drv->pinnedImagePoolCount;
+    memcpy(pinned, drv->pinnedImagePool, sizeof(pinned));
+    drv->pinnedImagePoolCount = 0;
+    drv->pinnedImagePoolBytes = 0;
     nvStatsSet(drv, NV_STAT_BUFFER_POOL_RETAINED_BYTES, 0);
     nvStatsUpdateMemoryEstimates(drv);
     pthread_mutex_unlock(&drv->bufferPoolMutex);
+    for (uint32_t i = 0; i < pinnedCount; i++) {
+        freePinnedHostMemory(drv, pinned[i]);
+    }
 }
 
 static VAStatus nvCreateBuffer(
@@ -3202,6 +3455,7 @@ static VAStatus nvMapBuffer(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, false);
     if (pbuf == NULL) {
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     }
@@ -3209,6 +3463,9 @@ static VAStatus nvMapBuffer(
 
     if (buf == NULL) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (atomic_exchange(&buf->needsZero, false)) {
+        memset(buf->ptr, 0, buf->size);
     }
     *pbuf = buf->ptr;
 
@@ -3222,6 +3479,7 @@ static VAStatus nvUnmapBuffer(
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, false);
     return getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id) != NULL
         ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_INVALID_BUFFER;
 }
@@ -3232,7 +3490,8 @@ static VAStatus nvDestroyBuffer(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
-    NVD_OBJECT_LIFETIME_GUARD(drv, true);
+    NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, true);
     NVBuffer *buf = getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffer_id);
 
     if (buf == NULL) {
@@ -4798,14 +5057,24 @@ static VAStatus nvRenderPictureImpl(
     if (nvCtx->entrypoint == VAEntrypointVideoProc) {
         bool processed = false;
         for (int i = 0; i < num_buffers; i++) {
+            // Snapshot the pipeline parameters so the buffer lock is not held
+            // across the GPU conversion and its completion wait.
+            VAProcPipelineParameterBuffer pipelineCopy;
+            NVDObjectLifetimeGuard bufferGuard = { 0 };
+            if (!acquireBufferLifetimeGuard(drv, false, &bufferGuard)) {
+                cancelCurrentPictureResolve(nvCtx);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
             NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
             if (buf == NULL) {
+                releaseObjectLifetimeGuard(&bufferGuard);
                 cancelCurrentPictureResolve(nvCtx);
                 return VA_STATUS_ERROR_INVALID_BUFFER;
             }
             if (buf->ownerContextId != context) {
                 LOG("VideoProc buffer %d belongs to context %d, not %d",
                     buffers[i], buf->ownerContextId, context);
+                releaseObjectLifetimeGuard(&bufferGuard);
                 cancelCurrentPictureResolve(nvCtx);
                 return VA_STATUS_ERROR_INVALID_BUFFER;
             }
@@ -4814,13 +5083,16 @@ static VAStatus nvRenderPictureImpl(
                 buf->elementSize < sizeof(VAProcPipelineParameterBuffer) ||
                 buf->ptr == NULL) {
                 LOG("Invalid VideoProc buffer detected: %d", buffers[i]);
+                releaseObjectLifetimeGuard(&bufferGuard);
                 cancelCurrentPictureResolve(nvCtx);
                 return VA_STATUS_ERROR_INVALID_PARAMETER;
             }
+            memcpy(&pipelineCopy, buf->ptr, sizeof(pipelineCopy));
+            releaseObjectLifetimeGuard(&bufferGuard);
 
             nvStatsIncrement(drv, NV_STAT_VIDEOPROC_REQUESTS);
             processed = true;
-            VAProcPipelineParameterBuffer *pipeline = (VAProcPipelineParameterBuffer*) buf->ptr;
+            const VAProcPipelineParameterBuffer *pipeline = &pipelineCopy;
             NVSurface *src = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, pipeline->surface);
             const uint64_t videoProcStart = nvStatsTimestamp(drv);
             // copySurfaceBackingImage always clears the render target's resolving
@@ -4845,6 +5117,13 @@ static VAStatus nvRenderPictureImpl(
     }
 
     CUVIDPICPARAMS *picParams = &nvCtx->pPicParams;
+
+    NVDObjectLifetimeGuard bufferGuard
+        __attribute__((cleanup(releaseObjectLifetimeGuard))) = { 0 };
+    if (!acquireBufferLifetimeGuard(drv, false, &bufferGuard)) {
+        cancelCurrentPictureResolve(nvCtx);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
 
     for (int i = 0; i < num_buffers; i++) {
         NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
@@ -5422,12 +5701,12 @@ static VAStatus nvCreateImage(
     imageBuffer->size = imageSize;
     imageBuffer->elementSize = imageSize;
     imageBuffer->elements = 1;
-    if (!allocateBufferMemory(drv, imageBuffer, imageBuffer->size)) {
+    if (!allocateImageBufferMemory(drv, imageBuffer, imageBuffer->size)) {
         deleteObject(drv, imageBufferObject->id);
         deleteObject(drv, imageObj->id);
         return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
-    memset(imageBuffer->ptr, 0, imageBuffer->size);
+    atomic_store(&imageBuffer->needsZero, true);
 
     img->imageBuffer = imageBuffer;
     img->imageBufferId = imageBufferObject->id;
@@ -5481,7 +5760,9 @@ static VAStatus nvDestroyImage(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
-    NVD_OBJECT_LIFETIME_GUARD(drv, true);
+    NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_IMAGE_LIFETIME_GUARD(drv, true);
+    NVD_BUFFER_LIFETIME_GUARD(drv, true);
     NVImage *img = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
 
     if (img == NULL) {
@@ -5527,12 +5808,25 @@ static VAStatus nvGetImage(
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
 
     NVSurface *surfaceObj = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, surface);
-    NVImage *imageObj = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
 
     if (surfaceObj == NULL) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
+    if (getObjectPtr(drv, OBJECT_TYPE_IMAGE, image) == NULL) {
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
+
+    //wait for the surface to be decoded
+    const VAStatus syncStatus = nvSyncSurface(ctx, surface);
+    if (syncStatus != VA_STATUS_SUCCESS) {
+        return syncStatus;
+    }
+
+    // Look the image up again under the image lock: it may have been
+    // destroyed while this thread waited for the decode above.
+    NVD_IMAGE_LIFETIME_GUARD(drv, false);
+    NVImage *imageObj = (NVImage*) getObjectPtr(drv, OBJECT_TYPE_IMAGE, image);
     if (imageObj == NULL) {
         return VA_STATUS_ERROR_INVALID_IMAGE;
     }
@@ -5545,12 +5839,6 @@ static VAStatus nvGetImage(
         (uint64_t) (unsigned int) y + height > surfaceObj->height ||
         width > imageObj->width || height > imageObj->height) {
         return VA_STATUS_ERROR_INVALID_PARAMETER;
-    }
-
-    //wait for the surface to be decoded
-    const VAStatus syncStatus = nvSyncSurface(ctx, surface);
-    if (syncStatus != VA_STATUS_SUCCESS) {
-        return syncStatus;
     }
 
     BackingImage *backingImage = surfaceObj->backingImage;
@@ -5577,6 +5865,15 @@ static VAStatus nvGetImage(
                 backingImage, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
         }
         return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    // A download of the whole image writes every byte of its buffer (planes
+    // are packed with pitch == row size), so only a partial one needs the
+    // deferred zero fill first.
+    NVBuffer *imageBuffer = imageObj->imageBuffer;
+    const bool wholeImage = x == 0 && y == 0 &&
+        width == imageObj->width && height == imageObj->height;
+    if (!wholeImage && atomic_exchange(&imageBuffer->needsZero, false)) {
+        memset(imageBuffer->ptr, 0, imageBuffer->size);
     }
     size_t destinationOffset = 0;
     VAStatus status = VA_STATUS_SUCCESS;
@@ -5620,6 +5917,9 @@ static VAStatus nvGetImage(
         }
         destinationOffset += destinationPitch *
             nvPlaneExtent(imageObj->height, p->ss.y);
+    }
+    if (wholeImage && status == VA_STATUS_SUCCESS) {
+        atomic_store(&imageBuffer->needsZero, false);
     }
     CUresult popResult = cu->cuCtxPopCurrent(NULL);
     if (popResult != CUDA_SUCCESS) {
@@ -5933,7 +6233,7 @@ static VAStatus nvQuerySurfaceAttributes(
         };
 
         CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-        const CUresult capsResult = cv->cuvidGetDecoderCaps(&videoDecodeCaps);
+        const CUresult capsResult = getDecoderCaps(drv, &videoDecodeCaps);
         const CUresult popResult = cu->cuCtxPopCurrent(NULL);
         if (CHECK_CUDA_RESULT(capsResult) || CHECK_CUDA_RESULT(popResult)) {
             return VA_STATUS_ERROR_OPERATION_FAILED;
@@ -6032,6 +6332,7 @@ static VAStatus nvBufferInfo(
     }
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     NVD_OBJECT_LIFETIME_GUARD(drv, false);
+    NVD_BUFFER_LIFETIME_GUARD(drv, false);
     NVBuffer *buffer = getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
     if (buffer == NULL || buffer->elementSize > UINT_MAX) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
@@ -6338,6 +6639,16 @@ static VAStatus nvTerminate( VADriverContextP ctx )
     pthread_mutex_destroy(&drv->exportMutex);
     pthread_mutex_destroy(&drv->imagesMutex);
     pthread_mutex_destroy(&drv->objectCreationMutex);
+    if (drv->imageLifetimeLock != NULL) {
+        pthread_rwlock_destroy(drv->imageLifetimeLock);
+        free(drv->imageLifetimeLock);
+        drv->imageLifetimeLock = NULL;
+    }
+    if (drv->bufferLifetimeLock != NULL) {
+        pthread_rwlock_destroy(drv->bufferLifetimeLock);
+        free(drv->bufferLifetimeLock);
+        drv->bufferLifetimeLock = NULL;
+    }
     if (drv->objectLifetimeLock != NULL) {
         pthread_rwlock_destroy(drv->objectLifetimeLock);
         free(drv->objectLifetimeLock);
@@ -6459,6 +6770,8 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     nvdObjectTableInit(&drv->objects);
     ctx->pDriverData = drv;
     bool objectLifetimeLockInitialized = false;
+    bool bufferLifetimeLockInitialized = false;
+    bool imageLifetimeLockInitialized = false;
     bool objectMutexInitialized = false;
     bool imagesMutexInitialized = false;
     bool exportMutexInitialized = false;
@@ -6538,6 +6851,24 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     }
     objectLifetimeLockInitialized = true;
 
+    drv->bufferLifetimeLock = calloc(1, sizeof(pthread_rwlock_t));
+    if (drv->bufferLifetimeLock == NULL ||
+        pthread_rwlock_init(drv->bufferLifetimeLock, NULL) != 0) {
+        free(drv->bufferLifetimeLock);
+        drv->bufferLifetimeLock = NULL;
+        goto fail;
+    }
+    bufferLifetimeLockInitialized = true;
+
+    drv->imageLifetimeLock = calloc(1, sizeof(pthread_rwlock_t));
+    if (drv->imageLifetimeLock == NULL ||
+        pthread_rwlock_init(drv->imageLifetimeLock, NULL) != 0) {
+        free(drv->imageLifetimeLock);
+        drv->imageLifetimeLock = NULL;
+        goto fail;
+    }
+    imageLifetimeLockInitialized = true;
+
     pthread_mutexattr_t attrib;
     if (pthread_mutexattr_init(&attrib) != 0) {
         goto fail;
@@ -6581,6 +6912,7 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         goto fail;
     }
     cudaContextCreated = true;
+    loadPinnedHostFunctions(drv);
 
     //CHECK_CUDA_RESULT_RETURN(cv->cuvidCtxLockCreate(&drv->vidLock, drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
@@ -6621,6 +6953,16 @@ fail:
     }
     if (objectMutexInitialized) {
         pthread_mutex_destroy(&drv->objectCreationMutex);
+    }
+    if (imageLifetimeLockInitialized) {
+        pthread_rwlock_destroy(drv->imageLifetimeLock);
+        free(drv->imageLifetimeLock);
+        drv->imageLifetimeLock = NULL;
+    }
+    if (bufferLifetimeLockInitialized) {
+        pthread_rwlock_destroy(drv->bufferLifetimeLock);
+        free(drv->bufferLifetimeLock);
+        drv->bufferLifetimeLock = NULL;
     }
     if (objectLifetimeLockInitialized) {
         pthread_rwlock_destroy(drv->objectLifetimeLock);

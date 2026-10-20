@@ -50,6 +50,12 @@ typedef struct
     void            *ptr;
     size_t          capacity;
     int8_t          poolClass;
+    // Page-locked memory from cuMemAllocHost (VAImage buffers only).
+    bool            pinned;
+    // VAImage data not yet written by a whole-image vaGetImage. It is zeroed
+    // on the first vaMapBuffer or partial vaGetImage instead of at creation,
+    // since a full download overwrites every byte anyway.
+    atomic_bool     needsZero;
     size_t          statsRequestedBytes;
 } NVBuffer;
 
@@ -217,6 +223,15 @@ typedef struct _NVDriver
     // Opaque here so users of this shared header do not need POSIX rwlock
     // feature-test macros; vabackend.c owns the pthread_rwlock_t allocation.
     void                    *objectLifetimeLock;
+    // Narrower barrier for VABuffer/VAImage memory, taken after the object
+    // lifetime read lock. Buffers and images are destroyed several times per
+    // frame; taking the object write lock for that would wait for every
+    // in-flight SyncSurface/EndPicture of every other decoder on the display.
+    void                    *bufferLifetimeLock;
+    // Same for VAImage objects, so a long GetImage download does not hold
+    // up decode buffer destruction. Destroying an image takes this lock and
+    // then bufferLifetimeLock, since it also frees the image's buffer.
+    void                    *imageLifetimeLock;
     pthread_mutex_t         objectCreationMutex;
     bool                    terminating;
     bool                    useCorrectNV12Format;
@@ -238,6 +253,15 @@ typedef struct _NVDriver
     NVBufferPoolBlock       *bufferPool[NVD_BUFFER_POOL_CLASS_COUNT];
     uint32_t                bufferPoolCounts[NVD_BUFFER_POOL_CLASS_COUNT];
     uint64_t                bufferPoolBytes;
+    // Page-locked VAImage buffers kept for reuse; guarded by bufferPoolMutex.
+    // Clients create and destroy one image per downloaded frame, and
+    // allocating page-locked memory costs more than the copy it speeds up.
+    CUresult                (*cuMemAllocHost)(void **ptr, size_t size);
+    CUresult                (*cuMemFreeHost)(void *ptr);
+    void                    *pinnedImagePool[4];
+    size_t                  pinnedImagePoolSizes[4];
+    uint32_t                pinnedImagePoolCount;
+    uint64_t                pinnedImagePoolBytes;
     uint64_t                bufferPoolMaxBytes;
     Array/*<NVEGLImage>*/   images;
     const NVBackend         *backend;
@@ -445,6 +469,7 @@ void nvBackingImageStoreSurfaceColorMetadata(BackingImage *img, const NVSurface 
 void nvBackingImageCopyColorMetadata(BackingImage *dst, const BackingImage *src);
 bool checkCudaErrors(CUresult err, const char *file, const char *function, const int line);
 void logger(const char *filename, const char *function, int line, const char *msg, ...);
+bool nvdLogEnabled(void);
 bool nvdLogDebugEnabled(void);
 typedef enum {
     NVD_EXPORT_LAYOUT_PER_PLANE_NATURAL = 0,

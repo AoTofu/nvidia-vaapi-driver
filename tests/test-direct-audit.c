@@ -985,6 +985,222 @@ static void testTimingHistograms(void) {
     assert(shared == 1 && private == 0);
 }
 
+typedef struct {
+    struct VADriverContext *driver;
+    VAGenericID id;
+    VAStatus status;
+    sem_t done;
+} LifetimeCall;
+
+static void *syncSurfaceCall(void *opaque) {
+    LifetimeCall *call = opaque;
+    call->status = nvSyncSurface(call->driver, call->id);
+    assert(sem_post(&call->done) == 0);
+    return NULL;
+}
+
+static void *bufferAndImageChurn(void *opaque) {
+    LifetimeCall *call = opaque;
+    VABufferID buffer = VA_INVALID_ID;
+    call->status = nvCreateBuffer(call->driver, call->id, VAPictureParameterBufferType,
+                                  64, 1, NULL, &buffer);
+    if (call->status == VA_STATUS_SUCCESS)
+        call->status = nvDestroyBuffer(call->driver, buffer);
+    VAImageFormat format = {.fourcc = VA_FOURCC_NV12};
+    VAImage image;
+    if (call->status == VA_STATUS_SUCCESS)
+        call->status = nvCreateImage(call->driver, &format, 64, 64, &image);
+    if (call->status == VA_STATUS_SUCCESS)
+        call->status = nvDestroyImage(call->driver, image.image_id);
+    assert(sem_post(&call->done) == 0);
+    return NULL;
+}
+
+static bool waitWithin(sem_t *sem, long ms) {
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    int result;
+    do { result = sem_timedwait(sem, &deadline); } while (result != 0 && errno == EINTR);
+    return result == 0;
+}
+
+static void testBufferDestroyDoesNotWaitForSync(void) {
+    // Decoders destroy several VA buffers per frame. That must not queue
+    // behind another thread's SyncSurface, which may wait for a whole decode.
+    pthread_rwlock_t objectLock, bufferLock, imageLock;
+    assert(pthread_rwlock_init(&objectLock, NULL) == 0);
+    assert(pthread_rwlock_init(&bufferLock, NULL) == 0);
+    assert(pthread_rwlock_init(&imageLock, NULL) == 0);
+    NVDriver drv = {.objectLifetimeLock = &objectLock,
+                    .bufferLifetimeLock = &bufferLock,
+                    .imageLifetimeLock = &imageLock};
+    nvdObjectTableInit(&drv.objects);
+    assert(pthread_mutex_init(&drv.objectCreationMutex, NULL) == 0);
+    assert(pthread_mutex_init(&drv.bufferPoolMutex, NULL) == 0);
+    drv.bufferPoolMutexInitialized = true;
+    struct VADriverContext driver = {.pDriverData = &drv};
+    Object contextObject = allocateObject(&drv, OBJECT_TYPE_CONTEXT, sizeof(NVContext));
+    Object surfaceObject = allocateObject(&drv, OBJECT_TYPE_SURFACE, sizeof(NVSurface));
+    assert(contextObject != NULL && surfaceObject != NULL);
+    NVSurface *surface = surfaceObject->obj;
+    assert(pthread_mutex_init(&surface->mutex, NULL) == 0);
+    assert(pthread_cond_init(&surface->cond, NULL) == 0);
+    setSurfaceResolving(surface, true);
+
+    LifetimeCall sync = {.driver = &driver, .id = surfaceObject->id};
+    LifetimeCall churn = {.driver = &driver, .id = contextObject->id};
+    assert(sem_init(&sync.done, 0, 0) == 0 && sem_init(&churn.done, 0, 0) == 0);
+    pthread_t syncThread, churnThread;
+    assert(pthread_create(&syncThread, NULL, syncSurfaceCall, &sync) == 0);
+    // Wait until the sync call holds the object lifetime read lock.
+    while (pthread_rwlock_trywrlock(&objectLock) == 0) {
+        assert(pthread_rwlock_unlock(&objectLock) == 0);
+        sched_yield();
+    }
+    assert(!waitWithin(&sync.done, 20));
+    assert(pthread_create(&churnThread, NULL, bufferAndImageChurn, &churn) == 0);
+    assert(waitWithin(&churn.done, 2000));
+    assert(churn.status == VA_STATUS_SUCCESS);
+    assert(pthread_join(churnThread, NULL) == 0);
+
+    setSurfaceResolving(surface, false);
+    assert(waitWithin(&sync.done, 2000));
+    assert(pthread_join(syncThread, NULL) == 0);
+    assert(sync.status == VA_STATUS_SUCCESS);
+
+    sem_destroy(&sync.done);
+    sem_destroy(&churn.done);
+    destroyBufferPool(&drv);
+    pthread_cond_destroy(&surface->cond);
+    pthread_mutex_destroy(&surface->mutex);
+    deleteObject(&drv, surfaceObject->id);
+    deleteObject(&drv, contextObject->id);
+    nvdObjectTableDestroy(&drv.objects);
+    pthread_mutex_destroy(&drv.bufferPoolMutex);
+    pthread_mutex_destroy(&drv.objectCreationMutex);
+    pthread_rwlock_destroy(&imageLock);
+    pthread_rwlock_destroy(&bufferLock);
+    pthread_rwlock_destroy(&objectLock);
+}
+
+static unsigned capsCalls;
+static CUresult capsResult;
+static CUresult CUDAAPI mockDecoderCaps(CUVIDDECODECAPS *caps) {
+    capsCalls++;
+    caps->bIsSupported = 1;
+    caps->nMaxWidth = 8192 + caps->nBitDepthMinus8;
+    return capsResult;
+}
+
+static void testDecoderCapsCache(void) {
+    CuvidFunctions cuvid = {.cuvidGetDecoderCaps = mockDecoderCaps};
+    cv = &cuvid;
+    NVDriver gpu0 = {.cudaGpuId = 0}, gpu1 = {.cudaGpuId = 1};
+    // A failed query is not remembered.
+    capsResult = CUDA_ERROR_UNKNOWN;
+    CUVIDDECODECAPS caps = {.eCodecType = cudaVideoCodec_HEVC, .nBitDepthMinus8 = 2};
+    assert(getDecoderCaps(&gpu0, &caps) == CUDA_ERROR_UNKNOWN && capsCalls == 1);
+    capsResult = CUDA_SUCCESS;
+    for (unsigned i = 0; i < 3; i++) {
+        caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC, .nBitDepthMinus8 = 2,
+                                 .nMaxWidth = 1};
+        assert(getDecoderCaps(&gpu0, &caps) == CUDA_SUCCESS);
+        assert(caps.bIsSupported == 1 && caps.nMaxWidth == 8194 && capsCalls == 2);
+    }
+    // The key covers bit depth, chroma format and GPU.
+    caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC};
+    assert(getDecoderCaps(&gpu0, &caps) == CUDA_SUCCESS && capsCalls == 3);
+    caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC,
+                             .eChromaFormat = cudaVideoChromaFormat_444};
+    assert(getDecoderCaps(&gpu0, &caps) == CUDA_SUCCESS && capsCalls == 4);
+    caps = (CUVIDDECODECAPS){.eCodecType = cudaVideoCodec_HEVC, .nBitDepthMinus8 = 2,
+                             .eChromaFormat = cudaVideoChromaFormat_420};
+    assert(getDecoderCaps(&gpu1, &caps) == CUDA_SUCCESS && capsCalls == 5);
+    assert(doesGPUSupportCodec(&gpu1, cudaVideoCodec_HEVC, 10, cudaVideoChromaFormat_420,
+                               NULL, NULL) && capsCalls == 5);
+    cv = NULL;
+}
+
+static unsigned pinnedAllocs, pinnedFrees;
+static CUresult pinnedAlloc(void **ptr, size_t size) {
+    pinnedAllocs++;
+    *ptr = malloc(size);
+    return *ptr != NULL ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
+}
+static CUresult pinnedFree(void *ptr) {
+    pinnedFrees++;
+    free(ptr);
+    return CUDA_SUCCESS;
+}
+
+static VAImageID createTestImage(struct VADriverContext *driver, int width, bool pinned) {
+    VAImageFormat format = {.fourcc = VA_FOURCC_NV12};
+    VAImage image;
+    assert(nvCreateImage(driver, &format, width, 64, &image) == VA_STATUS_SUCCESS);
+    NVDriver *drv = driver->pDriverData;
+    NVImage *img = getObjectPtr(drv, OBJECT_TYPE_IMAGE, image.image_id);
+    assert(img != NULL && img->imageBuffer->pinned == pinned);
+    // Pooled memory still holds the previous image; mapping must zero it.
+    uint8_t *data = NULL;
+    assert(nvMapBuffer(driver, image.buf, (void **) &data) == VA_STATUS_SUCCESS);
+    for (uint32_t i = 0; i < image.data_size; i++) assert(data[i] == 0);
+    memset(data, 0xab, image.data_size);
+    assert(nvMapBuffer(driver, image.buf, (void **) &data) == VA_STATUS_SUCCESS);
+    assert(data[0] == 0xab);
+    return image.image_id;
+}
+
+static void testPinnedImagePool(void) {
+    CudaFunctions cuda = {.cuCtxPushCurrent = mockPush, .cuCtxPopCurrent = mockPop};
+    cu = &cuda;
+    pushFailure = 0;
+    pthread_rwlock_t objectLock, bufferLock, imageLock;
+    assert(pthread_rwlock_init(&objectLock, NULL) == 0);
+    assert(pthread_rwlock_init(&bufferLock, NULL) == 0);
+    assert(pthread_rwlock_init(&imageLock, NULL) == 0);
+    NVDriver drv = {.objectLifetimeLock = &objectLock, .bufferLifetimeLock = &bufferLock,
+                    .imageLifetimeLock = &imageLock, .cuMemAllocHost = pinnedAlloc,
+                    .cuMemFreeHost = pinnedFree, .bufferPoolMaxBytes = 64U << 20};
+    nvdObjectTableInit(&drv.objects);
+    assert(pthread_mutex_init(&drv.objectCreationMutex, NULL) == 0);
+    assert(pthread_mutex_init(&drv.bufferPoolMutex, NULL) == 0);
+    drv.bufferPoolMutexInitialized = true;
+    struct VADriverContext driver = {.pDriverData = &drv};
+
+    // One image per frame reuses a single page-locked allocation.
+    for (unsigned i = 0; i < 5; i++) {
+        assert(nvDestroyImage(&driver, createTestImage(&driver, 64, true)) == VA_STATUS_SUCCESS);
+    }
+    assert(pinnedAllocs == 1 && pinnedFrees == 0 && drv.pinnedImagePoolCount == 1);
+
+    // Four other sizes evict the oldest entry instead of growing the pool.
+    for (int width = 2048; width <= 5120; width += 1024) {
+        assert(nvDestroyImage(&driver, createTestImage(&driver, width, true)) == VA_STATUS_SUCCESS);
+    }
+    assert(pinnedAllocs == 5 && pinnedFrees == 1 && drv.pinnedImagePoolCount == 4);
+
+    // A zero budget disables page-locked images altogether.
+    drv.bufferPoolMaxBytes = 0;
+    assert(nvDestroyImage(&driver, createTestImage(&driver, 64, false)) == VA_STATUS_SUCCESS);
+    assert(pinnedAllocs == 5);
+
+    destroyBufferPool(&drv);
+    assert(pinnedFrees == 5 && drv.pinnedImagePoolCount == 0 && drv.pinnedImagePoolBytes == 0);
+    nvdObjectTableDestroy(&drv.objects);
+    pthread_mutex_destroy(&drv.bufferPoolMutex);
+    pthread_mutex_destroy(&drv.objectCreationMutex);
+    pthread_rwlock_destroy(&imageLock);
+    pthread_rwlock_destroy(&bufferLock);
+    pthread_rwlock_destroy(&objectLock);
+    cu = NULL;
+}
+
 int main(void) {
     testSecurityClearPatterns();
     testAV1SubmissionOrder();
@@ -1000,6 +1216,9 @@ int main(void) {
     testVideoProcCompletionFailures();
     testVideoProcSameFormatBlit();
     testSharedSurfaceSubmission();
+    testBufferDestroyDoesNotWaitForSync();
+    testDecoderCapsCache();
+    testPinnedImagePool();
 #if NVD_TEST_VP9
     testVp9();
 #endif

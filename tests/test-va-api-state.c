@@ -5,8 +5,10 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <va/va.h>
@@ -152,6 +154,93 @@ static void *queryConfigUntilDestroyed(void *opaque) {
     return NULL;
 }
 
+static uint8_t *mapImage(VADisplay display, const VAImage *image) {
+    uint8_t *data = NULL;
+    requireStatus("map image", vaMapBuffer(display, image->buf, (void **) &data),
+                  VA_STATUS_SUCCESS);
+    return data;
+}
+
+// Image buffers are reused across vaCreateImage calls and zeroed lazily. A
+// whole-image download must overwrite the previous contents, and a partial
+// one must leave the rest zero rather than another image's pixels.
+static void testImageDownloadZeroFill(VADisplay display) {
+    VASurfaceID surface;
+    requireStatus("create download surface",
+                  vaCreateSurfaces(display, VA_RT_FORMAT_YUV420, 64, 64, &surface, 1, NULL, 0),
+                  VA_STATUS_SUCCESS);
+    VADRMPRIMESurfaceDescriptor desc = {0};
+    requireStatus("realise download surface", vaExportSurfaceHandle(display, surface,
+        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &desc), VA_STATUS_SUCCESS);
+    for (unsigned i = 0; i < desc.num_objects; i++) close(desc.objects[i].fd);
+
+    VAImageFormat format = {.fourcc = VA_FOURCC_NV12};
+    // Reference pixels (the allocation's security clear) from a fresh image.
+    uint8_t reference[64 * 64 * 3 / 2];
+    {
+        VAImage image;
+        requireStatus("create reference image",
+                      vaCreateImage(display, &format, 64, 64, &image), VA_STATUS_SUCCESS);
+        requireStatus("download reference",
+                      vaGetImage(display, surface, 0, 0, 64, 64, image.image_id),
+                      VA_STATUS_SUCCESS);
+        if (image.data_size != sizeof(reference)) exit(EXIT_FAILURE);
+        memcpy(reference, mapImage(display, &image), sizeof(reference));
+        requireStatus("unmap reference", vaUnmapBuffer(display, image.buf), VA_STATUS_SUCCESS);
+        requireStatus("destroy reference", vaDestroyImage(display, image.image_id),
+                      VA_STATUS_SUCCESS);
+        bool nonZero = false;
+        for (size_t i = 0; i < sizeof(reference); i++) nonZero |= reference[i] != 0;
+        if (!nonZero || memchr(reference, 0xab, sizeof(reference)) != NULL) {
+            fprintf(stderr, "unexpected cleared surface contents\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    // Even passes leave 0xab behind in a pooled buffer; odd passes download
+    // a 32x32 region and then the whole image into the reused buffer.
+    for (unsigned pass = 0; pass < 4; pass++) {
+        VAImage image;
+        requireStatus("create download image",
+                      vaCreateImage(display, &format, 64, 64, &image), VA_STATUS_SUCCESS);
+        if (pass % 2 == 0) {
+            uint8_t *data = mapImage(display, &image);
+            for (uint32_t i = 0; i < image.data_size; i++) {
+                if (data[i] != 0) {
+                    fprintf(stderr, "new image byte %u is %u\n", i, data[i]);
+                    exit(EXIT_FAILURE);
+                }
+            }
+            memset(data, 0xab, image.data_size);
+        } else {
+            const unsigned size = pass == 1 ? 32 : 64;
+            requireStatus("download image",
+                          vaGetImage(display, surface, 0, 0, size, size, image.image_id),
+                          VA_STATUS_SUCCESS);
+            const uint8_t *data = mapImage(display, &image);
+            for (uint32_t i = 0; i < image.data_size; i++) {
+                const bool luma = i < image.offsets[1];
+                const uint32_t row = luma ? i / image.pitches[0]
+                                          : (i - image.offsets[1]) / image.pitches[1];
+                const uint32_t col = luma ? i % image.pitches[0]
+                                          : (i - image.offsets[1]) % image.pitches[1];
+                const bool inside = luma ? row < size && col < size
+                                         : row < size / 2 && col < size;
+                if (data[i] != (inside ? reference[i] : 0)) {
+                    fprintf(stderr, "pass %u byte %u (%s %u,%u) is %u\n", pass, i,
+                            luma ? "Y" : "UV", col, row, data[i]);
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+        requireStatus("unmap image", vaUnmapBuffer(display, image.buf), VA_STATUS_SUCCESS);
+        requireStatus("destroy download image", vaDestroyImage(display, image.image_id),
+                      VA_STATUS_SUCCESS);
+    }
+    requireStatus("destroy download surface", vaDestroySurfaces(display, &surface, 1),
+                  VA_STATUS_SUCCESS);
+}
+
 int main(int argc, char **argv) {
     const char *enabled = getenv("NVD_RUN_GPU_TESTS");
     if (enabled == NULL || enabled[0] != '1') {
@@ -171,6 +260,7 @@ int main(int argc, char **argv) {
     requireStatus("vaInitialize", vaInitialize(display, &major, &minor),
                   VA_STATUS_SUCCESS);
     testExportRoundtrip(display);
+    testImageDownloadZeroFill(display);
 
     VAEntrypoint unsupportedEntrypoints[4] = {0};
     int unsupportedEntrypointCount = 4;
@@ -179,6 +269,35 @@ int main(int argc, char **argv) {
                                            unsupportedEntrypoints,
                                            &unsupportedEntrypointCount),
                   VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+
+    // Attributes the driver does not implement must come back as
+    // VA_ATTRIB_NOT_SUPPORTED rather than whatever the caller passed in.
+    VAConfigAttrib decodeAttribs[] = {
+        { .type = VAConfigAttribRTFormat, .value = 0x5a5a5a5a },
+        { .type = VAConfigAttribDecSliceMode, .value = 0x5a5a5a5a },
+        { .type = VAConfigAttribMaxPictureWidth, .value = 0x5a5a5a5a },
+    };
+    requireStatus("H264 vaGetConfigAttributes",
+                  vaGetConfigAttributes(display, VAProfileH264High, VAEntrypointVLD,
+                                        decodeAttribs, 3),
+                  VA_STATUS_SUCCESS);
+    if ((decodeAttribs[0].value & VA_RT_FORMAT_YUV420) == 0 ||
+        decodeAttribs[1].value != VA_ATTRIB_NOT_SUPPORTED ||
+        decodeAttribs[2].value == 0 || decodeAttribs[2].value == 0x5a5a5a5a) {
+        fprintf(stderr, "unexpected H264 config attributes: %#x %#x %#x\n",
+                decodeAttribs[0].value, decodeAttribs[1].value,
+                decodeAttribs[2].value);
+        exit(EXIT_FAILURE);
+    }
+    VAConfigAttrib vppAttrib = { .type = VAConfigAttribDecSliceMode, .value = 0x5a5a5a5a };
+    requireStatus("VideoProc vaGetConfigAttributes",
+                  vaGetConfigAttributes(display, VAProfileNone, VAEntrypointVideoProc,
+                                        &vppAttrib, 1),
+                  VA_STATUS_SUCCESS);
+    if (vppAttrib.value != VA_ATTRIB_NOT_SUPPORTED) {
+        fprintf(stderr, "unexpected VideoProc attribute: %#x\n", vppAttrib.value);
+        exit(EXIT_FAILURE);
+    }
 
     VAConfigID config = VA_INVALID_ID;
     requireStatus("vaCreateConfig",
